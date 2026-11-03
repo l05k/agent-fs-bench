@@ -272,12 +272,8 @@ def write_seed_package_json(path: Path) -> None:
     )
 
 
-def ignore_args(manager: str, ignore_scripts: bool) -> list[str]:
-    if ignore_scripts:
-        return ["--ignore-scripts"]
-    if manager == "pnpm":
-        return ["--config.ignore-scripts=false"]
-    return ["--ignore-scripts=false"]
+def ignore_args(ignore_scripts: bool) -> list[str]:
+    return ["--ignore-scripts"] if ignore_scripts else []
 
 
 def run_visible(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
@@ -311,7 +307,7 @@ def seed_npm(
         "--no-fund",
         "--cache",
         str(cache_dir),
-        *ignore_args("npm", ignore_scripts),
+        *ignore_args(ignore_scripts),
         *packages,
     ]
     run_visible(command, seed_dir)
@@ -344,7 +340,7 @@ def resolve_pnpm_packages(
         "--no-fund",
         "--cache",
         str(cache_dir),
-        *ignore_args("npm", ignore_scripts),
+        *ignore_args(ignore_scripts),
         *packages,
     ]
     run_visible(command, resolve_dir)
@@ -375,7 +371,7 @@ def seed_pnpm(
         f"--package-import-method={PNPM_IMPORT_METHOD}",
         "--config.enable-global-virtual-store=false",
         "--reporter=append-only",
-        *ignore_args("pnpm", ignore_scripts),
+        *ignore_args(ignore_scripts),
     ]
     run_visible(command, seed_dir, env=env)
 
@@ -594,7 +590,7 @@ def run_npm_once(
         "--no-audit",
         "--no-fund",
         "--no-update-notifier",
-        *ignore_args("npm", args.ignore_scripts),
+        *ignore_args(args.ignore_scripts),
     ]
     log(f"npm run {run_number}/{args.runs} on {project}")
     status, elapsed, user, system = run_timed(command, project, log_path)
@@ -649,7 +645,7 @@ def run_pnpm_once(
         "--config.enable-global-virtual-store=false",
         "--frozen-lockfile",
         "--reporter=append-only",
-        *ignore_args("pnpm", args.ignore_scripts),
+        *ignore_args(args.ignore_scripts),
     ]
     log(f"pnpm run {run_number}/{args.runs} on {project}")
     status, elapsed, user, system = run_timed(command, project, log_path, env=env)
@@ -854,7 +850,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--npm-bin", default=os.environ.get("NPM_BIN", "npm"), help="npm executable")
     parser.add_argument("--pnpm-bin", default=os.environ.get("PNPM_BIN", "pnpm"), help="pnpm executable")
-    parser.add_argument("--ignore-scripts", action="store_true", help="Skip lifecycle scripts")
+    parser.add_argument(
+        "--ignore-scripts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip lifecycle scripts (use --no-ignore-scripts to run them)",
+    )
     parser.add_argument("--no-prewarm", action="store_true", help="Do not pre-read cache/store")
     parser.add_argument(
         "--warm-once",
@@ -1095,7 +1096,7 @@ def main(argv: list[str]) -> int:
         "sync_mode=fsync every file and directory under node_modules",
         "sync_timing=sync_s is timed separately and excluded from elapsed_s",
         "note=warm cache/store; cold node_modules; cache/store reads are warmed; "
-        "scripts enabled unless --ignore-scripts; logical_bytes counts file entries; "
+        "scripts skipped unless --no-ignore-scripts; logical_bytes counts file entries; "
         "allocated_bytes counts each hardlinked inode once",
     ]
     manifest_path.write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
