@@ -21,6 +21,7 @@ clone 省掉真实写入；跨盘（`--prep-dir`）时被计时的写入全部�
 | --- | --- | --- |
 | `npm_install_fs_bench.py` | repo root | the benchmark (stdlib only) |
 | gist `l05k/0c7df...` (CSV, `package`+`rank`) | network | default package catalog |
+| `data/pnpm-bench/`, `data/pnpm-bench-integrated/` | repo | `--fixture` trees (pnpm's own benchmark fixtures) |
 | `<--dir>/npm_install_fs_bench-*/work/*-run-<n>/node_modules` | target FS | the timed write |
 | `<--dir>/npm_install_fs_bench-*` (same-FS mode) | target FS | cache, pnpm store, templates, seed projects |
 | `<--prep-dir>/{cache,templates,work}` (cross-FS mode) | other FS | cache, pnpm store, templates, seed projects |
@@ -30,6 +31,52 @@ Results directory contents: `results.csv`, `summary.csv`,
 `selected-packages.txt`, `manifest.txt`, `logs/{npm,pnpm}-run-<n>.log`, and
 `top-packages.csv` when the catalog was downloaded.
 
+| `data/pnpm-bench/{package.json,pnpm-lock.yaml,package-lock.json}` | repo | pnpm's `pnpm11/benchmarks/fixture` |
+| `data/pnpm-bench-integrated/{package.json,pnpm-lock.yaml,pnpm-workspace.yaml,package-lock.json}` | repo | pnpm's `integrated-benchmark/src/fixtures` |
+
+## Fixtures / fixture
+
+By default the dependency tree is a selection from the downloaded top-package
+catalog (`--top-k`, `--packages`). `--fixture NAME` replaces that with one of
+the trees pnpm's own install benchmark uses, vendored under `data/`:
+
+| Name | Upstream | Shape |
+| --- | --- | --- |
+| `pnpm-bench` | `pnpm11/benchmarks/fixture` | `bench-project`, 84 deps + 4 devDeps |
+| `pnpm-bench-integrated` | `pnpm/tasks/integrated-benchmark/src/fixtures` | `alotta-modules`, 109 deps, ships a `pnpm-workspace.yaml` |
+
+The fixture's own manifest and committed lockfile define the tree; nothing is
+re-resolved.
+
+- **pnpm** installs with `--frozen-lockfile` from the committed
+  `pnpm-lock.yaml`, so the payload is exactly what pnpm's benchmark measures.
+  The fixture's `pnpm-workspace.yaml` is copied into every run project (its
+  `storeDir` is overridden by the explicit `--store-dir`); for
+  `pnpm-bench-integrated` it also pins `supportedArchitectures` and
+  `enableGlobalVirtualStore: false`.
+- **npm** cannot read a pnpm lockfile, and these trees have peer ranges npm's
+  resolver rejects (e.g. `eslint@9` against `@typescript-eslint/parser@7`), so
+  each fixture carries a `package-lock.json` resolved with
+  `--legacy-peer-deps`. The timed npm install uses the same flag. Without the
+  committed npm lockfile the seed resolves one first.
+
+Fixtures are installed online exactly once, during the seed phase; the timed
+runs are still `--offline`. Neither fixture fits the catalog path's
+`--top-k`/`--packages` selection, so `--fixture` and `--packages` are mutually
+exclusive and `--top-k` is ignored.
+
+The two fixtures differ in what they are good for: `pnpm-bench` is the shape
+pnpm's CI tracks (fewer packages), `pnpm-bench-integrated` is larger and adds
+the cross-platform `supportedArchitectures` payload, which roughly doubles the
+installed file count for pnpm. Compare a filesystem against itself, not the two
+fixtures against each other.
+
+默认用热门包目录（gist）按 `--top-k` / `--packages` 选树；`--fixture` 改为
+直接复现 pnpm 官方 benchmark 的两个依赖树（pnpm 侧用提交的 `pnpm-lock.yaml`
+加 `--frozen-lockfile`，npm 侧用同一 fixture 内附带的、由
+`--legacy-peer-deps` 解析出的 `package-lock.json`）。fixture 只在 seed 阶段联网
+一次，计时阶段依旧 `--offline`。
+
 ## Run / 运行
 
 Same filesystem (default) — every artifact lives on the filesystem under test:
@@ -37,6 +84,7 @@ Same filesystem (default) — every artifact lives on the filesystem under test:
 ```sh
 uv run npm_install_fs_bench.py --dir /mnt/testfs --top-k 30 --runs 3
 uv run npm_install_fs_bench.py --dir /mnt/testfs --packages 'react,typescript'
+uv run npm_install_fs_bench.py --dir /mnt/testfs --fixture pnpm-bench --runs 3
 uv run npm_install_fs_bench.py --dir /mnt/testfs --seed-only   # prepare, no timing
 ```
 
@@ -45,11 +93,13 @@ Cross filesystem — caches, templates and seed projects on another filesystem:
 ```sh
 uv run npm_install_fs_bench.py --dir /mnt/nas/mount \
   --prep-dir /var/tmp/npm-prep --top-k 30 --runs 3
+uv run npm_install_fs_bench.py --dir /mnt/nas/mount \
+  --prep-dir /var/tmp/npm-prep --fixture pnpm-bench-integrated --runs 3
 ```
 
-Useful flags: `--pm npm|pnpm|both`, `--runs`, `--concurrency`, `--no-ignore-scripts`,
-`--no-prewarm`, `--warm-once`, `--keep-node-modules`, `--npm-bin`,
-`--pnpm-bin`, `--prep-dir`, `--allow-same-device`.
+Useful flags: `--fixture`, `--pm npm|pnpm|both`, `--runs`, `--concurrency`,
+`--no-ignore-scripts`, `--no-prewarm`, `--warm-once`, `--keep-node-modules`,
+`--npm-bin`, `--pnpm-bin`, `--prep-dir`, `--allow-same-device`.
 
 There is no per-artifact override: `--prep-dir` moves the npm cache, the pnpm
 store, the pnpm XDG cache, the lockfile templates and the seed projects in one
@@ -109,15 +159,19 @@ N 只会写进实测有效的旋钮：npm 是 `UV_THREADPOOL_SIZE`（它没有�
 
 ## Workload / 负载
 
-1. **Setup (untimed)** — `npm install` into a seed project (network) to build
-   the npm cache and lockfile; pnpm resolves the same spec set and seeds its
-   store, producing `pnpm-lock.yaml`. In cross-filesystem mode the seed project
+1. **Setup (untimed)** — the dependency tree is chosen once: either a
+   `--top-k`/`--packages` selection from the catalog, or a `--fixture` tree with
+   its own committed lockfiles. npm installs it into a seed project (network) to
+   build the npm cache; pnpm seeds its store from the same manifest, producing
+   `pnpm-lock.yaml` (catalog mode) or consuming the fixture's committed one with
+   `--frozen-lockfile` (fixture mode). In cross-filesystem mode the seed project
    lives under `--prep-dir`, so the network install never writes to the target.
 2. **Prewarm (untimed)** — every cache/store file is read once to fill the page
    cache (`--no-prewarm` / `--warm-once` change this).
 3. **Timed install** — a fresh project directory holding only
-   `package.json` + lockfile:
-   - npm: `npm install --offline --cache <cache>`
+   `package.json` + lockfile (+ the fixture's `pnpm-workspace.yaml`):
+   - npm: `npm install --offline --cache <cache>` (fixture mode adds
+     `--legacy-peer-deps`)
    - pnpm: `pnpm install --offline --store-dir <store> --frozen-lockfile
      --package-import-method=copy --config.enable-global-virtual-store=false`
 4. **Timed flush** — every file and directory under `node_modules` is fsynced
@@ -161,9 +215,9 @@ excluded from `elapsed_s`. `sync_errors` counts fsync/open failures (locks,
 permission, unsupported operations) that were skipped. `summary.csv` per
 manager: `ok_runs, mean_s, median_s, p95_s` plus the same statistics for
 `sync_s` and for `elapsed_s + sync_s` (`mean_total_s`, `median_total_s`).
-`manifest.txt` pins tool versions, the resolved package list, every path, the
-placement (`same`/`cross`), both `st_dev` values, the concurrency mapping and
-the timed commands.
+`manifest.txt` pins tool versions, the resolved package list (or the
+`fixture=`/`fixture_dir=` pair), every path, the placement (`same`/`cross`),
+both `st_dev` values, the concurrency mapping and the timed commands.
 
 `elapsed_s` 只包含安装过程，`sync_s` 是随后的落盘阶段、不计入 `elapsed_s`；
 `sync_errors` 记录被跳过（拿不到句柄、文件系统不支持等）的 fsync 次数。
@@ -188,5 +242,15 @@ the timed commands.
 - Whole-file fsync costs one syscall pair per file and directory. On
   high-latency filesystems `sync_s` can dominate; it is reported separately for
   that reason. 逐文件落盘在高延迟文件系统上可能成为主要开销，因此单独计时。
-- Two runs started in the same UTC second share (and overwrite) one results
-  directory.
+- Runs started in the same UTC second get a `-2`, `-3`, ... suffix on the
+  results directory instead of overwriting each other.
+- In `--fixture` mode the npm and pnpm arms install **different graphs**: pnpm
+  replays the fixture's committed `pnpm-lock.yaml`, npm resolves the same
+  `package.json` under `--legacy-peer-deps` into a different `package-lock.json`.
+  The file/byte counts therefore differ by design — compare npm-against-npm or
+  pnpm-against-pnpm across filesystems, not npm against pnpm within one run.
+  在 `--fixture` 模式下，npm 与 pnpm 装的是**不同的依赖图**（pnpm 用提交的
+  `pnpm-lock.yaml`，npm 用同一个 `package.json` 在 `--legacy-peer-deps` 下的解析
+  结果），文件数/字节数不可跨 manager 直接比较。
+- `npm` 侧的被测命令因此是 `npm install --offline --legacy-peer-deps`；这与
+  非 fixture 模式的命令不同，manifest 的 `timed_command_npm` 会如实记录。
