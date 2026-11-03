@@ -11,6 +11,23 @@ an empty node_modules directory on the target filesystem:
 Only node_modules metrics are written to results.csv. Cache/store setup and
 prewarming happen outside the timed section.
 
+Two placements are supported:
+
+* same filesystem (default) -- cache/store live next to the timed
+  node_modules, so the filesystem may hardlink or server-side clone package
+  contents instead of writing them.
+* cross filesystem (``--prep-dir``) -- npm cache, pnpm store, pnpm XDG cache,
+  templates and seed projects move to another filesystem, so every timed
+  write lands on the target filesystem as real data. The placement is
+  verified with ``st_dev`` and the run is aborted if it was not achieved.
+
+``pnpm`` always imports packages with ``copy``; ``hardlink``/``auto`` can
+short-circuit the write path this benchmark is meant to measure.
+
+After each timed install the tree is fsynced file by file and directory by
+directory. That flush is timed separately as ``sync_s`` and is not part of
+``elapsed_s``.
+
 The top-package catalog is downloaded from the gist when --packages is not
 provided. The downloaded source and parsed selection are saved under results/.
 """
@@ -81,11 +98,15 @@ PACKAGE_LIST_URL = (
     "l05k/0c7dfaedb703fa6d5465e00dd297cdcd/raw"
 )
 
+PNPM_IMPORT_METHOD = "copy"
+
 CSV_FIELDS = [
     "manager",
     "run",
     "status",
     "elapsed_s",
+    "sync_s",
+    "sync_errors",
     "user_s",
     "sys_s",
     "files",
@@ -96,6 +117,7 @@ CSV_FIELDS = [
     "allocated_bytes",
     "du_kib",
     "files_per_s",
+    "sync_files_per_s",
     "logical_mib_per_s",
     "allocated_mib_per_s",
     "log",
@@ -161,6 +183,66 @@ def sync_filesystem() -> None:
         os.sync()
     except (AttributeError, OSError):
         pass
+
+
+def fsync_tree(path: Path) -> tuple[float, int]:
+    """Fsync every file and directory under ``path``; return (seconds, errors).
+
+    Opening a directory read-only and fsyncing the descriptor persists its
+    entries. Walking bottom-up means a directory is synced after the entries
+    it gained. The walk itself is not timed: only the fsync calls are, so
+    ``elapsed_s`` and ``sync_s`` stay additive.
+    """
+    if not path.is_dir():
+        return 0.0, 0
+
+    directories: list[Path] = []
+    files: list[Path] = []
+    for dirpath, _dirnames, filenames in os.walk(path, followlinks=False):
+        directories.append(Path(dirpath))
+        for filename in filenames:
+            files.append(Path(dirpath) / filename)
+
+    errors = 0
+    elapsed = 0.0
+
+    def sync_file(file_path: Path) -> None:
+        nonlocal errors, elapsed
+        try:
+            descriptor = os.open(file_path, os.O_RDONLY)
+        except OSError:
+            errors += 1
+            return
+        try:
+            started = time.monotonic()
+            os.fsync(descriptor)
+            elapsed += time.monotonic() - started
+        except OSError:
+            errors += 1
+        finally:
+            os.close(descriptor)
+
+    def sync_directory(directory: Path) -> None:
+        nonlocal errors, elapsed
+        try:
+            descriptor = os.open(directory, os.O_RDONLY)
+        except OSError:
+            errors += 1
+            return
+        try:
+            started = time.monotonic()
+            os.fsync(descriptor)
+            elapsed += time.monotonic() - started
+        except OSError:
+            errors += 1
+        finally:
+            os.close(descriptor)
+
+    for file_path in files:
+        sync_file(file_path)
+    for directory in reversed(directories):
+        sync_directory(directory)
+    return elapsed, errors
 
 
 def warm_tree(path: Path) -> None:
@@ -276,7 +358,6 @@ def seed_pnpm(
     cache_dir: Path,
     seed_dir: Path,
     template_dir: Path,
-    import_method: str,
     ignore_scripts: bool,
 ) -> None:
     ensure_dir(seed_dir)
@@ -291,7 +372,7 @@ def seed_pnpm(
         str(store_dir),
         "--cache-dir",
         str(cache_dir),
-        f"--package-import-method={import_method}",
+        f"--package-import-method={PNPM_IMPORT_METHOD}",
         "--config.enable-global-virtual-store=false",
         "--reporter=append-only",
         *ignore_args("pnpm", ignore_scripts),
@@ -426,10 +507,22 @@ def run_timed(
     return status, elapsed, user, system
 
 
-def finalize_run(project: Path, keep_node_modules: bool) -> None:
+def finalize_run(
+    project: Path, keep_node_modules: bool
+) -> tuple[float, int, dict[str, int]]:
+    """Flush the tree, measure it while it exists, then drop it."""
+    node_modules = project / "node_modules"
+    sync_s, sync_errors = fsync_tree(node_modules)
+    metrics = tree_metrics(node_modules)
+    if sync_errors:
+        log(
+            f"fsync reported {sync_errors} error(s) under {node_modules}; "
+            "see the sync_errors column"
+        )
     if not keep_node_modules:
-        remove_tree(project / "node_modules")
+        remove_tree(node_modules)
     sync_filesystem()
+    return sync_s, sync_errors, metrics
 
 
 def make_result(
@@ -437,12 +530,13 @@ def make_result(
     run_number: int,
     status: int,
     elapsed: float,
+    sync_s: float,
+    sync_errors: int,
     user: float,
     system: float,
-    project: Path,
+    metrics: dict[str, int],
     log_name: str,
 ) -> dict[str, object]:
-    metrics = tree_metrics(project / "node_modules")
     elapsed_for_rate = elapsed if elapsed > 0 else 0.0
     files_per_s = metrics["files"] / elapsed_for_rate if elapsed_for_rate else 0.0
     logical_mib_s = (
@@ -455,15 +549,22 @@ def make_result(
         if elapsed_for_rate
         else 0.0
     )
+    sync_for_rate = sync_s if sync_s > 0 else 0.0
+    sync_files_per_s = (
+        metrics["files"] / sync_for_rate if sync_for_rate else 0.0
+    )
     return {
         "manager": manager,
         "run": run_number,
         "status": "ok" if status == 0 else "failed",
         "elapsed_s": f"{elapsed:.6f}",
+        "sync_s": f"{sync_s:.6f}",
+        "sync_errors": sync_errors,
         "user_s": f"{user:.6f}",
         "sys_s": f"{system:.6f}",
         **metrics,
         "files_per_s": f"{files_per_s:.3f}",
+        "sync_files_per_s": f"{sync_files_per_s:.3f}",
         "logical_mib_per_s": f"{logical_mib_s:.3f}",
         "allocated_mib_per_s": f"{allocated_mib_s:.3f}",
         "log": log_name,
@@ -497,14 +598,17 @@ def run_npm_once(
     ]
     log(f"npm run {run_number}/{args.runs} on {project}")
     status, elapsed, user, system = run_timed(command, project, log_path)
+    sync_s, sync_errors, metrics = finalize_run(project, args.keep_node_modules)
     row = make_result(
         "npm",
         run_number,
         status,
         elapsed,
+        sync_s,
+        sync_errors,
         user,
         system,
-        project,
+        metrics,
         log_path.name,
     )
     if status != 0:
@@ -512,7 +616,6 @@ def run_npm_once(
         tail = read_tail(log_path)
         if tail:
             print(tail, file=sys.stderr)
-    finalize_run(project, args.keep_node_modules)
     return row
 
 
@@ -542,7 +645,7 @@ def run_pnpm_once(
         str(store_dir),
         "--cache-dir",
         str(pnpm_cache),
-        f"--package-import-method={args.pnpm_import_method}",
+        f"--package-import-method={PNPM_IMPORT_METHOD}",
         "--config.enable-global-virtual-store=false",
         "--frozen-lockfile",
         "--reporter=append-only",
@@ -550,14 +653,17 @@ def run_pnpm_once(
     ]
     log(f"pnpm run {run_number}/{args.runs} on {project}")
     status, elapsed, user, system = run_timed(command, project, log_path, env=env)
+    sync_s, sync_errors, metrics = finalize_run(project, args.keep_node_modules)
     row = make_result(
         "pnpm",
         run_number,
         status,
         elapsed,
+        sync_s,
+        sync_errors,
         user,
         system,
-        project,
+        metrics,
         log_path.name,
     )
     if status != 0:
@@ -565,7 +671,6 @@ def run_pnpm_once(
         tail = read_tail(log_path)
         if tail:
             print(tail, file=sys.stderr)
-    finalize_run(project, args.keep_node_modules)
     return row
 
 
@@ -580,15 +685,32 @@ def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
 def write_summary(path: Path, rows: list[dict[str, object]], managers: list[str]) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle, lineterminator="\n")
-        writer.writerow(["manager", "ok_runs", "mean_s", "median_s", "p95_s"])
+        writer.writerow(
+            [
+                "manager",
+                "ok_runs",
+                "mean_s",
+                "median_s",
+                "p95_s",
+                "mean_sync_s",
+                "median_sync_s",
+                "mean_total_s",
+                "median_total_s",
+            ]
+        )
         for manager in managers:
-            values = sorted(
-                float(row["elapsed_s"])
+            ok_rows = [
+                row
                 for row in rows
                 if row["manager"] == manager and row["status"] == "ok"
-            )
+            ]
+            values = sorted(float(row["elapsed_s"]) for row in ok_rows)
             if not values:
                 continue
+            sync_values = sorted(float(row["sync_s"]) for row in ok_rows)
+            total_values = sorted(
+                float(row["elapsed_s"]) + float(row["sync_s"]) for row in ok_rows
+            )
             p95_index = max(0, math.ceil(0.95 * len(values)) - 1)
             writer.writerow(
                 [
@@ -597,6 +719,10 @@ def write_summary(path: Path, rows: list[dict[str, object]], managers: list[str]
                     f"{statistics.mean(values):.6f}",
                     f"{statistics.median(values):.6f}",
                     f"{values[p95_index]:.6f}",
+                    f"{statistics.mean(sync_values):.6f}",
+                    f"{statistics.median(sync_values):.6f}",
+                    f"{statistics.mean(total_values):.6f}",
+                    f"{statistics.median(total_values):.6f}",
                 ]
             )
 
@@ -678,11 +804,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "The script creates a unique ROOT under --dir. Cache/store are shared across "
-            "timed runs; each run starts with no node_modules.\n\n"
+            "timed runs; each run starts with no node_modules.\n"
+            "Without --prep-dir the caches share --dir; with it, everything the timed "
+            "install only reads moves to another filesystem.\n\n"
             "Examples:\n"
             "  %(prog)s --dir /mnt/testfs --top-k 30 --runs 3\n"
             "  %(prog)s --dir /mnt/testfs --packages 'react,typescript'\n"
-            "  %(prog)s --dir /mnt/testfs --pnpm-import-method hardlink\n"
+            "  %(prog)s --dir /mnt/nas/mount --prep-dir /var/tmp/npm-prep\n"
         ),
     )
     parser.add_argument(
@@ -706,16 +834,26 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--pm", choices=["npm", "pnpm", "both"], default="both", help="Manager selection")
     parser.add_argument("--runs", type=int, default=5, help="Timed runs per manager")
-    parser.add_argument("--cache-dir", type=Path, help="npm cache directory")
-    parser.add_argument("--store-dir", type=Path, help="pnpm store directory")
+    parser.add_argument(
+        "--prep-dir",
+        type=Path,
+        help=(
+            "Cross-filesystem mode: keep the npm cache, pnpm store, pnpm XDG "
+            "cache, lockfile templates and seed projects here (another "
+            "filesystem than --dir). Omit it to keep everything on --dir."
+        ),
+    )
+    parser.add_argument(
+        "--allow-same-device",
+        action="store_true",
+        help=(
+            "Allow --prep-dir to resolve to the same filesystem as --dir. The "
+            "filesystem can then hardlink or clone package contents instead of "
+            "writing them, so the run no longer measures the write path."
+        ),
+    )
     parser.add_argument("--npm-bin", default=os.environ.get("NPM_BIN", "npm"), help="npm executable")
     parser.add_argument("--pnpm-bin", default=os.environ.get("PNPM_BIN", "pnpm"), help="pnpm executable")
-    parser.add_argument(
-        "--pnpm-import-method",
-        choices=["copy", "hardlink", "auto"],
-        default="copy",
-        help="pnpm package import method (default: copy)",
-    )
     parser.add_argument("--ignore-scripts", action="store_true", help="Skip lifecycle scripts")
     parser.add_argument("--no-prewarm", action="store_true", help="Do not pre-read cache/store")
     parser.add_argument(
@@ -739,23 +877,125 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return args
 
 
+def device_of(path: Path) -> int:
+    return path.stat().st_dev
+
+
+def describe_device(path: Path) -> str:
+    try:
+        return f"dev={device_of(path)}"
+    except OSError as exc:
+        return f"dev=unknown ({exc})"
+
+
+def check_placement(
+    target_dir: Path,
+    prep_dir: Path | None,
+    allow_same_device: bool,
+) -> tuple[str, list[str]]:
+    """Return (placement, manifest lines) after validating the layout."""
+    target_device = device_of(target_dir)
+    lines = [f"target_device={target_device}"]
+    if prep_dir is None:
+        log("placement: same filesystem (no --prep-dir)")
+        return "same", lines
+
+    prep_device = device_of(prep_dir)
+    lines.append(f"prep_dir_device={prep_device}")
+    if prep_device == target_device:
+        if not allow_same_device:
+            die(
+                f"--prep-dir {prep_dir} is on the same filesystem as --dir "
+                f"{target_dir} (both device {target_device}); the filesystem "
+                "can then hardlink or clone package contents instead of "
+                "writing them. Point --prep-dir at another filesystem, or pass "
+                "--allow-same-device to run anyway."
+            )
+        log(
+            "warning: --prep-dir shares the target filesystem; cache reads keep "
+            "competing with the timed writes"
+        )
+        return "cross (same device, --allow-same-device)", lines
+
+    log(f"placement: cross filesystem ({target_device} -> {prep_device})")
+    return "cross", lines
+
+
+def same_device_of(first: Path, second: Path) -> bool:
+    try:
+        return device_of(first) == device_of(second)
+    except OSError:
+        return False
+
+
+def make_layout(
+    root: Path, prep_dir: Path | None
+) -> dict[str, object]:
+    """Build the cache/store/template/work layout for one placement mode.
+
+    In cross-filesystem mode everything the timed install only reads lives on
+    ``prep_dir``; only each run's ``node_modules`` is written to ``root``.
+    """
+    if prep_dir is None:
+        cache_root = root / "cache"
+        return {
+            "npm_cache": ensure_dir(cache_root / "npm"),
+            "pnpm_store": ensure_dir(cache_root / "pnpm"),
+            "pnpm_cache": ensure_dir(cache_root / "pnpm-xdg"),
+            "npm_template": ensure_dir(root / "templates" / "npm"),
+            "pnpm_template": ensure_dir(root / "templates" / "pnpm"),
+            "work_root": ensure_dir(root / "work"),
+        }
+
+    npm_cache = ensure_dir(prep_dir / "cache" / "npm")
+    # The pnpm store and its XDG cache must share a filesystem, so they are
+    # always built as siblings under --prep-dir.
+    pnpm_store = ensure_dir(prep_dir / "cache" / "pnpm")
+    pnpm_cache = ensure_dir(prep_dir / "cache" / "pnpm-xdg")
+    if not same_device_of(pnpm_store, pnpm_cache):
+        die(
+            f"pnpm store {pnpm_store} and pnpm XDG cache {pnpm_cache} are on "
+            "different filesystems; they must share one"
+        )
+    return {
+        "npm_cache": npm_cache,
+        "pnpm_store": pnpm_store,
+        "pnpm_cache": pnpm_cache,
+        "npm_template": ensure_dir(prep_dir / "templates" / "npm"),
+        "pnpm_template": ensure_dir(prep_dir / "templates" / "pnpm"),
+        "work_root": ensure_dir(prep_dir / "work"),
+    }
+
+
+def warn_if_pnpm_split(npm_cache: Path, pnpm_store: Path) -> None:
+    if same_device_of(npm_cache, pnpm_store):
+        return
+    log(
+        "note: the npm cache and the pnpm store are on different filesystems; "
+        "each manager is then measured with its own cache placement"
+    )
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     target_dir = ensure_dir(args.target_dir)
-    # Intermediate artifacts must live on the filesystem under test.
+    prep_dir = ensure_dir(args.prep_dir) if args.prep_dir else None
+    placement, placement_lines = check_placement(
+        target_dir, prep_dir, args.allow_same_device
+    )
+    # The benchmark root always lives on the filesystem under test.
     root = Path(tempfile.mkdtemp(prefix="npm-install-bench-", dir=str(target_dir)))
     # Only reports, logs and manifests go to the project results directory.
     results_dir = results_run_dir(SCRIPT_NAME, anchor=__file__)
 
-    cache_root = root / "cache"
-    npm_cache = ensure_dir(args.cache_dir) if args.cache_dir else ensure_dir(cache_root / "npm")
-    pnpm_store = ensure_dir(args.store_dir) if args.store_dir else ensure_dir(cache_root / "pnpm")
-    pnpm_cache = ensure_dir(cache_root / "pnpm-xdg")
-
-    templates_root = root / "templates"
-    npm_template = ensure_dir(templates_root / "npm")
-    pnpm_template = ensure_dir(templates_root / "pnpm")
-    work_root = ensure_dir(root / "work")
+    layout = make_layout(root, prep_dir)
+    npm_cache = layout["npm_cache"]
+    pnpm_store = layout["pnpm_store"]
+    pnpm_cache = layout["pnpm_cache"]
+    npm_template = layout["npm_template"]
+    pnpm_template = layout["pnpm_template"]
+    work_root = layout["work_root"]
+    warn_if_pnpm_split(npm_cache, pnpm_store)
     seed_npm_dir = work_root / "seed-npm"
     seed_pnpm_dir = work_root / "seed-pnpm"
     resolve_dir = work_root / "resolve"
@@ -815,6 +1055,9 @@ def main(argv: list[str]) -> int:
     manifest_lines = [
         f"root={root}",
         f"target_dir={target_dir}",
+        f"prep_dir={prep_dir or 'not used'}",
+        f"placement={placement}",
+        *placement_lines,
         f"work_dir={work_root}",
         f"created_at_utc={created_at}",
         f"selected_packages={len(packages)}",
@@ -841,14 +1084,16 @@ def main(argv: list[str]) -> int:
         f"prewarm={int(not args.no_prewarm)}",
         f"warm_each_run={int(args.warm_each_run)}",
         f"keep_node_modules={int(args.keep_node_modules)}",
-        f"pnpm_import_method={args.pnpm_import_method}",
+        f"pnpm_import_method={PNPM_IMPORT_METHOD}",
         "pnpm_global_virtual_store=0",
         "timed_command_npm=npm install --offline",
         (
             "timed_command_pnpm=pnpm install --offline "
-            f"--package-import-method={args.pnpm_import_method} "
+            f"--package-import-method={PNPM_IMPORT_METHOD} "
             "--config.enable-global-virtual-store=false"
         ),
+        "sync_mode=fsync every file and directory under node_modules",
+        "sync_timing=sync_s is timed separately and excluded from elapsed_s",
         "note=warm cache/store; cold node_modules; cache/store reads are warmed; "
         "scripts enabled unless --ignore-scripts; logical_bytes counts file entries; "
         "allocated_bytes counts each hardlinked inode once",
@@ -885,7 +1130,6 @@ def main(argv: list[str]) -> int:
             pnpm_cache,
             seed_pnpm_dir,
             pnpm_template,
-            args.pnpm_import_method,
             args.ignore_scripts,
         )
 

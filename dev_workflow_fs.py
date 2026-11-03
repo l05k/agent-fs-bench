@@ -681,21 +681,32 @@ def cleanup_failed_clone(repo: Path, *, preserve_root: bool) -> None:
         shutil.rmtree(repo)
 
 
-def has_local_commit(repo: Path, revision: str) -> bool:
+def resolve_commit(repo: Path, revision: str) -> str | None:
+    """Resolve a revision expression (e.g. ``<sha>^``) to a full commit id.
+
+    ``rev-parse --verify --quiet`` exits 1 for anything it cannot resolve, so
+    missing objects stay a "not present" answer instead of an error.
+    """
     result = run_command(
         [
             "git",
             "-c",
             "core.hooksPath=/dev/null",
-            "cat-file",
-            "-e",
+            "rev-parse",
+            "--verify",
+            "--quiet",
             f"{revision}^{{commit}}",
         ],
         cwd=repo,
-        what=f"checking for local commit {revision}",
+        what=f"resolving commit {revision}",
+        capture_stdout=True,
         allow_codes=(0, 1),
     )
-    return result.returncode == 0
+    return result.stdout.strip() or None
+
+
+def has_local_commit(repo: Path, revision: str) -> bool:
+    return resolve_commit(repo, revision) is not None
 
 
 def prepare_linux_checkout(
@@ -711,6 +722,7 @@ def prepare_linux_checkout(
 
     action = "reused"
     preserve_root = False
+    needs_clone = not repo.exists()
     if repo.exists():
         if not repo.is_dir():
             raise WorkflowError(f"--repo is not a directory: {repo}")
@@ -719,12 +731,17 @@ def prepare_linux_checkout(
                 raise WorkflowError(
                     f"--repo is non-empty but is not a Git checkout: {repo}"
                 )
-        elif os.path.ismount(repo):
-            preserve_root = True
         else:
-            repo.rmdir()
+            # An empty directory is kept when it is a mountpoint (it cannot be
+            # removed, and removing it would drop the filesystem under test).
+            # ``git clone`` accepts an existing empty directory, so the clone
+            # still happens either way.
+            preserve_root = os.path.ismount(repo)
+            needs_clone = True
+            if not preserve_root:
+                repo.rmdir()
 
-    if not repo.exists():
+    if needs_clone:
         repo.parent.mkdir(parents=True, exist_ok=True)
         source = Path(linux_url).expanduser()
         clone_source = str(source.resolve()) if source.exists() else linux_url
@@ -988,9 +1005,15 @@ def begin_checkout_run(
         )
 
     head = git_text(repo, ["rev-parse", "HEAD"], what="reading checkout HEAD")
-    if head != base_commit:
+    expected = resolve_commit(repo, base_commit)
+    if expected is None:
         raise WorkflowError(
-            f"checkout HEAD is {head}, expected fixture base commit {base_commit}"
+            f"fixture base commit {base_commit} is not present in {repo}"
+        )
+    if head != expected:
+        raise WorkflowError(
+            f"checkout HEAD is {head}, expected fixture base commit "
+            f"{base_commit} ({expected})"
         )
 
     status = git_text(
@@ -1052,7 +1075,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     config_path = fixture_dir / DEFAULT_CONFIG
 
     series = validate_fixtures(fixture_dir)
-    base_commit = series["base_commit"]
+    base_commit_expression = series["base_commit"]
     commits = series["commits"]
     commit_ids = [commit["id"] for commit in commits]
 
@@ -1061,11 +1084,22 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     repo_action = prepare_linux_checkout(
         repo,
         linux_url=args.linux_url,
-        base_commit=base_commit,
+        base_commit=base_commit_expression,
         commit_ids=commit_ids,
         verbose=args.verbose,
     )
-    validate_repository(repo, base_commit=base_commit, commit_ids=commit_ids)
+    validate_repository(
+        repo, base_commit=base_commit_expression, commit_ids=commit_ids
+    )
+    # The fixture may name its base with a revision expression (the shipped
+    # dev-workflow fixture uses ``c2c54b5f34f6^``). Everything after this point
+    # compares full object ids, so resolve once here.
+    base_commit = resolve_commit(repo, base_commit_expression)
+    if base_commit is None:
+        raise WorkflowError(
+            f"fixture base commit {base_commit_expression} cannot be resolved "
+            f"in {repo}"
+        )
     marker = active_marker_path(repo)
 
     if args.jobs > 0:
@@ -1086,6 +1120,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     success = False
     error: str | None = None
     timed_start: int | None = None
+    # Cleanup must only touch a checkout this process claimed; an abort such as
+    # "another run owns this checkout" must not reset the owner's work.
+    owns_marker = False
 
     try:
         begin_checkout_run(
@@ -1094,6 +1131,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             marker=marker,
             verbose=args.verbose,
         )
+        owns_marker = True
         preparation_ms = elapsed_ms(preparation_start)
         print(
             f"Linux preparation complete ({repo_action}, {preparation_ms} ms).",
@@ -1248,7 +1286,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         else:
             workflow_ms = 0
         cleanup_start = time.perf_counter_ns()
-        if marker.exists():
+        if owns_marker:
             try:
                 cleanup_checkout(
                     repo,

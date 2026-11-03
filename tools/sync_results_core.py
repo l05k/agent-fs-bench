@@ -26,6 +26,7 @@ END = "# <<< END GENERATED results-core <<<"
 
 TARGETS = (
     REPO_ROOT / "dev_workflow_fs.py",
+    REPO_ROOT / "mini_dev_workflow_fs.py",
     REPO_ROOT / "npm-install-fs-bench.py",
     REPO_ROOT / "openclaw_session_bench.py",
 )
