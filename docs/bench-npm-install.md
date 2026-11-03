@@ -47,7 +47,7 @@ uv run npm-install-fs-bench.py --dir /mnt/nas/mount \
   --prep-dir /var/tmp/npm-prep --top-k 30 --runs 3
 ```
 
-Useful flags: `--pm npm|pnpm|both`, `--runs`, `--ignore-scripts`,
+Useful flags: `--pm npm|pnpm|both`, `--runs`, `--no-ignore-scripts`,
 `--no-prewarm`, `--warm-once`, `--keep-node-modules`, `--npm-bin`,
 `--pnpm-bin`, `--prep-dir`, `--allow-same-device`.
 
