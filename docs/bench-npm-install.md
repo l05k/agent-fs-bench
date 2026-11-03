@@ -19,12 +19,12 @@ clone 省掉真实写入；跨盘（`--prep-dir`）时被计时的写入全部�
 
 | Path | Where | Purpose |
 | --- | --- | --- |
-| `npm-install-fs-bench.py` | repo root | the benchmark (stdlib only) |
+| `npm_install_fs_bench.py` | repo root | the benchmark (stdlib only) |
 | gist `l05k/0c7df...` (CSV, `package`+`rank`) | network | default package catalog |
-| `<--dir>/npm-install-bench-*/work/*-run-<n>/node_modules` | target FS | the timed write |
-| `<--dir>/npm-install-bench-*` (same-FS mode) | target FS | cache, pnpm store, templates, seed projects |
+| `<--dir>/npm_install_fs_bench-*/work/*-run-<n>/node_modules` | target FS | the timed write |
+| `<--dir>/npm_install_fs_bench-*` (same-FS mode) | target FS | cache, pnpm store, templates, seed projects |
 | `<--prep-dir>/{cache,templates,work}` (cross-FS mode) | other FS | cache, pnpm store, templates, seed projects |
-| `results/npm-install-fs-bench/<UTC-run-id>/` | project | reports only |
+| `results/npm_install_fs_bench/<UTC-run-id>/` | project | reports only |
 
 Results directory contents: `results.csv`, `summary.csv`,
 `selected-packages.txt`, `manifest.txt`, `logs/{npm,pnpm}-run-<n>.log`, and
@@ -35,19 +35,19 @@ Results directory contents: `results.csv`, `summary.csv`,
 Same filesystem (default) — every artifact lives on the filesystem under test:
 
 ```sh
-uv run npm-install-fs-bench.py --dir /mnt/testfs --top-k 30 --runs 3
-uv run npm-install-fs-bench.py --dir /mnt/testfs --packages 'react,typescript'
-uv run npm-install-fs-bench.py --dir /mnt/testfs --seed-only   # prepare, no timing
+uv run npm_install_fs_bench.py --dir /mnt/testfs --top-k 30 --runs 3
+uv run npm_install_fs_bench.py --dir /mnt/testfs --packages 'react,typescript'
+uv run npm_install_fs_bench.py --dir /mnt/testfs --seed-only   # prepare, no timing
 ```
 
 Cross filesystem — caches, templates and seed projects on another filesystem:
 
 ```sh
-uv run npm-install-fs-bench.py --dir /mnt/nas/mount \
+uv run npm_install_fs_bench.py --dir /mnt/nas/mount \
   --prep-dir /var/tmp/npm-prep --top-k 30 --runs 3
 ```
 
-Useful flags: `--pm npm|pnpm|both`, `--runs`, `--no-ignore-scripts`,
+Useful flags: `--pm npm|pnpm|both`, `--runs`, `--concurrency`, `--no-ignore-scripts`,
 `--no-prewarm`, `--warm-once`, `--keep-node-modules`, `--npm-bin`,
 `--pnpm-bin`, `--prep-dir`, `--allow-same-device`.
 
@@ -56,6 +56,56 @@ store, the pnpm XDG cache, the lockfile templates and the seed projects in one
 step. `--prep-dir` must resolve to a different device (`st_dev`) than `--dir`;
 otherwise the run aborts with an explanation unless `--allow-same-device` is
 given.
+
+## Concurrency / 并发
+
+`--concurrency N` fixes the parallelism of the timed install at `N`; the
+default is **4**, which is also npm's threadpool default and pnpm's macOS copy
+pool default. The two managers have no shared knob, so `N` is applied to the
+ones with a measured effect:
+
+| Manager | Pinned by `--concurrency N` | Tool default | Measured effect |
+| --- | --- | --- | --- |
+| npm | `UV_THREADPOOL_SIZE=N` | 4 | `1` → ~20% slower; `2`/`4` equal; above 4 slower |
+| pnpm (Linux/Windows) | `RAYON_NUM_THREADS=N` | `clamp(2×cpu, 4, 16)` | the pool that copies the store into `node_modules` |
+| pnpm (macOS) | `PNPM_MACOS_LINK_THREADS=N` | 4 | `1` → 1.98s, `4` → 1.11s, `16` → 0.90s |
+
+`--concurrency 0` disables pinning and leaves every tool at its own default.
+
+**npm has no install-wide concurrency option.** Arborist's
+`[_unpackNewModules]` fans every pending package out to pacote at once, and
+there is no CLI flag or config key to bound it. What *is* boundable is the
+libuv threadpool, because the unpack writes are async `fs.write` calls; that is
+the one pin above. It is a real but weak lever on this workload — the store
+materialisation is dominated by the fan-out, not by the pool width.
+
+**pnpm's timed install is almost entirely its copy phase**, so the copy pool is
+what `N` has to reach. On Linux and Windows that is rayon
+(`RAYON_NUM_THREADS`). On macOS the copy runs on a separate, smaller pool whose
+default is 4, and `RAYON_NUM_THREADS` alone changes nothing there — both are set
+so one `N` means the same thing on either platform.
+
+Deliberately **not** set, because they do not affect a timed offline install:
+
+| Knob | Why not |
+| --- | --- |
+| `PNPM_MAX_WORKERS` | the pnpm 11 Node worker pool; pnpm 12's binary never reads it |
+| `--network-concurrency` | bounds downloads; an offline install fetches nothing (measured effect < 1%) |
+| `--child-concurrency` | bounds lifecycle scripts; `--ignore-scripts` is the default (measured effect < 1%) |
+| `--maxsockets` | registry sockets only, same reason as `--network-concurrency` |
+
+The seed phase uses the same values, so the cache/store are populated under the
+same parallelism as the timed runs. `manifest.txt` records `concurrency`,
+`concurrency_note`, `npm_concurrency`, `pnpm_concurrency` and both timed
+commands with their environment prefix, e.g.
+`UV_THREADPOOL_SIZE=4 npm install --offline`. `results.csv` carries a
+`concurrency` column so mixed runs stay separable.
+
+`--concurrency N` 固定计时安装的并发度，默认 **4**。两个包管理器没有共同的开关，
+N 只会写进实测有效的旋钮：npm 是 `UV_THREADPOOL_SIZE`（它没有安装级并发选项，解包
+扇出本身无上限），pnpm 是 `RAYON_NUM_THREADS` 与 macOS 上独立的
+`PNPM_MACOS_LINK_THREADS`（默认 4）。`PNPM_MAX_WORKERS` 只有 pnpm 11 读，下载/脚本
+类限制对离线安装没有影响，所以都不设置；`--concurrency 0` 表示不固定、沿用各自默认。
 
 ## Workload / 负载
 
@@ -101,8 +151,8 @@ cacache 解包，没有对应开关，用 `allocated_bytes / logical_bytes` 比�
 
 ## Output / 输出
 
-`results.csv` per run: `manager, run, status, elapsed_s, sync_s, sync_errors,
-user_s, sys_s, files, dirs, symlinks, hardlinks, logical_bytes,
+`results.csv` per run: `manager, run, concurrency, status, elapsed_s, sync_s,
+sync_errors, user_s, sys_s, files, dirs, symlinks, hardlinks, logical_bytes,
 allocated_bytes, du_kib, files_per_s, sync_files_per_s, logical_mib_per_s,
 allocated_mib_per_s, log`.
 
@@ -112,7 +162,8 @@ permission, unsupported operations) that were skipped. `summary.csv` per
 manager: `ok_runs, mean_s, median_s, p95_s` plus the same statistics for
 `sync_s` and for `elapsed_s + sync_s` (`mean_total_s`, `median_total_s`).
 `manifest.txt` pins tool versions, the resolved package list, every path, the
-placement (`same`/`cross`), both `st_dev` values and the timed commands.
+placement (`same`/`cross`), both `st_dev` values, the concurrency mapping and
+the timed commands.
 
 `elapsed_s` 只包含安装过程，`sync_s` 是随后的落盘阶段、不计入 `elapsed_s`；
 `sync_errors` 记录被跳过（拿不到句柄、文件系统不支持等）的 fsync 次数。

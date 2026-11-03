@@ -24,6 +24,26 @@ Two placements are supported:
 ``pnpm`` always imports packages with ``copy``; ``hardlink``/``auto`` can
 short-circuit the write path this benchmark is meant to measure.
 
+``--concurrency N`` (default 4) pins the parallelism knobs that actually
+govern a timed offline install. The managers do not share one knob, so N
+is applied per manager:
+
+* npm has **no** install-wide limit and no option for one: Arborist fans
+  every pending package out to pacote at once. Its writes are async
+  ``fs.write`` calls, so ``UV_THREADPOOL_SIZE`` is the one pin available;
+  at 4 the default is unchanged, and lowering it measurably serialises
+  the writes (1 is ~20% slower on the reference tree).
+* pnpm's store-to-``node_modules`` copy is what the timed install mostly
+  does. ``RAYON_NUM_THREADS`` sizes that pool (Linux/Windows);
+  ``PNPM_MACOS_LINK_THREADS`` sizes the separate macOS copy pool, whose
+  default of 4 is why the two are set together -- on macOS the rayon
+  variable alone changes nothing.
+
+``PNPM_MAX_WORKERS`` (pnpm 11's Node worker pool, unread by pnpm 12) and
+``--network-concurrency`` / ``--child-concurrency`` (which bound downloads
+and lifecycle scripts, not an offline materialisation) are deliberately not
+set. ``--concurrency 0`` keeps each tool's own defaults instead.
+
 After each timed install the tree is fsynced file by file and directory by
 directory. That flush is timed separately as ``sync_s`` and is not part of
 ``elapsed_s``.
@@ -99,10 +119,19 @@ PACKAGE_LIST_URL = (
 )
 
 PNPM_IMPORT_METHOD = "copy"
+DEFAULT_CONCURRENCY = 4
+CONCURRENCY_NOTE = (
+    "one N is pinned onto the knobs with a measured effect: npm gets "
+    "UV_THREADPOOL_SIZE (its unpack fan-out itself has no limit or option), "
+    "pnpm gets RAYON_NUM_THREADS and PNPM_MACOS_LINK_THREADS. The download "
+    "and lifecycle-script limits and the pnpm 11 worker pool are not set "
+    "because they do not affect a timed offline install"
+)
 
 CSV_FIELDS = [
     "manager",
     "run",
+    "concurrency",
     "status",
     "elapsed_s",
     "sync_s",
@@ -264,7 +293,7 @@ def warm_tree(path: Path) -> None:
 def write_seed_package_json(path: Path) -> None:
     path.write_text(
         '{\n'
-        '  "name": "npm-install-fs-bench-seed",\n'
+        '  "name": "npm_install_fs_bench_seed",\n'
         '  "version": "1.0.0",\n'
         '  "private": true\n'
         '}\n',
@@ -274,6 +303,86 @@ def write_seed_package_json(path: Path) -> None:
 
 def ignore_args(ignore_scripts: bool) -> list[str]:
     return ["--ignore-scripts"] if ignore_scripts else []
+
+
+def concurrency_for(
+    manager: str, concurrency: int
+) -> tuple[dict[str, str], list[str], str]:
+    """Return (env, extra args, description) pinning ``manager`` to ``concurrency``.
+
+    ``concurrency`` of 0 keeps the tool's own defaults and returns empty
+    overrides. The managers do not share a single knob, so one value is
+    mapped onto the ones that measurably matter; see the module docstring
+    and docs/bench-npm-install.md for the measurements behind this table.
+
+    Only knobs with a measured effect are set. Dropped on purpose:
+
+    * ``PNPM_MAX_WORKERS`` -- the pnpm 11 Node worker pool; pnpm 12's binary
+      does not read it at all.
+    * ``--network-concurrency`` / ``--child-concurrency`` -- these bound
+      download and lifecycle-script concurrency, which the offline timed
+      install barely uses; measured effect under 1%.
+    """
+    if concurrency < 1:
+        return {}, [], "tool default"
+
+    if manager == "npm":
+        # npm has no install-wide limit: Arborist fans every pending package
+        # out to pacote at once. The libuv pool is what its async file system
+        # calls actually run on, so it is the only pin available.
+        env = {"UV_THREADPOOL_SIZE": str(concurrency)}
+        return env, [], f"UV_THREADPOOL_SIZE={concurrency}"
+
+    env = {
+        # Linux/Windows: rayon copies packages out of the store.
+        "RAYON_NUM_THREADS": str(concurrency),
+        # macOS: a separate, smaller pool does the copying (default 4).
+        "PNPM_MACOS_LINK_THREADS": str(concurrency),
+    }
+    return env, [], f"RAYON_NUM_THREADS={concurrency} PNPM_MACOS_LINK_THREADS={concurrency}"
+
+
+def manager_env(manager: str, concurrency: int) -> dict[str, str] | None:
+    """Process environment for one install, or ``None`` to inherit unchanged."""
+    env, _args, _description = concurrency_for(manager, concurrency)
+    if not env:
+        return None
+    merged = os.environ.copy()
+    merged.update(env)
+    return merged
+
+
+def concurrency_args(manager: str, concurrency: int) -> list[str]:
+    return concurrency_for(manager, concurrency)[1]
+
+
+def env_prefix(manager: str, concurrency: int) -> str:
+    """Render the pinned environment the way it would be typed in a shell."""
+    env, _args, _description = concurrency_for(manager, concurrency)
+    return " ".join(f"{key}={value}" for key, value in sorted(env.items()))
+
+
+def timed_command(manager: str, base: list[str], concurrency: int) -> str:
+    command = " ".join([manager, *base, *concurrency_args(manager, concurrency)])
+    prefix = env_prefix(manager, concurrency)
+    return f"{prefix} {command}" if prefix else command
+
+
+def pnpm_timed_command(concurrency: int) -> str:
+    return timed_command(
+        "pnpm",
+        [
+            "install",
+            "--offline",
+            "--package-import-method=" + PNPM_IMPORT_METHOD,
+            "--config.enable-global-virtual-store=false",
+        ],
+        concurrency,
+    )
+
+
+def npm_timed_command(concurrency: int) -> str:
+    return timed_command("npm", ["install", "--offline"], concurrency)
 
 
 def run_visible(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
@@ -295,6 +404,7 @@ def seed_npm(
     templates_dir: Path,
     packages: list[str],
     ignore_scripts: bool,
+    concurrency: int,
 ) -> None:
     ensure_dir(seed_dir)
     write_seed_package_json(seed_dir / "package.json")
@@ -307,10 +417,11 @@ def seed_npm(
         "--no-fund",
         "--cache",
         str(cache_dir),
+        *concurrency_args("npm", concurrency),
         *ignore_args(ignore_scripts),
         *packages,
     ]
-    run_visible(command, seed_dir)
+    run_visible(command, seed_dir, env=manager_env("npm", concurrency))
 
     package_json = seed_dir / "package.json"
     package_lock = seed_dir / "package-lock.json"
@@ -328,6 +439,7 @@ def resolve_pnpm_packages(
     pnpm_template_dir: Path,
     packages: list[str],
     ignore_scripts: bool,
+    concurrency: int,
 ) -> None:
     ensure_dir(resolve_dir)
     write_seed_package_json(resolve_dir / "package.json")
@@ -340,10 +452,11 @@ def resolve_pnpm_packages(
         "--no-fund",
         "--cache",
         str(cache_dir),
+        *concurrency_args("npm", concurrency),
         *ignore_args(ignore_scripts),
         *packages,
     ]
-    run_visible(command, resolve_dir)
+    run_visible(command, resolve_dir, env=manager_env("npm", concurrency))
     shutil.copy2(resolve_dir / "package.json", pnpm_template_dir / "package.json")
     remove_tree(resolve_dir / "node_modules")
 
@@ -355,11 +468,10 @@ def seed_pnpm(
     seed_dir: Path,
     template_dir: Path,
     ignore_scripts: bool,
+    concurrency: int,
 ) -> None:
     ensure_dir(seed_dir)
     shutil.copy2(template_dir / "package.json", seed_dir / "package.json")
-    env = os.environ.copy()
-    env["XDG_CACHE_HOME"] = str(cache_dir)
     command = [
         pnpm_bin,
         "install",
@@ -371,8 +483,13 @@ def seed_pnpm(
         f"--package-import-method={PNPM_IMPORT_METHOD}",
         "--config.enable-global-virtual-store=false",
         "--reporter=append-only",
+        *concurrency_args("pnpm", concurrency),
         *ignore_args(ignore_scripts),
     ]
+    env = manager_env("pnpm", concurrency)
+    if env is None:
+        env = os.environ.copy()
+    env["XDG_CACHE_HOME"] = str(cache_dir)
     run_visible(command, seed_dir, env=env)
 
     lockfile = seed_dir / "pnpm-lock.yaml"
@@ -524,6 +641,7 @@ def finalize_run(
 def make_result(
     manager: str,
     run_number: int,
+    concurrency: int,
     status: int,
     elapsed: float,
     sync_s: float,
@@ -552,6 +670,7 @@ def make_result(
     return {
         "manager": manager,
         "run": run_number,
+        "concurrency": concurrency,
         "status": "ok" if status == 0 else "failed",
         "elapsed_s": f"{elapsed:.6f}",
         "sync_s": f"{sync_s:.6f}",
@@ -590,14 +709,18 @@ def run_npm_once(
         "--no-audit",
         "--no-fund",
         "--no-update-notifier",
+        *concurrency_args("npm", args.concurrency),
         *ignore_args(args.ignore_scripts),
     ]
     log(f"npm run {run_number}/{args.runs} on {project}")
-    status, elapsed, user, system = run_timed(command, project, log_path)
+    status, elapsed, user, system = run_timed(
+        command, project, log_path, env=manager_env("npm", args.concurrency)
+    )
     sync_s, sync_errors, metrics = finalize_run(project, args.keep_node_modules)
     row = make_result(
         "npm",
         run_number,
+        args.concurrency,
         status,
         elapsed,
         sync_s,
@@ -631,7 +754,9 @@ def run_pnpm_once(
         warm_tree(store_dir)
         warm_tree(pnpm_cache)
 
-    env = os.environ.copy()
+    env = manager_env("pnpm", args.concurrency)
+    if env is None:
+        env = os.environ.copy()
     env["XDG_CACHE_HOME"] = str(pnpm_cache)
     command = [
         pnpm_bin,
@@ -645,6 +770,7 @@ def run_pnpm_once(
         "--config.enable-global-virtual-store=false",
         "--frozen-lockfile",
         "--reporter=append-only",
+        *concurrency_args("pnpm", args.concurrency),
         *ignore_args(args.ignore_scripts),
     ]
     log(f"pnpm run {run_number}/{args.runs} on {project}")
@@ -653,6 +779,7 @@ def run_pnpm_once(
     row = make_result(
         "pnpm",
         run_number,
+        args.concurrency,
         status,
         elapsed,
         sync_s,
@@ -727,7 +854,7 @@ def download_package_catalog(url: str, destination: Path) -> list[str]:
     log(f"downloading package catalog: {url}")
     request = urlrequest.Request(
         url,
-        headers={"User-Agent": "npm-install-fs-bench/1.0"},
+        headers={"User-Agent": "npm_install_fs_bench/1.0"},
     )
     try:
         with urlrequest.urlopen(request, timeout=30) as response:
@@ -831,6 +958,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--pm", choices=["npm", "pnpm", "both"], default="both", help="Manager selection")
     parser.add_argument("--runs", type=int, default=5, help="Timed runs per manager")
     parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        metavar="N",
+        help=(
+            "Pin every parallelism knob that affects a timed install to N "
+            "(npm: UV_THREADPOOL_SIZE; pnpm: RAYON_NUM_THREADS and "
+            "PNPM_MACOS_LINK_THREADS). 0 keeps each tool's own defaults. The "
+            "seed phase uses the same values."
+        ),
+    )
+    parser.add_argument(
         "--prep-dir",
         type=Path,
         help=(
@@ -874,6 +1013,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--top-k must be greater than zero")
     if args.runs < 1:
         parser.error("--runs must be greater than zero")
+    if args.concurrency < 0:
+        parser.error("--concurrency must be zero or greater")
     args.warm_each_run = not args.no_prewarm and not args.warm_once
     return args
 
@@ -985,7 +1126,7 @@ def main(argv: list[str]) -> int:
         target_dir, prep_dir, args.allow_same_device
     )
     # The benchmark root always lives on the filesystem under test.
-    root = Path(tempfile.mkdtemp(prefix="npm-install-bench-", dir=str(target_dir)))
+    root = Path(tempfile.mkdtemp(prefix="npm_install_fs_bench-", dir=str(target_dir)))
     # Only reports, logs and manifests go to the project results directory.
     results_dir = results_run_dir(SCRIPT_NAME, anchor=__file__)
 
@@ -1087,12 +1228,12 @@ def main(argv: list[str]) -> int:
         f"keep_node_modules={int(args.keep_node_modules)}",
         f"pnpm_import_method={PNPM_IMPORT_METHOD}",
         "pnpm_global_virtual_store=0",
-        "timed_command_npm=npm install --offline",
-        (
-            "timed_command_pnpm=pnpm install --offline "
-            f"--package-import-method={PNPM_IMPORT_METHOD} "
-            "--config.enable-global-virtual-store=false"
-        ),
+        f"concurrency={args.concurrency}",
+        f"concurrency_note={CONCURRENCY_NOTE}",
+        f"npm_concurrency={concurrency_for('npm', args.concurrency)[2]}",
+        f"pnpm_concurrency={concurrency_for('pnpm', args.concurrency)[2]}",
+        f"timed_command_npm={npm_timed_command(args.concurrency)}",
+        f"timed_command_pnpm={pnpm_timed_command(args.concurrency)}",
         "sync_mode=fsync every file and directory under node_modules",
         "sync_timing=sync_s is timed separately and excluded from elapsed_s",
         "note=warm cache/store; cold node_modules; cache/store reads are warmed; "
@@ -1109,6 +1250,7 @@ def main(argv: list[str]) -> int:
             npm_template,
             packages,
             args.ignore_scripts,
+            args.concurrency,
         )
     elif args.pm == "pnpm":
         resolve_pnpm_packages(
@@ -1118,6 +1260,7 @@ def main(argv: list[str]) -> int:
             pnpm_template,
             packages,
             args.ignore_scripts,
+            args.concurrency,
         )
     if args.pm == "both":
         shutil.copy2(
@@ -1132,6 +1275,7 @@ def main(argv: list[str]) -> int:
             seed_pnpm_dir,
             pnpm_template,
             args.ignore_scripts,
+            args.concurrency,
         )
 
     if not args.no_prewarm:

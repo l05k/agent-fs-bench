@@ -11,7 +11,7 @@ downloads and builds on the test machine:
 | --- | --- |
 | [`dev_workflow_fs.py`](./dev_workflow_fs.py) | Kernel dev workflow (config/build/search/edit/commit) in one disposable Linux checkout |
 | [`mini_dev_workflow_fs.py`](./mini_dev_workflow_fs.py) | Same workflow shape against a tiny C project in a disposable Git worktree; the fast reproducer |
-| [`npm-install-fs-bench.py`](./npm-install-fs-bench.py) | Warm npm/pnpm cache, cold `node_modules` install, same- or cross-filesystem cache placement |
+| [`npm_install_fs_bench.py`](./npm_install_fs_bench.py) | Warm npm/pnpm cache, cold `node_modules` install, same- or cross-filesystem cache placement |
 | [`openclaw_session_bench.py`](./openclaw_session_bench.py) | OpenClaw transcript SQLite write microbenchmark |
 | [`kvtest_openclaw_fs.py`](./kvtest_openclaw_fs.py) | SQLite's official `kvtest --multitrans`: one commit per write, as an OpenClaw-shaped lower bound |
 
@@ -40,9 +40,10 @@ uv run <script>  # run any benchmark in the project environment
 ```sh
 uv run dev_workflow_fs.py --repo /mnt/testfs/linux
 uv run mini_dev_workflow_fs.py --repo /mnt/testfs/mini-worktree
-uv run npm-install-fs-bench.py --dir /mnt/testfs --top-k 30 --runs 3
-uv run npm-install-fs-bench.py --dir /mnt/nas/mount \
+uv run npm_install_fs_bench.py --dir /mnt/testfs --top-k 30 --runs 3
+uv run npm_install_fs_bench.py --dir /mnt/nas/mount \
   --prep-dir /var/tmp/npm-prep --top-k 30 --runs 3
+uv run npm_install_fs_bench.py --dir /mnt/testfs --top-k 30 --concurrency 8
 uv run openclaw_session_bench.py --dir /mnt/testfs --duration 30
 uv run kvtest_openclaw_fs.py --dir /mnt/testfs --count 2000
 ```
@@ -51,11 +52,15 @@ uv run kvtest_openclaw_fs.py --dir /mnt/testfs --count 2000
 artifacts (Linux checkout, npm/pnpm caches and `node_modules`, SQLite database
 and WAL) stay on that filesystem so the measurements reflect it.
 
-`npm-install-fs-bench.py` is the exception: `--prep-dir` deliberately moves its
+`npm_install_fs_bench.py` is the exception: `--prep-dir` deliberately moves its
 npm cache, pnpm store, pnpm XDG cache and seed projects to another filesystem,
 so that every write timed in `--dir` is real data rather than a hardlink or a
 server-side clone. Without `--prep-dir` the caches share `--dir`, which is the
-historical behaviour.
+historical behaviour. Its `--concurrency N` pins the parallelism of the timed
+install (default `4`; `0` leaves each tool at its own default) on the knobs that
+measurably matter — `UV_THREADPOOL_SIZE` for npm, `RAYON_NUM_THREADS` and
+`PNPM_MACOS_LINK_THREADS` for pnpm. See
+[`docs/bench-npm-install.md`](./docs/bench-npm-install.md#concurrency--并发).
 
 `dev_workflow_fs.py` reads its fixtures from `data/dev-workflow/` next to the
 script (override with `--fixture-dir`); copy the script together with `data/`
@@ -114,7 +119,7 @@ Only the profiling/timing results go to the project directory, under
 results/
   dev_workflow_fs/20261102T042113Z/result.json
   mini_dev_workflow_fs/20261102T042113Z/result.json
-  npm-install-fs-bench/20261102T042113Z/
+  npm_install_fs_bench/20261102T042113Z/
     results.csv
     summary.csv
     selected-packages.txt
@@ -164,7 +169,7 @@ fixtures are derived from external work:
 | `mini-dev-workflow` fixtures, and the base of `mini_dev_workflow_fs.py` | [`YoloFS/perf-eval`](https://github.com/YoloFS/perf-eval) — `fixtures/mini-dev-workflow` and `src/workloads/mini_dev_workflow.rs` | `mini_dev_workflow_fs.py` |
 | Dev-workflow patchset | Amir Goldstein's overlayfs `ovl_file` refactoring, merged in Linux v6.13 (`fs/overlayfs/file.c`), replayed from upstream git history | `dev_workflow_fs.py` |
 | Linux source tree | [`torvalds/linux`](https://github.com/torvalds/linux) (default `--linux-url`) | `dev_workflow_fs.py` |
-| Top-package catalog | [gist `l05k/0c7dfaedb703fa6d5465e00dd297cdcd`](https://gist.github.com/l05k/0c7dfaedb703fa6d5465e00dd297cdcd) | `npm-install-fs-bench.py` |
+| Top-package catalog | [gist `l05k/0c7dfaedb703fa6d5465e00dd297cdcd`](https://gist.github.com/l05k/0c7dfaedb703fa6d5465e00dd297cdcd) | `npm_install_fs_bench.py` |
 | OpenClaw transcript schema and WAL settings | [`openclaw/openclaw`](https://github.com/openclaw/openclaw) at `5f6f15fed0d6` | `openclaw_session_bench.py` |
 
 Vendored fixtures were copied verbatim from `YoloFS/perf-eval` at commit
