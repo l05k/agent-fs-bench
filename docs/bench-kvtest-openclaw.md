@@ -110,8 +110,18 @@ Deliberate workload gaps:
 - **Uniform payloads.** OpenClaw payloads are 90% 1–4 KiB, 9% 256 KiB, 1% 1 MiB
   JSON text; `kvtest` writes fixed-size BLOBs varied only by `--variance`.
 
-`kvtest` therefore measures the **commit + BLOB overwrite lower bound** of the
-OpenClaw write path, not the whole path.
+`kvtest` is a **single-table random BLOB overwrite comparison benchmark**, with
+one commit per operation, not a strict lower bound on OpenClaw latency: the
+simpler schema and stronger default synchronization pull costs in opposite
+directions. `Microseconds per BLOB write` is total elapsed time divided by the
+operation count, including connection setup and the final close/checkpoint;
+it is not a sampled transaction latency distribution.
+
+The harness passes a negative SQLite `cache_size` so `--cache-size` is in KiB,
+not pages. `reached_settings.journal_mode` comes from kvtest's own connection
+output (nonpersistent modes can differ on a later inspection connection).
+An integrity check other than `ok` marks the result as failed and returns a
+nonzero exit code.
 
 ## Artifacts
 
@@ -125,5 +135,7 @@ results/kvtest_openclaw_fs/<UTC-run-id>/
   kvtest-stdout.txt          raw kvtest output for every phase
 ```
 
-A run started within the same second reuses and overwrites that second's
-directory.
+Runs within the same second use `-2`, `-3`, ... suffixes instead of overwriting
+previous reports. Do not run concurrently against the same `--dir`: the database
+name is fixed and each invocation deletes it before setup. The first build uses
+the bundled SQLite header and does not require a system SQLite development package.
