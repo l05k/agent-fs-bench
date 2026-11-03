@@ -30,24 +30,31 @@ Checkpoint boundaries are recorded as zero-cost markers: this variant
 deliberately removes ckpt/backend operations, so its timings must not be
 compared with backend checkpoint measurements.
 
-The source repository is ``--source-repo`` (default:
-``data/mini-dev-workflow/source-repo``). Upstream shipped it as a Git submodule
-and later deleted it, so this repository rebuilds it with
+The source repository holding the fixture commits lives next to ``--repo``
+(``<repo>-source``) so that Git's index, refs, logs and objects sit on the
+filesystem under test. Upstream shipped the fixture repository as a Git
+submodule and later deleted it, so this repository rebuilds it with
 ``tools/gen_mini_source_repo.py`` and keeps an exported
-``source-repo.bundle`` next to it: clone the bundle once
-(``git clone <fixture>/source-repo.bundle <dir>``) and pass that clone. A
-``--repo`` path that already exists and is not empty is an error: the worktree
-target must be fresh.
+``source-repo.bundle`` next to it; on first use the bundle is cloned to that
+path, and later runs reuse it. A ``--repo`` path that already exists and is
+not empty is an error: the worktree target must be fresh.
+
+Durability: Git runs with ``core.fsync=committed`` and
+``core.fsyncMethod=fsync`` so ``git commit`` really does flush. Nothing else in
+the workload fsyncs - the edit scripts and the compiler only reach the page
+cache - and no cache is dropped between phases, so reads are warm. Timings are
+throughput/efficiency numbers, not crash-durability numbers; ``result.json``
+reports both ``fsync_mode`` and ``cache_state``.
 
 Review notes / known limitations:
 
-* The worktree is created on the filesystem under test, but the source
-  repository (and therefore ``git worktree add``'s object access) lives in
-  ``data/``, which is usually not the filesystem under test.
 * ``--repo`` is removed on cleanup; it must be disposable.
 * The ownership marker lands in the source repository's Git directory, so
   concurrent runs sharing one source repository are not supported.
 * Shell fixture pipelines are not run with ``pipefail``.
+* Commits accumulate unreachable loose objects in the source repository.
+  Nothing prunes them; right before a comparison, remove ``<repo>-source`` so
+  the next run starts from the bundle again.
 """
 
 from __future__ import annotations
@@ -55,6 +62,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shlex
 import shutil
 import signal
@@ -91,16 +99,20 @@ def results_run_dir(script_name, anchor=None, moment=None):
     """Create and return ``<project>/results/<script_name>/<utc-run-id>``.
 
     ``anchor`` is the benchmark script path (default: this file), so the
-    location never depends on the current working directory. An existing
-    directory for the same run id is reused.
+    location never depends on the current working directory. A second run in
+    the same second would otherwise overwrite the first one's artifacts, so a
+    ``-2``, ``-3``, ... suffix is appended until the directory is unused.
     """
     anchor_path = _ResultsPath(anchor if anchor is not None else __file__)
-    path = (
-        anchor_path.resolve().parent
-        / RESULTS_DIRNAME
-        / script_name
-        / utc_run_id(moment)
+    root = (
+        anchor_path.resolve().parent / RESULTS_DIRNAME / script_name
     )
+    run_id = utc_run_id(moment)
+    path = root / run_id
+    suffix = 1
+    while path.exists():
+        suffix += 1
+        path = root / f"{run_id}-{suffix}"
     path.mkdir(parents=True, exist_ok=True)
     return path
 # <<< END GENERATED results-core <<<
@@ -108,10 +120,20 @@ def results_run_dir(script_name, anchor=None, moment=None):
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_FIXTURE_DIR = SCRIPT_DIR / "data" / "mini-dev-workflow"
 DEFAULT_SERIES = "series.json"
-DEFAULT_SOURCE_REPO = "source-repo"
 DEFAULT_BUNDLE = "source-repo.bundle"
 SCRIPT_NAME = Path(__file__).stem
 ACTIVE_MARKER = "mini-dev-workflow-fs-active"
+
+# Git metadata (objects, index, refs, logs) and the replayed tree must live on
+# the filesystem under test, so the source repository sits next to --repo.
+SOURCE_REPO_SUFFIX = "-source"
+
+# The fixture builds two translation units at most, so extra build parallelism
+# only adds scheduling noise. Pin it.
+FIXED_JOBS = 2
+
+FSYNC_MODE = "git:core.fsync=committed,core.fsyncMethod=fsync"
+CACHE_STATE = "warm: no cache drop; reads hit page cache dirtied by the run"
 
 CORE_COMMANDS = ("git", "bash", "make", "grep", "sed", "python3")
 BUILD_COMMANDS = (("cc", "gcc", "clang"),)
@@ -308,9 +330,13 @@ def run_command(
     env.update(
         {
             "GIT_TERMINAL_PROMPT": "0",
-            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_COUNT": "3",
             "GIT_CONFIG_KEY_0": "core.hooksPath",
             "GIT_CONFIG_VALUE_0": "/dev/null",
+            "GIT_CONFIG_KEY_1": "core.fsync",
+            "GIT_CONFIG_VALUE_1": "committed",
+            "GIT_CONFIG_KEY_2": "core.fsyncMethod",
+            "GIT_CONFIG_VALUE_2": "fsync",
         }
     )
     if extra_env:
@@ -603,13 +629,27 @@ def require_filesystem(path: Path, expected: str | None, label: str) -> None:
         )
 
 
+def default_source_repo(worktree: Path) -> Path:
+    """Return the source repository path next to ``--repo``.
+
+    The repository must sit on the filesystem under test: ``git worktree add``
+    keeps the index, refs and objects in the source repository, so anything
+    placed elsewhere is timed against the wrong filesystem.
+    """
+    return worktree.parent / f"{worktree.name}{SOURCE_REPO_SUFFIX}"
+
+
 def ensure_source_repo(source_repo: Path, fixture_dir: Path, *, verbose: bool) -> None:
-    """Recreate the default source repository from its committed bundle."""
+    """Create the source repository from the committed bundle when absent."""
     if source_repo.exists():
         return
     bundle = fixture_dir / DEFAULT_BUNDLE
-    if source_repo != (fixture_dir / DEFAULT_SOURCE_REPO) or not bundle.is_file():
-        return
+    if not bundle.is_file():
+        raise WorkflowError(
+            f"cannot create source repository {source_repo}: "
+            f"bundle not found at {bundle}"
+        )
+    source_repo.parent.mkdir(parents=True, exist_ok=True)
     run_command(
         ["git", "-c", "core.hooksPath=/dev/null", "clone", "--quiet",
          str(bundle), str(source_repo)],
@@ -619,23 +659,40 @@ def ensure_source_repo(source_repo: Path, fixture_dir: Path, *, verbose: bool) -
     )
 
 
+def prepare_source_repo(
+    source_repo: Path, fixture_dir: Path, *, verbose: bool
+) -> int:
+    """Ensure the source repository exists; return its one-off setup time.
+
+    Creation happens before any timed section, so later runs reuse the
+    repository and pay nothing. The cost is reported separately instead of
+    being folded into a reused-run measurement.
+    """
+    if source_repo.exists():
+        return 0
+    start = time.perf_counter_ns()
+    ensure_source_repo(source_repo, fixture_dir, verbose=verbose)
+    return elapsed_ms(start)
+
+
 def resolve_source_repo(source_repo: Path, *, verbose: bool) -> Path:
-    """Validate --source-repo and return the directory to run ``git`` in."""
+    """Validate the source repository and return the directory to run git in."""
     if not source_repo.exists():
         raise WorkflowError(
             f"source repository not found: {source_repo}\n"
-            "Run tools/gen_mini_source_repo.py or pass --source-repo."
+            "It is created from the fixture bundle on first use; if that "
+            "failed, remove the path and rerun."
         )
     if not source_repo.is_dir():
         raise WorkflowError(
-            f"source repository must be a Git worktree, not a file: {source_repo}\n"
+            f"source repository must be a Git checkout, not a file: {source_repo}\n"
             f"If this is source-repo.bundle, extract it first: "
             f"git clone {source_repo} <dir>"
         )
     if not (source_repo / ".git").exists():
         raise WorkflowError(
             f"{source_repo} is not a Git repository; "
-            "run tools/gen_mini_source_repo.py"
+            "remove it and rerun so it is recreated from the bundle"
         )
     run_command(
         ["git", "-c", "core.hooksPath=/dev/null", "rev-parse", "--git-dir"],
@@ -777,13 +834,36 @@ def begin_run(
 
 
 def has_local_commit(repo: Path, revision: str) -> bool:
+    # ``rev-parse --verify --quiet`` exits 1 for an unresolvable revision;
+    # ``cat-file -e`` exits 128, which would bypass the friendly error below.
     result = run_command(
-        ["git", "-c", "core.hooksPath=/dev/null", "cat-file", "-e", f"{revision}^{{commit}}"],
+        [
+            "git",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{revision}^{{commit}}",
+        ],
         cwd=repo,
         what=f"checking for local commit {revision}",
+        capture_stdout=True,
         allow_codes=(0, 1),
     )
-    return result.returncode == 0
+    return result.stdout.strip() != ""
+
+
+def loose_object_count(repo: Path) -> int:
+    """Count loose objects so run-to-run history growth stays visible."""
+    objects = repo / ".git" / "objects"
+    if not objects.is_dir():
+        return 0
+    count = 0
+    for entry in objects.iterdir():
+        if len(entry.name) == 2 and entry.is_dir():
+            count += sum(1 for _ in entry.iterdir())
+    return count
 
 
 def verify_tree(worktree: Path, commit_id: str) -> dict[str, Any]:
@@ -808,29 +888,86 @@ def record_checkpoint(step: int, phase: str, steps: list[dict[str, Any]]) -> Non
     steps.append({"step": f"checkpoint: {phase}", "ms": 0})
 
 
-def write_result(results_dir: Path, result: dict[str, Any]) -> None:
+def summary_text(result: dict[str, Any]) -> str:
+    lines = [f"{result.get('workflow', 'workflow')} ({result.get('execution_mode', '?')})"]
+    if result.get("repo"):
+        lines.append(f"repo={result['repo']} source={result.get('source_repo')}")
+    lines.append(
+        f"success={result.get('success')} filesystem={result.get('filesystem')}"
+    )
+    if result.get("elapsed_ms") is not None:
+        lines.append(
+            f"elapsed_ms={result['elapsed_ms']} "
+            f"preparation_ms={result.get('preparation_ms')} "
+            f"cleanup_ms={result.get('cleanup_ms')} "
+            f"unattributed_ms={result.get('unattributed_ms')}"
+        )
+        lines.append(
+            f"jobs={result.get('jobs')} checkpoints={result.get('checkpoint_count')}"
+        )
+        lines.append(f"fsync_mode: {result.get('fsync_mode', '?')}")
+        lines.append(f"cache_state: {result.get('cache_state', '?')}")
+        lines.append(
+            f"loose_objects: {result.get('loose_objects_before')} -> "
+            f"{result.get('loose_objects_after')}"
+        )
+    error = result.get("error")
+    if error:
+        lines.append(f"error: {error}")
+    return "\n".join(lines) + "\n"
+
+
+def manifest_text(result: dict[str, Any], argv: list[str]) -> str:
+    return "\n".join(
+        [
+            f"workload: {result.get('workflow', '?')}",
+            f"generated_at_utc: {utc_run_id()}",
+            f"command: {shlex.join([sys.executable, Path(__file__).name, *argv])}",
+            f"platform: {platform.platform()}",
+            f"python_version: {sys.version.split()[0]}",
+            f"target_repo: {result.get('repo', '?')}",
+            f"source_repo: {result.get('source_repo', '?')}",
+            f"git_dir: {result.get('git_dir', '?')}",
+            f"jobs: {result.get('jobs')}",
+            f"fsync_mode: {result.get('fsync_mode', '?')}",
+            f"cache_state: {result.get('cache_state', '?')}",
+            f"required_filesystem: {result.get('required_filesystem')}",
+        ]
+    ) + "\n"
+
+
+def write_result(
+    results_dir: Path,
+    result: dict[str, Any],
+    argv: list[str],
+) -> None:
     output = results_dir / "result.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    (results_dir / "summary.txt").write_text(summary_text(result), encoding="utf-8")
+    (results_dir / "manifest.txt").write_text(
+        manifest_text(result, argv), encoding="utf-8"
+    )
     print(f"Results written to {output}", file=sys.stderr)
 
 
 def resolve_jobs(args: argparse.Namespace) -> int:
-    if args.jobs > 0:
-        return args.jobs
-    try:
-        return len(os.sched_getaffinity(0))
-    except (AttributeError, OSError):
-        return os.cpu_count() or 1
+    """Pin build parallelism.
+
+    The fixture has two translation units, so a larger ``-j`` only adds
+    scheduling noise. An explicit ``--jobs`` is still honoured but clamped,
+    and the value actually used is reported in ``result.json``.
+    """
+    return min(args.jobs, FIXED_JOBS) if args.jobs > 0 else FIXED_JOBS
 
 
 def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     worktree = Path(args.repo).expanduser().absolute()
     fixture_dir = Path(args.fixture_dir).expanduser().absolute()
-    source_repo = Path(args.source_repo).expanduser().absolute()
+    source_repo = default_source_repo(worktree)
     series_path = fixture_dir / DEFAULT_SERIES
 
     series = validate_fixtures(fixture_dir)
@@ -838,14 +975,17 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     commits = series["commits"]
     commit_ids = [commit["id"] for commit in commits]
 
-    require_filesystem(worktree, args.require_fstype, "benchmark worktree")
-    filesystem = detect_filesystem(existing_ancestor(worktree))
-    ensure_source_repo(source_repo, fixture_dir, verbose=args.verbose)
+    source_setup_ms = prepare_source_repo(
+        source_repo, fixture_dir, verbose=args.verbose
+    )
     source_repo = resolve_source_repo(source_repo, verbose=args.verbose)
+    require_filesystem(source_repo, args.require_fstype, "source repository")
+    filesystem = detect_filesystem(source_repo)
 
     preparation_start = time.perf_counter_ns()
     validate_source_repository(source_repo, base_commit=base_commit, commit_ids=commit_ids)
     marker = active_marker_path(source_repo)
+    objects_before = loose_object_count(source_repo)
 
     jobs = resolve_jobs(args)
     steps: list[dict[str, Any]] = []
@@ -854,11 +994,14 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     cleanup_error: str | None = None
     cleanup_ms: int | None = None
     preparation_ms: int | None = None
+    preparation_steps: list[dict[str, Any]] = []
     workflow_ms: int | None = None
     success = False
     error: str | None = None
     timed_start: int | None = None
+    timed_end: int | None = None
     repo_action = "worktree-add"
+    source_repo_action = "cloned-bundle" if source_setup_ms else "reused"
 
     try:
         begin_run(
@@ -876,7 +1019,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             what="pruning stale worktree metadata",
             verbose=args.verbose,
         )
-        steps.append({"step": "worktree: prune", "ms": elapsed_ms(prune_start)})
+        preparation_steps.append(
+            {"step": "worktree: prune", "ms": elapsed_ms(prune_start)}
+        )
 
         add_start = time.perf_counter_ns()
         run_git(
@@ -885,7 +1030,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             what="creating the benchmark worktree",
             verbose=args.verbose,
         )
-        steps.append({"step": "worktree: add", "ms": elapsed_ms(add_start)})
+        preparation_steps.append(
+            {"step": "worktree: add", "ms": elapsed_ms(add_start)}
+        )
 
         preparation_ms = elapsed_ms(preparation_start)
         print(
@@ -919,7 +1066,15 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
 
             for phase, filename in commands:
                 category = phase.removesuffix("_commands")
-                for idx, command in enumerate(load_commands(fixture_dir / filename), 1):
+                load_start = time.perf_counter_ns()
+                loaded = load_commands(fixture_dir / filename)
+                steps.append(
+                    {
+                        "step": f"{category}-load: {commit_id}",
+                        "ms": elapsed_ms(load_start),
+                    }
+                )
+                for idx, command in enumerate(loaded, 1):
                     result = run_shell(
                         command,
                         cwd=worktree,
@@ -993,7 +1148,11 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
 
             checkpoint_step += 1
             record_checkpoint(checkpoint_step, f"git-commit {commit_id}", steps)
+            verify_start = time.perf_counter_ns()
             assertions.append(verify_tree(worktree, commit_id))
+            steps.append(
+                {"step": f"tree-verify: {commit_id}", "ms": elapsed_ms(verify_start)}
+            )
 
         success = True
     except WorkflowError as exc:
@@ -1007,8 +1166,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         if preparation_ms is None:
             preparation_ms = elapsed_ms(preparation_start)
+        timed_end = time.perf_counter_ns()
         if timed_start is not None:
-            workflow_ms = elapsed_ms(timed_start)
+            workflow_ms = (timed_end - timed_start) // 1_000_000
         else:
             workflow_ms = 0
         cleanup_start = time.perf_counter_ns()
@@ -1028,6 +1188,10 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         success = False
         error = f"{error}; {cleanup_error}" if error else cleanup_error
 
+    unattributed_ms = max(0, (workflow_ms or 0) - sum(
+        step["ms"] for step in steps if not step["step"].startswith("checkpoint: ")
+    ))
+
     return {
         "schema_version": 3,
         "workflow": "mini-dev-workflow",
@@ -1037,7 +1201,11 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "repo": str(worktree),
         "repo_action": repo_action,
         "source_repo": str(source_repo),
+        "source_repo_action": source_repo_action,
+        "source_setup_ms": source_setup_ms,
+        "git_dir": str(source_repo / ".git"),
         "preparation_ms": preparation_ms,
+        "preparation_steps": preparation_steps,
         "fixture_dir": str(fixture_dir),
         "series": str(series_path),
         "worktree_removed": not worktree.exists(),
@@ -1047,7 +1215,12 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint_count": checkpoint_step,
         "jobs": jobs,
         "elapsed_ms": workflow_ms,
+        "unattributed_ms": unattributed_ms,
         "cleanup_ms": cleanup_ms,
+        "loose_objects_before": objects_before,
+        "loose_objects_after": loose_object_count(source_repo),
+        "fsync_mode": FSYNC_MODE,
+        "cache_state": CACHE_STATE,
         "steps": steps,
         "tree_assertions": assertions,
     }
@@ -1067,7 +1240,8 @@ def validate_source_repository(
     if problems:
         raise WorkflowError(
             f"source repository {source_repo} is missing fixture commits: "
-            f"{', '.join(problems)}; regenerate the fixture with "
+            f"{', '.join(problems)}; remove that directory so it is recreated "
+            "from the fixture bundle, or regenerate the fixture with "
             "tools/gen_mini_source_repo.py"
         )
     status = git_text(
@@ -1098,11 +1272,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--source-repo",
-        default=str(DEFAULT_FIXTURE_DIR / DEFAULT_SOURCE_REPO),
-        help="Git repository holding the fixture commits (default: %(default)s)",
-    )
-    parser.add_argument(
         "--fixture-dir",
         default=str(DEFAULT_FIXTURE_DIR),
         help="directory containing the checked-in workflow fixtures",
@@ -1121,7 +1290,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--jobs",
         type=int,
         default=0,
-        help="build parallelism (default: available CPUs)",
+        help=f"build parallelism (default and maximum: {FIXED_JOBS})",
     )
     parser.add_argument(
         "--verbose",
@@ -1132,7 +1301,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(sys.argv[1:] if argv is None else argv)
+    argv = sys.argv[1:] if argv is None else argv
+    args = parse_args(argv)
     results_dir = results_run_dir(SCRIPT_NAME, anchor=__file__)
 
     try:
@@ -1166,7 +1336,7 @@ def main(argv: list[str] | None = None) -> int:
             "error": f"unexpected error: {exc}",
         }
 
-    write_result(results_dir, result)
+    write_result(results_dir, result, argv)
     if result.get("success"):
         print(
             "mini-dev-workflow completed: "

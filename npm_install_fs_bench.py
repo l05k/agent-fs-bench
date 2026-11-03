@@ -98,16 +98,20 @@ def results_run_dir(script_name, anchor=None, moment=None):
     """Create and return ``<project>/results/<script_name>/<utc-run-id>``.
 
     ``anchor`` is the benchmark script path (default: this file), so the
-    location never depends on the current working directory. An existing
-    directory for the same run id is reused.
+    location never depends on the current working directory. A second run in
+    the same second would otherwise overwrite the first one's artifacts, so a
+    ``-2``, ``-3``, ... suffix is appended until the directory is unused.
     """
     anchor_path = _ResultsPath(anchor if anchor is not None else __file__)
-    path = (
-        anchor_path.resolve().parent
-        / RESULTS_DIRNAME
-        / script_name
-        / utc_run_id(moment)
+    root = (
+        anchor_path.resolve().parent / RESULTS_DIRNAME / script_name
     )
+    run_id = utc_run_id(moment)
+    path = root / run_id
+    suffix = 1
+    while path.exists():
+        suffix += 1
+        path = root / f"{run_id}-{suffix}"
     path.mkdir(parents=True, exist_ok=True)
     return path
 # <<< END GENERATED results-core <<<

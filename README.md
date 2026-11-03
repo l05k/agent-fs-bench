@@ -68,9 +68,17 @@ to run it on another machine. It requires Linux, and its fixture commits must
 exist in the `--repo` checkout or its `--linux-url` remote.
 
 `mini_dev_workflow_fs.py` also requires Linux. It creates a detached Git
-worktree at `<fixture>/source-repo` into `--repo`, which must be absent or
-empty, and removes it afterwards. The source repository is recreated from the
-committed `source-repo.bundle` on first use if it is missing.
+worktree at `<repo>-source` (next to `--repo`, i.e. on the filesystem under
+test) into `--repo`, which must be absent or empty, and removes the worktree
+afterwards. The source repository is created from the committed
+`source-repo.bundle` on first use and reused afterwards; keep it on the
+filesystem under test, because Git stores the index, refs and objects there.
+
+All five benchmarks report `fsync_mode` and `cache_state`. `dev_workflow` and
+`mini_dev_workflow` commit with `core.fsync=committed` +
+`core.fsyncMethod=fsync`; everything else (edit scripts, compiler, linker)
+stops at the page cache, and no cache is dropped between phases — so read
+timings are warm-cache timings.
 
 `kvtest_openclaw_fs.py` is the only benchmark that needs a C compiler. It is
 still a single self-contained file: copy it alone to the test machine and run
@@ -86,9 +94,8 @@ parameter comparison against OpenClaw and the gaps it cannot close.
 ```text
 data/
   dev-workflow/          # used by dev_workflow_fs.py
-  mini-dev-workflow/     # used by mini_dev_workflow_fs.py
+  mini-dev-workflow/     # fixtures for mini_dev_workflow_fs.py
     source-repo.bundle   # committed Git bundle with the fixture history
-    source-repo/         # extracted from the bundle; git-ignored
     repo/                # reference copy of the final tree (vendored)
 ```
 
@@ -113,12 +120,19 @@ commit ids.
 
 Only the profiling/timing results go to the project directory, under
 `results/<script-name>/<UTC-run-id>/`, where the run id looks like
-`20261102T042113Z`:
+`20261102T042113Z`. Runs that start within the same second get a `-2`, `-3`,
+... suffix instead of overwriting each other:
 
 ```text
 results/
-  dev_workflow_fs/20261102T042113Z/result.json
-  mini_dev_workflow_fs/20261102T042113Z/result.json
+  dev_workflow_fs/20261102T042113Z/
+    result.json
+    summary.txt
+    manifest.txt
+  mini_dev_workflow_fs/20261102T042113Z/
+    result.json
+    summary.txt
+    manifest.txt
   npm_install_fs_bench/20261102T042113Z/
     results.csv
     summary.csv
@@ -140,8 +154,8 @@ results/
 ```
 
 The path is derived from each script's own location, so the current working
-directory does not matter. There is no option to redirect it: a run started
-within the same second reuses (and overwrites) that second's directory.
+directory does not matter. There is no option to redirect it: runs starting in
+the same second get a `-2`, `-3`, ... suffix so none overwrites another.
 
 `results/` is git-ignored.
 
