@@ -41,6 +41,7 @@ uv run <script>  # run any benchmark in the project environment
 uv run dev_workflow_fs.py --repo /mnt/testfs/linux
 uv run mini_dev_workflow_fs.py --repo /mnt/testfs/mini-worktree
 uv run npm_install_fs_bench.py --dir /mnt/testfs --top-k 30 --runs 3
+uv run npm_install_fs_bench.py --dir /mnt/testfs --fixture pnpm-bench --runs 3
 uv run npm_install_fs_bench.py --dir /mnt/nas/mount \
   --prep-dir /var/tmp/npm-prep --top-k 30 --runs 3
 uv run npm_install_fs_bench.py --dir /mnt/testfs --top-k 30 --concurrency 8
@@ -61,6 +62,11 @@ install (default `4`; `0` leaves each tool at its own default) on the knobs that
 measurably matter — `UV_THREADPOOL_SIZE` for npm, `RAYON_NUM_THREADS` and
 `PNPM_MACOS_LINK_THREADS` for pnpm. See
 [`docs/bench-npm-install.md`](./docs/bench-npm-install.md#concurrency--并发).
+
+Its dependency tree comes from the top-package catalog by default (`--top-k`,
+`--packages`), or from `--fixture pnpm-bench|pnpm-bench-integrated`, which
+replays one of the fixtures pnpm's own install benchmark uses from
+`data/pnpm-bench*/` (committed lockfiles, so the payload is fixed).
 
 `dev_workflow_fs.py` reads its fixtures from `data/dev-workflow/` next to the
 script (override with `--fixture-dir`); copy the script together with `data/`
@@ -97,11 +103,24 @@ data/
   mini-dev-workflow/     # fixtures for mini_dev_workflow_fs.py
     source-repo.bundle   # committed Git bundle with the fixture history
     repo/                # reference copy of the final tree (vendored)
+  pnpm-bench/            # used by npm_install_fs_bench.py --fixture pnpm-bench
+  pnpm-bench-integrated/ # used by npm_install_fs_bench.py --fixture pnpm-bench-integrated
 ```
 
 These are copies of the upstream `fixtures/` directory, so the benchmark
 scripts do not depend on an external checkout of that repository. Their origin
 is recorded under [Credits and dependencies](#credits-and-dependencies).
+
+The two `pnpm-bench*` directories are pnpm's own install-benchmark fixtures:
+`package.json` plus pnpm's committed `pnpm-lock.yaml` (and, for the integrated
+one, `pnpm-workspace.yaml`). Each also carries a `package-lock.json` resolved by
+npm from the same manifest with `--legacy-peer-deps` — these trees have peer
+ranges npm's resolver rejects, and a pnpm lockfile is not readable by npm. That
+lockfile is generated, not upstream, so regenerate it if a fixture is refreshed:
+
+```sh
+npm install --package-lock-only --legacy-peer-deps --ignore-scripts --cache <tmp>
+```
 
 Upstream kept `mini-dev-workflow/source-repo` as a Git submodule and later
 deleted it, so the fixture repository is not vendored verbatim. It is rebuilt
@@ -184,6 +203,7 @@ fixtures are derived from external work:
 | Dev-workflow patchset | Amir Goldstein's overlayfs `ovl_file` refactoring, merged in Linux v6.13 (`fs/overlayfs/file.c`), replayed from upstream git history | `dev_workflow_fs.py` |
 | Linux source tree | [`torvalds/linux`](https://github.com/torvalds/linux) (default `--linux-url`) | `dev_workflow_fs.py` |
 | Top-package catalog | [gist `l05k/0c7dfaedb703fa6d5465e00dd297cdcd`](https://gist.github.com/l05k/0c7dfaedb703fa6d5465e00dd297cdcd) | `npm_install_fs_bench.py` |
+| `pnpm-bench`, `pnpm-bench-integrated` fixtures | [`pnpm/pnpm`](https://github.com/pnpm/pnpm) — `pnpm11/benchmarks/fixture` and `pnpm/tasks/integrated-benchmark/src/fixtures` | `npm_install_fs_bench.py` |
 | OpenClaw transcript schema and WAL settings | [`openclaw/openclaw`](https://github.com/openclaw/openclaw) at `5f6f15fed0d6` | `openclaw_session_bench.py` |
 
 Vendored fixtures were copied verbatim from `YoloFS/perf-eval` at commit
@@ -195,6 +215,10 @@ git clone https://github.com/YoloFS/perf-eval /tmp/perf-eval
 rm -rf data/dev-workflow data/mini-dev-workflow
 cp -R /tmp/perf-eval/fixtures/dev-workflow /tmp/perf-eval/fixtures/mini-dev-workflow data/
 ```
+
+The `pnpm-bench*` fixtures are copied from `pnpm/pnpm` at `5bd38b19`
+(2026-11-03). To refresh them, re-copy the manifest and pnpm lockfile, then
+regenerate npm's lockfile as shown under [Fixtures](#fixtures).
 
 Upstream `YoloFS/perf-eval` does not currently ship a `LICENSE` file, so no
 explicit license is granted for those fixtures; confirm the terms with the

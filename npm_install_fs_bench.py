@@ -124,6 +124,12 @@ PACKAGE_LIST_URL = (
 
 PNPM_IMPORT_METHOD = "copy"
 DEFAULT_CONCURRENCY = 4
+# Upstream pnpm fixtures vendored under data/, so the benchmark can replay the
+# dependency trees pnpm's own install benchmark uses instead of a catalog.
+FIXTURES = {
+    "pnpm-bench": "data/pnpm-bench",
+    "pnpm-bench-integrated": "data/pnpm-bench-integrated",
+}
 CONCURRENCY_NOTE = (
     "one N is pinned onto the knobs with a measured effect: npm gets "
     "UV_THREADPOOL_SIZE (its unpack fan-out itself has no limit or option), "
@@ -309,6 +315,17 @@ def ignore_args(ignore_scripts: bool) -> list[str]:
     return ["--ignore-scripts"] if ignore_scripts else []
 
 
+def npm_fixture_args(args: argparse.Namespace) -> list[str]:
+    """Extra npm flags a fixture tree needs.
+
+    pnpm's own fixtures pin dependency versions whose peer ranges conflict
+    under npm's resolver (e.g. `eslint@9` against `@typescript-eslint/parser@7`
+    in the pnpm-bench fixture), so a fixture run has to resolve the same way
+    the seed did.
+    """
+    return ["--legacy-peer-deps"] if args.fixture else []
+
+
 def concurrency_for(
     manager: str, concurrency: int
 ) -> tuple[dict[str, str], list[str], str]:
@@ -372,21 +389,30 @@ def timed_command(manager: str, base: list[str], concurrency: int) -> str:
     return f"{prefix} {command}" if prefix else command
 
 
-def pnpm_timed_command(concurrency: int) -> str:
-    return timed_command(
-        "pnpm",
-        [
-            "install",
-            "--offline",
-            "--package-import-method=" + PNPM_IMPORT_METHOD,
-            "--config.enable-global-virtual-store=false",
-        ],
-        concurrency,
-    )
+def pnpm_timed_command(
+    concurrency: int,
+    store_dir: Path | None = None,
+    cache_dir: Path | None = None,
+) -> str:
+    base = [
+        "install",
+        "--offline",
+        "--package-import-method=" + PNPM_IMPORT_METHOD,
+        "--config.enable-global-virtual-store=false",
+        "--frozen-lockfile",
+    ]
+    if store_dir is not None:
+        base += ["--store-dir", str(store_dir)]
+    if cache_dir is not None:
+        base += ["--cache-dir", str(cache_dir)]
+    return timed_command("pnpm", base, concurrency)
 
 
-def npm_timed_command(concurrency: int) -> str:
-    return timed_command("npm", ["install", "--offline"], concurrency)
+def npm_timed_command(concurrency: int, legacy_peer_deps: bool = False) -> str:
+    base = ["install", "--offline"]
+    if legacy_peer_deps:
+        base.append("--legacy-peer-deps")
+    return timed_command("npm", base, concurrency)
 
 
 def run_visible(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
@@ -503,6 +529,127 @@ def seed_pnpm(
     remove_tree(seed_dir / "node_modules")
 
 
+def fixture_dir_for(name: str) -> Path:
+    """Return the vendored fixture directory for ``--fixture``."""
+    path = Path(__file__).resolve().parent / FIXTURES[name]
+    if not path.is_dir():
+        die(f"fixture {name} is missing: {path}")
+    return path
+
+
+def copy_fixture_manifest(
+    fixture_dir: Path, destination_dir: Path, lockfile: str
+) -> None:
+    ensure_dir(destination_dir)
+    for name in ("package.json", lockfile, "pnpm-workspace.yaml"):
+        source = fixture_dir / name
+        if source.is_file():
+            shutil.copy2(source, destination_dir / name)
+
+
+def seed_npm_fixture(
+    npm_bin: str,
+    cache_dir: Path,
+    seed_dir: Path,
+    templates_dir: Path,
+    fixture_dir: Path,
+    ignore_scripts: bool,
+    concurrency: int,
+) -> None:
+    """Seed the npm cache from a fixture's manifest and npm lockfile.
+
+    The vendored fixture ships pnpm's lockfile plus an npm lockfile resolved
+    from the same manifest (`--legacy-peer-deps`, which these trees need: e.g.
+    `eslint@9` against `@typescript-eslint/parser@7`). A fixture without the
+    npm lockfile gets one resolved into the seed directory first.
+    """
+    ensure_dir(seed_dir)
+    shutil.copy2(fixture_dir / "package.json", seed_dir / "package.json")
+    fixture_lockfile = fixture_dir / "package-lock.json"
+    if fixture_lockfile.is_file():
+        shutil.copy2(fixture_lockfile, seed_dir / "package-lock.json")
+    else:
+        package_lock_only = [
+            npm_bin,
+            "install",
+            "--package-lock-only",
+            "--legacy-peer-deps",
+            "--no-audit",
+            "--no-fund",
+            "--cache",
+            str(cache_dir),
+            *concurrency_args("npm", concurrency),
+            *ignore_args(ignore_scripts),
+        ]
+        run_visible(package_lock_only, seed_dir, env=manager_env("npm", concurrency))
+
+    command = [
+        npm_bin,
+        "install",
+        "--legacy-peer-deps",
+        "--no-audit",
+        "--no-fund",
+        "--cache",
+        str(cache_dir),
+        *concurrency_args("npm", concurrency),
+        *ignore_args(ignore_scripts),
+    ]
+    run_visible(command, seed_dir, env=manager_env("npm", concurrency))
+
+    package_lock = seed_dir / "package-lock.json"
+    if not package_lock.is_file():
+        die("npm fixture seed did not create package-lock.json")
+    shutil.copy2(seed_dir / "package.json", templates_dir / "package.json")
+    shutil.copy2(package_lock, templates_dir / "package-lock.json")
+    remove_tree(seed_dir / "node_modules")
+
+
+def seed_pnpm_fixture(
+    pnpm_bin: str,
+    store_dir: Path,
+    cache_dir: Path,
+    seed_dir: Path,
+    template_dir: Path,
+    fixture_dir: Path,
+    ignore_scripts: bool,
+    concurrency: int,
+) -> None:
+    """Seed the pnpm store from the fixture's committed lockfile.
+
+    The lockfile is taken as-is: ``--frozen-lockfile`` keeps the measured tree
+    identical to what pnpm's own benchmark installs, and a rewrite here would
+    silently change the payload.
+    """
+    ensure_dir(seed_dir)
+    copy_fixture_manifest(fixture_dir, seed_dir, "pnpm-lock.yaml")
+    command = [
+        pnpm_bin,
+        "install",
+        "--frozen-lockfile",
+        "--store-dir",
+        str(store_dir),
+        "--cache-dir",
+        str(cache_dir),
+        f"--package-import-method={PNPM_IMPORT_METHOD}",
+        "--config.enable-global-virtual-store=false",
+        "--reporter=append-only",
+        *concurrency_args("pnpm", concurrency),
+        *ignore_args(ignore_scripts),
+    ]
+    env = manager_env("pnpm", concurrency)
+    if env is None:
+        env = os.environ.copy()
+    env["XDG_CACHE_HOME"] = str(cache_dir)
+    run_visible(command, seed_dir, env=env)
+
+    template_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"):
+        source = seed_dir / name
+        if source.is_file():
+            shutil.copy2(source, template_dir / name)
+    remove_tree(seed_dir / "node_modules")
+
+
 def tree_metrics(node_modules: Path) -> dict[str, int]:
     metrics = {
         "files": 0,
@@ -583,6 +730,12 @@ def prepare_project(
         shutil.copy2(template_dir / "package-lock.json", project / "package-lock.json")
     else:
         shutil.copy2(template_dir / "pnpm-lock.yaml", project / "pnpm-lock.yaml")
+        # A fixture workspace manifest carries settings the fixture needs
+        # (`supportedArchitectures`, `enableGlobalVirtualStore`). Its
+        # `storeDir` is overridden by the explicit --store-dir.
+        workspace_manifest = template_dir / "pnpm-workspace.yaml"
+        if workspace_manifest.is_file():
+            shutil.copy2(workspace_manifest, project / "pnpm-workspace.yaml")
     remove_tree(project / "node_modules")
     return project
 
@@ -713,6 +866,7 @@ def run_npm_once(
         "--no-audit",
         "--no-fund",
         "--no-update-notifier",
+        *(npm_fixture_args(args)),
         *concurrency_args("npm", args.concurrency),
         *ignore_args(args.ignore_scripts),
     ]
@@ -959,6 +1113,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="SPECS",
         help="Comma-separated package specs; may be repeated. Overrides --top-k.",
     )
+    parser.add_argument(
+        "--fixture",
+        choices=sorted(FIXTURES),
+        help=(
+            "Replay a vendored pnpm benchmark fixture instead of the package "
+            "catalog: its own package.json and committed lockfile are installed "
+            "with --frozen-lockfile (pnpm) or --legacy-peer-deps (npm). "
+            "Mutually exclusive with --packages; --top-k is ignored."
+        ),
+    )
     parser.add_argument("--pm", choices=["npm", "pnpm", "both"], default="both", help="Manager selection")
     parser.add_argument("--runs", type=int, default=5, help="Timed runs per manager")
     parser.add_argument(
@@ -1149,17 +1313,43 @@ def main(argv: list[str]) -> int:
 
     catalog: list[str] = []
     catalog_path: Path | None = None
-    package_list_source = "custom --packages"
-    if args.packages:
-        packages = parse_packages(args.packages, args.top_k, catalog)
-    else:
-        package_list_source = "gist"
-        catalog_path = results_dir / "top-packages.csv"
-        catalog = download_package_catalog(PACKAGE_LIST_URL, catalog_path)
-        packages = parse_packages(None, args.top_k, catalog)
-
+    fixture_dir: Path | None = None
     selected_path = results_dir / "selected-packages.txt"
-    selected_path.write_text("\n".join(packages) + "\n", encoding="utf-8")
+    if args.fixture:
+        fixture_dir = fixture_dir_for(args.fixture)
+        package_list_source = f"fixture {Path(FIXTURES[args.fixture]).name}"
+        lockfiles = [
+            fixture_dir / name
+            for name in ("pnpm-lock.yaml", "package-lock.json")
+            if (fixture_dir / name).is_file()
+        ]
+        if not lockfiles:
+            die(f"fixture {args.fixture} has no lockfile: {fixture_dir}")
+        # The package list is not a selection here: the fixture's own manifest
+        # and lockfiles define the tree, so record them instead.
+        selected_path.write_text(
+            "\n".join(
+                [
+                    f"fixture={args.fixture}",
+                    f"fixture_dir={fixture_dir}",
+                    f"package_json={fixture_dir / 'package.json'}",
+                    *(f"lockfile={path}" for path in lockfiles),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        packages = []
+    else:
+        package_list_source = "custom --packages"
+        if args.packages:
+            packages = parse_packages(args.packages, args.top_k, catalog)
+        else:
+            package_list_source = "gist"
+            catalog_path = results_dir / "top-packages.csv"
+            catalog = download_package_catalog(PACKAGE_LIST_URL, catalog_path)
+            packages = parse_packages(None, args.top_k, catalog)
+        selected_path.write_text("\n".join(packages) + "\n", encoding="utf-8")
 
     npm_bin = resolve_tool(args.npm_bin, "npm")
     pnpm_bin = ""
@@ -1208,6 +1398,8 @@ def main(argv: list[str]) -> int:
         f"created_at_utc={created_at}",
         f"selected_packages={len(packages)}",
         f"package_list_source={package_list_source}",
+        f"fixture={args.fixture or 'none'}",
+        f"fixture_dir={fixture_dir or 'not used'}",
         f"package_list_url={PACKAGE_LIST_URL if catalog_path else 'not fetched'}",
         f"package_list_file={catalog_path or 'not downloaded'}",
         f"package_list_entries={len(catalog)}",
@@ -1236,8 +1428,8 @@ def main(argv: list[str]) -> int:
         f"concurrency_note={CONCURRENCY_NOTE}",
         f"npm_concurrency={concurrency_for('npm', args.concurrency)[2]}",
         f"pnpm_concurrency={concurrency_for('pnpm', args.concurrency)[2]}",
-        f"timed_command_npm={npm_timed_command(args.concurrency)}",
-        f"timed_command_pnpm={pnpm_timed_command(args.concurrency)}",
+        f"timed_command_npm={npm_timed_command(args.concurrency, bool(args.fixture))}",
+        f"timed_command_pnpm={pnpm_timed_command(args.concurrency, pnpm_store, pnpm_cache)}",
         "sync_mode=fsync every file and directory under node_modules",
         "sync_timing=sync_s is timed separately and excluded from elapsed_s",
         "note=warm cache/store; cold node_modules; cache/store reads are warmed; "
@@ -1246,41 +1438,64 @@ def main(argv: list[str]) -> int:
     ]
     manifest_path.write_text("\n".join(manifest_lines) + "\n", encoding="utf-8")
 
-    if args.pm in ("npm", "both"):
-        seed_npm(
-            npm_bin,
-            npm_cache,
-            seed_npm_dir,
-            npm_template,
-            packages,
-            args.ignore_scripts,
-            args.concurrency,
-        )
-    elif args.pm == "pnpm":
-        resolve_pnpm_packages(
-            npm_bin,
-            npm_cache,
-            resolve_dir,
-            pnpm_template,
-            packages,
-            args.ignore_scripts,
-            args.concurrency,
-        )
-    if args.pm == "both":
-        shutil.copy2(
-            npm_template / "package.json",
-            pnpm_template / "package.json",
-        )
-    if args.pm in ("pnpm", "both"):
-        seed_pnpm(
-            pnpm_bin,
-            pnpm_store,
-            pnpm_cache,
-            seed_pnpm_dir,
-            pnpm_template,
-            args.ignore_scripts,
-            args.concurrency,
-        )
+    if fixture_dir is not None:
+        if args.pm in ("npm", "both"):
+            seed_npm_fixture(
+                npm_bin,
+                npm_cache,
+                seed_npm_dir,
+                npm_template,
+                fixture_dir,
+                args.ignore_scripts,
+                args.concurrency,
+            )
+        if args.pm in ("pnpm", "both"):
+            seed_pnpm_fixture(
+                pnpm_bin,
+                pnpm_store,
+                pnpm_cache,
+                seed_pnpm_dir,
+                pnpm_template,
+                fixture_dir,
+                args.ignore_scripts,
+                args.concurrency,
+            )
+    else:
+        if args.pm in ("npm", "both"):
+            seed_npm(
+                npm_bin,
+                npm_cache,
+                seed_npm_dir,
+                npm_template,
+                packages,
+                args.ignore_scripts,
+                args.concurrency,
+            )
+        elif args.pm == "pnpm":
+            resolve_pnpm_packages(
+                npm_bin,
+                npm_cache,
+                resolve_dir,
+                pnpm_template,
+                packages,
+                args.ignore_scripts,
+                args.concurrency,
+            )
+        if args.pm == "both":
+            shutil.copy2(
+                npm_template / "package.json",
+                pnpm_template / "package.json",
+            )
+        if args.pm in ("pnpm", "both"):
+            seed_pnpm(
+                pnpm_bin,
+                pnpm_store,
+                pnpm_cache,
+                seed_pnpm_dir,
+                pnpm_template,
+                args.ignore_scripts,
+                args.concurrency,
+            )
 
     if not args.no_prewarm:
         if args.pm in ("npm", "both"):
