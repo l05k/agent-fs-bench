@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shlex
 import shutil
 import signal
@@ -86,16 +87,20 @@ def results_run_dir(script_name, anchor=None, moment=None):
     """Create and return ``<project>/results/<script_name>/<utc-run-id>``.
 
     ``anchor`` is the benchmark script path (default: this file), so the
-    location never depends on the current working directory. An existing
-    directory for the same run id is reused.
+    location never depends on the current working directory. A second run in
+    the same second would otherwise overwrite the first one's artifacts, so a
+    ``-2``, ``-3``, ... suffix is appended until the directory is unused.
     """
     anchor_path = _ResultsPath(anchor if anchor is not None else __file__)
-    path = (
-        anchor_path.resolve().parent
-        / RESULTS_DIRNAME
-        / script_name
-        / utc_run_id(moment)
+    root = (
+        anchor_path.resolve().parent / RESULTS_DIRNAME / script_name
     )
+    run_id = utc_run_id(moment)
+    path = root / run_id
+    suffix = 1
+    while path.exists():
+        suffix += 1
+        path = root / f"{run_id}-{suffix}"
     path.mkdir(parents=True, exist_ok=True)
     return path
 # <<< END GENERATED results-core <<<
@@ -107,6 +112,16 @@ DEFAULT_CONFIG = "tinyconfig-overlayfs.config"
 SCRIPT_NAME = Path(__file__).stem
 DEFAULT_LINUX_URL = "https://github.com/torvalds/linux.git"
 ACTIVE_MARKER = "dev-workflow-fs-active"
+
+# Fixed build parallelism: an unpinned default makes runs incomparable across
+# machines. --jobs overrides it.
+DEFAULT_JOBS = 8
+
+# Git metadata must be durable at commit time; the default
+# ``core.fsync=committed,-loose-object`` skips the loose objects this workload
+# writes, so it is set explicitly.
+FSYNC_MODE = "git:core.fsync=committed,core.fsyncMethod=fsync"
+CACHE_STATE = "warm: no cache drop; reads hit page cache dirtied by the run"
 
 CORE_COMMANDS = ("git", "bash", "make", "patch", "grep", "sed", "python3")
 KERNEL_COMMANDS = (
@@ -409,9 +424,13 @@ def run_command(
     env.update(
         {
             "GIT_TERMINAL_PROMPT": "0",
-            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_COUNT": "3",
             "GIT_CONFIG_KEY_0": "core.hooksPath",
             "GIT_CONFIG_VALUE_0": "/dev/null",
+            "GIT_CONFIG_KEY_1": "core.fsync",
+            "GIT_CONFIG_VALUE_1": "committed",
+            "GIT_CONFIG_KEY_2": "core.fsyncMethod",
+            "GIT_CONFIG_VALUE_2": "fsync",
         }
     )
     if extra_env:
@@ -877,11 +896,18 @@ def validate_repository(
 
 
 def detect_filesystem(path: Path) -> str | None:
+    """Report the filesystem backing ``path``.
+
+    ``path`` may not exist yet (``--repo`` is often absent before the clone),
+    so the nearest existing ancestor is probed. ``None`` means it could not be
+    determined, which is reported rather than silently guessed.
+    """
     findmnt = shutil.which("findmnt")
     if not findmnt:
         return None
+    probe = existing_ancestor(path)
     proc = subprocess.run(
-        [findmnt, "-T", str(path), "-n", "-o", "FSTYPE"],
+        [findmnt, "-T", str(probe), "-n", "-o", "FSTYPE"],
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -1058,12 +1084,79 @@ def record_checkpoint(step: int, phase: str, steps: list[dict[str, Any]]) -> Non
     steps.append({"step": f"checkpoint: {phase}", "ms": 0})
 
 
-def write_result(results_dir: Path, result: dict[str, Any]) -> None:
+def loose_object_count(repo: Path) -> int:
+    """Count loose objects so run-to-run repository growth stays visible."""
+    objects = repo / ".git" / "objects"
+    if not objects.is_dir():
+        return 0
+    count = 0
+    for entry in objects.iterdir():
+        if len(entry.name) == 2 and entry.is_dir():
+            count += sum(1 for _ in entry.iterdir())
+    return count
+
+
+def summary_text(result: dict[str, Any]) -> str:
+    lines = [f"{result.get('workflow', 'workflow')} ({result.get('execution_mode', '?')})"]
+    if result.get("repo"):
+        lines.append(f"repo={result['repo']}")
+    lines.append(
+        f"success={result.get('success')} filesystem={result.get('filesystem')}"
+    )
+    if result.get("elapsed_ms") is not None:
+        lines.append(
+            f"elapsed_ms={result['elapsed_ms']} "
+            f"preparation_ms={result.get('preparation_ms')} "
+            f"cleanup_ms={result.get('cleanup_ms')} "
+            f"unattributed_ms={result.get('unattributed_ms')}"
+        )
+        lines.append(
+            f"jobs={result.get('jobs')} checkpoints={result.get('checkpoint_count')}"
+        )
+        lines.append(f"fsync_mode: {result.get('fsync_mode', '?')}")
+        lines.append(f"cache_state: {result.get('cache_state', '?')}")
+        lines.append(
+            f"loose_objects: {result.get('loose_objects_before')} -> "
+            f"{result.get('loose_objects_after')}"
+        )
+    error = result.get("error")
+    if error:
+        lines.append(f"error: {error}")
+    return "\n".join(lines) + "\n"
+
+
+def manifest_text(result: dict[str, Any], argv: list[str]) -> str:
+    return "\n".join(
+        [
+            f"workload: {result.get('workflow', '?')}",
+            f"generated_at_utc: {utc_run_id()}",
+            f"command: {shlex.join([sys.executable, Path(__file__).name, *argv])}",
+            f"platform: {platform.platform()}",
+            f"python_version: {sys.version.split()[0]}",
+            f"target_repo: {result.get('repo', '?')}",
+            f"git_dir: {result.get('git_dir', '?')}",
+            f"jobs: {result.get('jobs')}",
+            f"fsync_mode: {result.get('fsync_mode', '?')}",
+            f"cache_state: {result.get('cache_state', '?')}",
+            f"required_filesystem: {result.get('required_filesystem')}",
+        ]
+    ) + "\n"
+
+
+def write_result(
+    results_dir: Path,
+    result: dict[str, Any],
+    argv: list[str],
+) -> None:
     output = results_dir / "result.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
+    )
+    (results_dir / "summary.txt").write_text(summary_text(result), encoding="utf-8")
+    (results_dir / "manifest.txt").write_text(
+        manifest_text(result, argv), encoding="utf-8"
     )
     print(f"Results written to {output}", file=sys.stderr)
 
@@ -1102,13 +1195,14 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         )
     marker = active_marker_path(repo)
 
+    # Pin the default so timings stay comparable across machines; --jobs
+    # overrides it for deliberate experiments.
     if args.jobs > 0:
         jobs = args.jobs
     else:
-        try:
-            jobs = len(os.sched_getaffinity(0))
-        except (AttributeError, OSError):
-            jobs = os.cpu_count() or 1
+        jobs = DEFAULT_JOBS
+
+    objects_before = loose_object_count(repo)
 
     steps: list[dict[str, Any]] = []
     assertions: list[dict[str, Any]] = []
@@ -1193,7 +1287,15 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
 
             for phase, filename in commands:
                 category = phase.removesuffix("_commands")
-                for idx, command in enumerate(load_commands(fixture_dir / filename), 1):
+                load_start = time.perf_counter_ns()
+                loaded = load_commands(fixture_dir / filename)
+                steps.append(
+                    {
+                        "step": f"{category}-load: {commit_id}",
+                        "ms": elapsed_ms(load_start),
+                    }
+                )
+                for idx, command in enumerate(loaded, 1):
                     result = run_shell(
                         command,
                         cwd=repo,
@@ -1267,7 +1369,11 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
 
             checkpoint_step += 1
             record_checkpoint(checkpoint_step, f"git-commit {commit_id}", steps)
+            verify_start = time.perf_counter_ns()
             assertions.append(verify_tree(repo, commit_id))
+            steps.append(
+                {"step": f"tree-verify: {commit_id}", "ms": elapsed_ms(verify_start)}
+            )
 
         success = True
     except WorkflowError as exc:
@@ -1281,8 +1387,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         if preparation_ms is None:
             preparation_ms = elapsed_ms(preparation_start)
+        timed_end = time.perf_counter_ns()
         if timed_start is not None:
-            workflow_ms = elapsed_ms(timed_start)
+            workflow_ms = (timed_end - timed_start) // 1_000_000
         else:
             workflow_ms = 0
         cleanup_start = time.perf_counter_ns()
@@ -1306,6 +1413,10 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             else cleanup_error
         )
 
+    unattributed_ms = max(0, (workflow_ms or 0) - sum(
+        step["ms"] for step in steps if not step["step"].startswith("checkpoint: ")
+    ))
+
     return {
         "schema_version": 3,
         "workflow": "dev-workflow",
@@ -1314,6 +1425,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "error": error,
         "repo": str(repo),
         "repo_action": repo_action,
+        "git_dir": str(repo / ".git"),
         "preparation_ms": preparation_ms,
         "fixture_dir": str(fixture_dir),
         "series": str(series_path),
@@ -1324,7 +1436,12 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint_count": checkpoint_step,
         "jobs": jobs,
         "elapsed_ms": workflow_ms,
+        "unattributed_ms": unattributed_ms,
         "cleanup_ms": cleanup_ms,
+        "loose_objects_before": objects_before,
+        "loose_objects_after": loose_object_count(repo),
+        "fsync_mode": FSYNC_MODE,
+        "cache_state": CACHE_STATE,
         "steps": steps,
         "tree_assertions": assertions,
     }
@@ -1372,7 +1489,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--jobs",
         type=int,
         default=0,
-        help="build parallelism (default: available CPUs)",
+        help=f"build parallelism (default: {DEFAULT_JOBS})",
     )
     parser.add_argument(
         "--verbose",
@@ -1383,7 +1500,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(sys.argv[1:] if argv is None else argv)
+    argv = sys.argv[1:] if argv is None else argv
+    args = parse_args(argv)
     results_dir = results_run_dir(SCRIPT_NAME, anchor=__file__)
 
     try:
@@ -1417,7 +1535,7 @@ def main(argv: list[str] | None = None) -> int:
             "error": f"unexpected error: {exc}",
         }
 
-    write_result(results_dir, result)
+    write_result(results_dir, result, argv)
     if result.get("success"):
         print(
             "dev-workflow completed: "
