@@ -1,0 +1,15 @@
+# Copy to local/hosts.toml. Mount the same shared target path externally.
+# Host keys and noninteractive SSH authentication must already be configured.
+[[hosts]]
+name = "node-a"
+address = "node-a.example.net"
+user = "bench"
+port = 22
+python = "python3"
+ssh_args = ["-o", "ServerAliveInterval=30"]
+
+[[hosts]]
+name = "node-b"
+address = "node-b.example.net"
+user = "bench"
+# Optional: ssh_args = ["-i", "/home/operator/.ssh/bench_ed25519"]

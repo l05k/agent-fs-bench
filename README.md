@@ -1,281 +1,210 @@
 # agent-fs-bench
 
-Benchmarking agent workloads on filesystems.
+面向 agent 工作负载的文件系统科研 benchmark。**输入是已挂载的目录；唯一原始结果是 JSONL；每次运行默认生成派生汇总 CSV，图表按需生成。**
 
-Six single-host benchmarks, plus one multi-host NAS experiment. Each
-single-host benchmark is a standalone script that can be copied alone to a test
-machine and run with a plain system `python3`; five need only the standard
-library, and the sixth shells out to SQLite's own C test program, which it
-downloads and builds on the test machine:
+正式运行环境为 Linux、Python 3.12+。不包含内部文件系统实现、挂载命令或凭据；本地盘、FUSE、NFS 使用同一个目录接口。benchmark 不负责挂载、卸载、自动安装、重试或旧结果迁移。出错即停止，修正实验环境后重测。KISS：公开 CLI 只选择“测什么、在哪测”，实验默认值集中在各 workload 的 `CONFIG` 常量中。
 
-| Script | Workload |
-| --- | --- |
-| [`dev_workflow_fs.py`](./dev_workflow_fs.py) | Kernel dev workflow (config/build/search/edit/commit) in one disposable Linux checkout |
-| [`mini_dev_workflow_fs.py`](./mini_dev_workflow_fs.py) | Same workflow shape against a tiny C project in a disposable Git worktree; the fast reproducer |
-| [`npm_install_fs_bench.py`](./npm_install_fs_bench.py) | Warm npm/pnpm cache, cold `node_modules` install, same- or cross-filesystem cache placement |
-| [`clone_bench.py`](./clone_bench.py) | Same-filesystem tree copy/clone: `cp -a`, `cp -r`, Python, or an external command copier |
-| [`openclaw_session_bench.py`](./openclaw_session_bench.py) | OpenClaw transcript SQLite write microbenchmark |
-| [`kvtest_openclaw_fs.py`](./kvtest_openclaw_fs.py) | SQLite's official `kvtest --multitrans`: one commit per write, as a single-table SQLite comparison workload |
-| [`multi_host_nas_fs.py`](./multi_host_nas_fs.py) | Multi-host NAS experiment: parallel SSH mounts, synchronized concurrent writes and shared-directory contention |
-
-Per-benchmark reference notes (EN/中文) live in
-[`docs/`](./docs):
-
-- [`docs/bench-dev-workflow.md`](./docs/bench-dev-workflow.md)
-- [`docs/bench-npm-install.md`](./docs/bench-npm-install.md)
-- [`docs/bench-clone.md`](./docs/bench-clone.md)
-- [`docs/bench-openclaw-session.md`](./docs/bench-openclaw-session.md)
-- [`docs/bench-kvtest-openclaw.md`](./docs/bench-kvtest-openclaw.md)
-- [`docs/bench-multi-host-nas.md`](./docs/bench-multi-host-nas.md)
-
-## Setup
-
-The project is managed with [uv](https://docs.astral.sh/uv/):
-
-```sh
-uv sync          # create .venv with the pinned Python
-uv run <script>  # run any benchmark in the project environment
-```
-
-`pyproject.toml` declares no third-party dependencies and requires Python 3.12.
-`.python-version` pins the interpreter; `uv.lock` is committed.
-
-## Running
-
-```sh
-uv run dev_workflow_fs.py --repo /mnt/testfs/linux
-uv run mini_dev_workflow_fs.py --repo /mnt/testfs/mini-worktree
-uv run npm_install_fs_bench.py --dir /mnt/testfs --top-k 30 --runs 3
-uv run npm_install_fs_bench.py --dir /mnt/testfs --fixture pnpm-bench --runs 3
-uv run npm_install_fs_bench.py --dir /mnt/nas/mount \
-  --prep-dir /var/tmp/npm-prep --top-k 30 --runs 3
-uv run npm_install_fs_bench.py --dir /mnt/testfs --top-k 30 --concurrency 8
-uv run clone_bench.py --mount /mnt/testfs --copiers cp,cpr,internal
-uv run clone_bench.py --mount /mnt/testfs --stage concurrency \
-  --copiers cp,internal --conc-levels 1,4,16,32
-uv run openclaw_session_bench.py --dir /mnt/testfs --duration 30
-uv run kvtest_openclaw_fs.py --dir /mnt/testfs --count 2000
-python3 multi_host_nas_fs.py --config experiments/multi-host-nas.yaml --check
-python3 multi_host_nas_fs.py --config experiments/multi-host-nas.yaml
-```
-
-`--repo` / `--dir` must point at the filesystem under test. Intermediate
-artifacts (Linux checkout, npm/pnpm caches and `node_modules`, SQLite database
-and WAL) stay on that filesystem so the measurements reflect it.
-
-`npm_install_fs_bench.py` is the exception: `--prep-dir` deliberately moves its
-npm cache, pnpm store, pnpm XDG cache and seed projects to another filesystem,
-so that every write timed in `--dir` is real data rather than a hardlink or a
-server-side clone. Without `--prep-dir` the caches share `--dir`, which is the
-historical behaviour. Its `--concurrency N` pins the parallelism of the timed
-install (default `4`; `0` leaves each tool at its own default) on the knobs that
-measurably matter — `UV_THREADPOOL_SIZE` for npm, `RAYON_NUM_THREADS` and
-`PNPM_MACOS_LINK_THREADS` for pnpm. See
-[`docs/bench-npm-install.md`](./docs/bench-npm-install.md#concurrency--并发).
-
-Its dependency tree comes from the top-package catalog by default (`--top-k`,
-`--packages`), or from `--fixture pnpm-bench|pnpm-bench-integrated`, which
-replays one of the fixtures pnpm's own install benchmark uses from
-`data/pnpm-bench*/` (committed lockfiles, so the payload is fixed).
-
-`clone_bench.py` keeps its source and destination on `--mount` and measures
-warm-cache copies only. It does not offer a cold-cache mode: dropping the
-kernel page cache does not evict FUSE or other userspace client caches, so the
-label would be false on distributed filesystems. Any command-line clone tool
-can be used as a copier with `--external-copier NAME='command {src} {dst}'`;
-see [`docs/bench-clone.md`](./docs/bench-clone.md).
-
-`dev_workflow_fs.py` reads its fixtures from `data/dev-workflow/` next to the
-script (override with `--fixture-dir`); copy the script together with `data/`
-to run it on another machine. It requires Linux, and its fixture commits must
-exist in the `--repo` checkout or its `--linux-url` remote.
-
-`mini_dev_workflow_fs.py` also requires Linux. It creates a detached Git
-worktree at `<repo>-source` (next to `--repo`, i.e. on the filesystem under
-test) into `--repo`, which must be absent or empty, and removes the worktree
-afterwards. The source repository is created from the committed
-`source-repo.bundle` on first use and reused afterwards; keep it on the
-filesystem under test, because Git stores the index, refs and objects there.
-
-The mini workflow follows upstream `perf-eval`: `git worktree prune` and
-`git worktree add` are timed steps, followed by build/search/read/edit/commit,
-with command exit-code checks and no per-commit tree comparison. Source setup
-and validation are outside the workload timer; the standalone runner removes
-the worktree afterwards and reports that separately as `cleanup_ms`, without
-resetting the source repository. Its result schema is now version 4:
-`worktree: prune` and `worktree: add` move from `preparation_steps` into `steps`,
-and `preparation_steps` and `tree_assertions` are removed. The changed timing
-boundary means `elapsed_ms` is not directly comparable with version 3 results.
-
-All six single-host benchmarks report `fsync_mode` and `cache_state`.
-`dev_workflow` and `mini_dev_workflow` commit with `core.fsync=committed` +
-`core.fsyncMethod=fsync`; everything else (edit scripts, compiler, linker)
-stops at the page cache, and no cache is dropped between phases — so read
-timings are warm-cache timings.
-
-`kvtest_openclaw_fs.py` is the only benchmark that needs a C compiler. It is
-still a single self-contained file: copy it alone to the test machine and run
-it with the system `python3`. The first run downloads the SQLite 3.54.1
-amalgamation and SQLite's `kvtest.c` into a `build/` directory next to the
-script (git-ignored) and compiles `build/kvtest`; later runs reuse both. Set
-`CC` to choose the compiler, or `--build-dir` to move the cache. See
-[`docs/bench-kvtest-openclaw.md`](./docs/bench-kvtest-openclaw.md) for the
-parameter comparison against OpenClaw and the gaps it cannot close.
-
-`multi_host_nas_fs.py` is different from the single-host benchmarks: the
-machine that launches it is only the control plane. The YAML plan lists the SSH
-hosts, one NAS source/mountpoint, and the workload shape. The script deploys
-itself as a worker, mounts the NAS on every host in parallel, releases all
-workers through one start gate, and writes only below `nas.run_root` on the NAS.
-It is standard-library-only, so the control machine does not need the project
-environment or a local mount. Run `--check` to validate the plan without
-opening SSH connections. See
-[`docs/bench-multi-host-nas.md`](./docs/bench-multi-host-nas.md) for the plan
-format, workload phases, synchronization and cleanup rules.
-
-## Fixtures
+## 结构
 
 ```text
-data/
-  dev-workflow/          # used by dev_workflow_fs.py
-  mini-dev-workflow/     # fixtures for mini_dev_workflow_fs.py
-    source-repo.bundle   # committed Git bundle with the fixture history
-    repo/                # reference copy of the final tree (vendored)
-  pnpm-bench/            # used by npm_install_fs_bench.py --fixture pnpm-bench
-  pnpm-bench-integrated/ # used by npm_install_fs_bench.py --fixture pnpm-bench-integrated
+agent_fs_bench/
+  cli.py                  # run 入口；目标、运行目录、默认 CSV 汇总
+  analysis.py             # DuckDB 汇总、查询与绘图
+  results.py              # JSONL 运行上下文与复现信息
+  targets.py              # 目录列表与别名
+  benchmarks/             # 7 个 workload + 顶部 CONFIG
+experiments/              # 不含内部信息的 TOML 示例
+local/                    # 私有目标/SSH 配置，不提交
+results/<bench>/<run-id>/ # results.jsonl、summary.csv 和诊断附件
+data/                     # 固定输入、lockfile、Git bundle
+docs/                     # 各 workload 的 CONFIG 默认值和计时边界
+tools/                    # fixture 维护工具
+tests/                    # 共享行为边界测试
 ```
 
-These are copies of the upstream `fixtures/` directory, so the benchmark
-scripts do not depend on an external checkout of that repository. Their origin
-is recorded under [Credits and dependencies](#credits-and-dependencies).
+部署整个 checkout（包括 `data/`），不再单独拷贝一个脚本。共享机制直接 import，不再生成或复制代码。
 
-The two `pnpm-bench*` directories are pnpm's own install-benchmark fixtures:
-`package.json` plus pnpm's committed `pnpm-lock.yaml` (and, for the integrated
-one, `pnpm-workspace.yaml`). Each also carries a `package-lock.json` resolved by
-npm from the same manifest with `--legacy-peer-deps` — these trees have peer
-ranges npm's resolver rejects, and a pnpm lockfile is not readable by npm. That
-lockfile is generated, not upstream, so regenerate it if a fixture is refreshed:
+## 安装
 
 ```sh
-npm install --package-lock-only --legacy-peer-deps --ignore-scripts --cache <tmp>
+uv sync --locked
+uv run python -m agent_fs_bench --help
+
+# 绘图才需要额外安装 Matplotlib；DuckDB 已包含在基础依赖中
+uv sync --locked --group analysis
 ```
 
-Upstream kept `mini-dev-workflow/source-repo` as a Git submodule and later
-deleted it, so the fixture repository is not vendored verbatim. It is rebuilt
-deterministically from the checked-in edit commands:
+`uv.lock` 固定 Python 依赖；`.python-version` 固定解释器系列。`run` 和 `analyze` 需要 DuckDB，`uv sync --locked` 即会安装；绘图另用 `analysis` 依赖组。DuckDB 只在测量完成后读取 JSONL，不进入 workload 计时。多机远端 worker 仍只需 Python 标准库，DuckDB 安装在控制机。外部工具由实验环境预先准备，各 bench 文档列出要求。
+
+## CLI 工具
+
+| 工具 | 用途 | 公开参数 |
+| --- | --- | --- |
+| `run` | 在一个或多个已挂载目录上顺序测量，随后生成汇总 CSV | `benchmark`、`--dirs`、`--target` |
+| `analyze` | 对任意 JSONL 执行 DuckDB 查询并输出 CSV/stdout | `inputs`、`--sql`、`--database`、`--output` |
+| `plot` | 从任意 JSONL 绘制指标分布图 | `inputs`、`--benchmark`、`--metric`、`--case`、`--parameter-id`、`--output` |
+| `tools/gen_mini_source_repo.py` | 确定性重建 mini 的 Git fixture | `--force` |
+
+`run` 的 workload 参数只剩 `clone --smoke`；其余实验设置在各模块顶部 `CONFIG` 中，修改代码属于实验配置变更，不得提交私有值。
+
+### 目标目录
+
+在仓库外完成挂载，复制 `experiments/targets.example.toml` 到固定的 `local/targets.toml`：
+
+```toml
+[[targets]]
+name = "fs-a"
+path = "/mnt/fs-a"
+
+[[targets]]
+name = "fs-b"
+path = "/mnt/fs-b"
+```
+
+`name` 是结果和图表标签；简写 `path = "fs-a"` 表示 `/mnt/fs-a`。不会扫描 `/mnt`，不会创建缺失的目标根目录，也不会验证挂载来源；仅有一个本地空目录并不证明挂载成功。
 
 ```sh
-uv run tools/gen_mini_source_repo.py --force   # rewrites source-repo/, bundle, series.json
+# 默认读取 local/targets.toml，按顺序测量全部目标
+uv run python -m agent_fs_bench run clone -- --smoke
+
+# 只测某个已注册别名
+uv run python -m agent_fs_bench run clone --target fs-a -- --smoke
+
+# 不使用注册文件，直接用目录列表（别名取末级目录名，必须唯一）
+uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 ```
 
-The tool writes the base tree (`hello v1`), replays each `*-edit.cmds`, commits
-it, asserts the result matches `mini-dev-workflow/repo/`, and re-exports the
-bundle. Identities and dates are pinned, so repeated runs produce the same
-commit ids.
+结果固定写入仓库 `results/<bench>/<run-id>/`，没有重定向参数。目标工作数据只写在 `<target>/agent-fs-bench/<bench>/<run-id>/`，不会清空目标根目录。不同目标顺序运行；bench 内原有并发 workload 不变。
 
-## Output layout
+## Benchmark 命令
 
-Only the profiling/timing results go to the project directory, under
-`results/<script-name>/<UTC-run-id>/`, where the run id looks like
-`20261102T042113Z`. Runs that start within the same second get a `-2`, `-3`,
-... suffix instead of overwriting each other:
+| 命令 | 工作负载 | 文档 |
+| --- | --- | --- |
+| `run dev-workflow` | Linux 内核配置、编译、搜索、修改、提交、树验证；固定 x86 config | [dev workflow](docs/bench-dev-workflow.md) |
+| `run mini-dev-workflow` | 固定小型 C 项目的完整 Git worktree 开发流程 | [dev workflow](docs/bench-dev-workflow.md) |
+| `run npm-install` | warm cache、cold `node_modules` 的离线 npm/pnpm 安装；固定 lockfile fixture | [npm install](docs/bench-npm-install.md) |
+| `run clone` | 同文件系统树复制及并发复制，支持代码配置的外部 copier | [clone](docs/bench-clone.md) |
+| `run openclaw-session` | 合成 OpenClaw transcript SQLite 写入 | [session](docs/bench-openclaw-session.md) |
+| `run kvtest` | SQLite 官方 kvtest，每次 BLOB 覆写一次提交 | [kvtest](docs/bench-kvtest-openclaw.md) |
+| `run multi-host` | 多台 SSH 主机同时在共享文件系统执行私有树操作和目录竞争 | [multi-host](docs/bench-multi-host-nas.md) |
+
+```sh
+uv run python -m agent_fs_bench run dev-workflow --dirs /mnt/fs-a
+uv run python -m agent_fs_bench run mini-dev-workflow --dirs /mnt/fs-a
+uv run python -m agent_fs_bench run npm-install --dirs /mnt/fs-a
+uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a -- --smoke
+uv run python -m agent_fs_bench run openclaw-session --dirs /mnt/fs-a
+uv run python -m agent_fs_bench run kvtest --dirs /mnt/fs-a
+uv run python -m agent_fs_bench run multi-host --dirs /mnt/fs-a
+```
+
+### 运行默认值
+
+`run` 不暴露规模、重复次数、并发、fsync/cache、PRAGMA、fixture/manager、资源路径等调节参数。每个模块顶部有唯一的 `CONFIG` 字典，记录该 workload 的可复现实验设置；具体默认值和计时含义见对应文档。修改 `CONFIG` 并在结果中保留源码指纹，才能说明实验条件。
+
+多机模式固定读取 `local/hosts.toml`，格式见 `experiments/hosts.example.toml`。控制机无需挂载；所有 worker 必须已经以**相同绝对路径访问同一个共享文件系统**。不会尝试修复连接、重试或挂载。
+
+## 结果
+
+每次成功运行写出原始 JSONL，并默认生成同目录的汇总 CSV：
 
 ```text
 results/
-  dev_workflow_fs/20261102T042113Z/
-    result.json
-    summary.txt
-    manifest.txt
-  mini_dev_workflow_fs/20261102T042113Z/
-    result.json
-    summary.txt
-    manifest.txt
-  npm_install_fs_bench/20261102T042113Z/
-    results.csv
+  clone/<run-id>/
+    results.jsonl
     summary.csv
-    selected-packages.txt
-    top-packages.csv        # only when the catalog is downloaded
-    manifest.txt
-    logs/{npm,pnpm}-run-<n>.log
-  clone_bench/20261102T042113Z/
-    raw.csv
-    summary.md
-    result.json
-    manifest.txt
-  openclaw_session_bench/20261102T042113Z/
-    result.json
-    report.md
-    report.md.tmpl
-    summary.txt
-    manifest.txt
-  kvtest_openclaw_fs/20261102T042113Z/
-    result.json
-    summary.txt
-    manifest.txt
-    kvtest-stdout.txt
-  multi_host_nas_fs/20261102T042113Z/
-    result.json
-    metrics.csv
-    aggregate.csv
-    summary.txt
-    config.yaml
-    plan.json
-    manifest.txt
-    <host>.result.json
-    logs/<host>.stdout.log
-    logs/<host>.stderr.log
+    fs-a/                 # 可选诊断附件
+    fs-b/
+  openclaw-session/<run-id>/
+    results.jsonl
+    summary.csv
 ```
 
-The path is derived from each script's own location, so the current working
-directory does not matter. There is no option to redirect it: runs starting in
-the same second get a `-2`, `-3`, ... suffix so none overwrites another.
+每行对应一个 case / repeat；完整开发流程是一条测量，步骤在 `details` 中。多机以 host / phase / round 拆分。公共字段：
 
-`results/` is git-ignored.
+| 字段 | 含义 |
+| --- | --- |
+| `benchmark`, `run_id`, `timestamp` | workload、UTC 微秒运行标识、写出时间 |
+| `target.name`, `target.path` | 稳定别名及实际目标目录 |
+| `case`, `repeat` | case 与重复序号 |
+| `parameters`, `parameter_id` | 生效 `CONFIG` 及规范 JSON 的 SHA-256 |
+| `environment` | 主机、系统、Python、调用参数、实际源码和固定输入指纹 |
+| `metrics` | 扁平数值指标，指标名标明单位 |
+| `details` | workload 专属实际值、校验结果、步骤或已有原始样本 |
 
-## Shared results helper
+JSONL 是唯一原始数据，可独立搬运；分析不需要原挂载、日志或工作目录。写入发生在对应测量计时之外；失败校验不输出成功测量。没有结果 schema 多版本、迁移层或重复报告。
 
-The `results/<script>/<timestamp>` logic lives in
-[`tools/results_core.py`](./tools/results_core.py) and is *inlined* into each
-script between generated markers, so the scripts keep no imports outside the
-standard library and stay individually copyable. After editing the helper,
-regenerate the copies:
+### 默认生成 summary.csv
 
 ```sh
-uv run tools/sync_results_core.py          # rewrite the embedded copies
-uv run tools/sync_results_core.py --check  # freshness check (exit 1 if stale)
+uv run python -m agent_fs_bench run clone \
+  --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 ```
 
-## Credits and dependencies
+只有全部目标测量成功且 JSONL 关闭后，才自动生成 `results/<bench>/<run-id>/summary.csv`，无需开关。若后续目标失败，前面已完成的测量行仍保留在 JSONL，但不会生成自动汇总 CSV；这些行不代表完整实验。汇总与 `analyze` 共用 DuckDB 查询及 CSV 写出函数，不是第二套结果机制：
 
-The scripts have no third-party Python dependencies, but the workloads and
-fixtures are derived from external work:
+```text
+target,case,metric,samples,mean,median,minimum,maximum,stddev,parameter_id,
+benchmark,target_path,source_sha256,hostname
+```
 
-| Component | Source | Used by |
-| --- | --- | --- |
-| `dev-workflow` fixtures, and the base of `dev_workflow_fs.py` | [`YoloFS/perf-eval`](https://github.com/YoloFS/perf-eval) — `fixtures/` and `scripts/dev_workflow_fs.py` | `dev_workflow_fs.py` |
-| `mini-dev-workflow` fixtures, and the base of `mini_dev_workflow_fs.py` | [`YoloFS/perf-eval`](https://github.com/YoloFS/perf-eval) — `fixtures/mini-dev-workflow` and `src/workloads/mini_dev_workflow.rs` | `mini_dev_workflow_fs.py` |
-| Dev-workflow patchset | Amir Goldstein's overlayfs `ovl_file` refactoring, merged in Linux v6.13 (`fs/overlayfs/file.c`), replayed from upstream git history | `dev_workflow_fs.py` |
-| Linux source tree | [`torvalds/linux`](https://github.com/torvalds/linux) (default `--linux-url`) | `dev_workflow_fs.py` |
-| Top-package catalog | [gist `l05k/0c7dfaedb703fa6d5465e00dd297cdcd`](https://gist.github.com/l05k/0c7dfaedb703fa6d5465e00dd297cdcd) | `npm_install_fs_bench.py` |
-| `pnpm-bench`, `pnpm-bench-integrated` fixtures | [`pnpm/pnpm`](https://github.com/pnpm/pnpm) — `pnpm11/benchmarks/fixture` and `pnpm/tasks/integrated-benchmark/src/fixtures` | `npm_install_fs_bench.py` |
-| OpenClaw transcript schema and WAL settings | [`openclaw/openclaw`](https://github.com/openclaw/openclaw) at `5f6f15fed0d6` | `openclaw_session_bench.py` |
+一行是目标 × case × 指标的统计；指标名保留单位，原始延迟数组、环境、步骤只留 JSONL。聚合按 `parameter_id`、源码指纹、主机隔离，尾部列用于解释不同分组；不合并不同参数、源码或主机的测量。导出在所有测量计时之外执行。导出失败返回非零并保留 JSONL，不重跑 benchmark；测量本身中途失败则不导出。
 
-Vendored fixtures were copied verbatim from `YoloFS/perf-eval` at commit
-`bc32d08` (2026-08-28), where `fixtures/dev-workflow` was last changed in
-`de6f95f` and `fixtures/mini-dev-workflow` in `afe112a`. To refresh them:
+CSV 的用途是快速比较本次各目标、用表格工具检查统计量，以及直接交给只接受扁平表格的绘图或分析工具。它不是原始数据归档的替代品：保留 JSONL，CSV 丢失或需重新汇总时直接重建，不必重跑 benchmark。重新计算逐操作分位数、检查离群值或分析详细步骤时，应读取 JSONL。
+
+## 分析与绘图
 
 ```sh
-git clone https://github.com/YoloFS/perf-eval /tmp/perf-eval
-rm -rf data/dev-workflow data/mini-dev-workflow
-cp -R /tmp/perf-eval/fixtures/dev-workflow /tmp/perf-eval/fixtures/mini-dev-workflow data/
+# 默认汇总输出 CSV 到 stdout；glob 加引号
+uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl'
+
+# 手动导出某个运行的汇总
+uv run python -m agent_fs_bench analyze \
+  'results/clone/<run-id>/results.jsonl' \
+  --output 'results/clone/<run-id>/summary.csv'
+
+# 重新生成可丢弃的 DuckDB 分析库
+uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl' \
+  --database results/analysis.duckdb
+
+# measurements 保留嵌套 JSON；metrics 是数值长表
+uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl' \
+  --sql 'SELECT benchmark, "case", metric, value FROM metrics'
+
+uv run --group analysis python -m agent_fs_bench plot \
+  'results/openclaw-session/*/results.jsonl' \
+  --benchmark openclaw-session --metric turns_per_s \
+  --output results/session.png
 ```
 
-The `pnpm-bench*` fixtures are copied from `pnpm/pnpm` at `5bd38b19`
-(2026-11-03). To refresh them, re-copy the manifest and pnpm lockfile, then
-regenerate npm's lockfile as shown under [Fixtures](#fixtures).
+CSV 是可随时重新生成的派生文件；DuckDB 是派生缓存，不维护数据库版本。自定义 SQL 可按研究问题聚合，但不要把不同 cache/fsync、输入、源码或计时边界当成同一实验。
 
-Upstream `YoloFS/perf-eval` does not currently ship a `LICENSE` file, so no
-explicit license is granted for those fixtures; confirm the terms with the
-upstream authors before redistributing this repository. The Linux kernel
-history the patchset replays is GPL-2.0, and OpenClaw is used only as a
-schema/write-path reference, without copying its code.
+## 可复现性与资源边界
+
+- 保留运行所用 checkout、`uv.lock`、私有目标/主机配置及导出的 JSONL。源码指纹识别实际源码和固定输入，包括未提交修改，但不替代源码归档。
+- 各 workload 的默认实验条件在模块 `CONFIG` 中；跨文件系统比较必须保持该配置、输入和工具版本一致。
+- 不宣称 cold-cache：page cache、FUSE 客户端缓存和服务端缓存是不同层；保持原 bench 的计时、同步与 cache 语义。
+- 本次不实现 cgroup，也不放空插件接口。FUSE 客户端、服务端和 benchmark 的资源限制由外部实验脚本设置；限制客户端时应控制真实客户端进程所在 cgroup，并保存这些私有条件。
+- smoke 只证明命令、测量和分析链路可运行，不代表真实 FUSE/NFS 性能或一致性验证。
+
+共享边界测试：
+
+```sh
+uv run python -m unittest discover -s tests
+```
+
+## Fixtures 与来源
+
+`data/dev-workflow/` 与 `data/mini-dev-workflow/` 来自 [YoloFS/perf-eval](https://github.com/YoloFS/perf-eval) 的 `bc32d08`（2026-08-28）；对应最后变更为 `de6f95f` 和 `afe112a`。内核 patchset 是 Amir Goldstein 的 overlayfs `ovl_file` 重构，已合入 Linux v6.13。
+
+mini 的 source repository 从提交的命令确定性重建；bundle 与 `series.json` 必须一起更新，不能只复制最终工作树：
+
+```sh
+uv run python tools/gen_mini_source_repo.py --force
+```
+
+`data/pnpm-bench*` 来自 [pnpm/pnpm](https://github.com/pnpm/pnpm) 的 `5bd38b19`（2026-11-03）。npm lockfile 由同一 manifest 执行 `npm install --package-lock-only --legacy-peer-deps --ignore-scripts --cache <tmp>` 生成，不是上游 pnpm lockfile 的转换。npm-install 只使用这两个已提交 fixture。
+
+OpenClaw schema 参考 [openclaw/openclaw](https://github.com/openclaw/openclaw) `5f6f15fed0d6`，未复制其代码。kvtest 使用 SQLite 官方源代码，版本和哈希记录在结果中。
+
+上游 YoloFS/perf-eval 当前未提供 LICENSE，公开分发 fixtures 前仍需确认授权；本次整理不改变授权状态。Linux 历史代码为 GPL-2.0。

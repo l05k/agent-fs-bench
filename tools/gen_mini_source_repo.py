@@ -15,9 +15,10 @@ final tree, so this tool rebuilds it deterministically:
 
 The generated ``source-repo/`` directory itself is ignored by Git; commit the
 bundle and ``series.json`` instead. Dates and identities are pinned, so
-re-running the tool produces the same commit ids.
+re-running the tool produces the same commit ids. The fixture directory is fixed
+by ``CONFIG``; ``--force`` is the only option and replaces an existing tree.
 
-    uv run tools/gen_mini_source_repo.py
+    uv run tools/gen_mini_source_repo.py --force
 """
 
 from __future__ import annotations
@@ -37,6 +38,12 @@ SERIES = FIXTURE_DIR / "series.json"
 REFERENCE = FIXTURE_DIR / "repo"
 SOURCE_REPO = FIXTURE_DIR / "source-repo"
 BUNDLE = FIXTURE_DIR / "source-repo.bundle"
+
+# ---------------------------------------------------------------------------
+# Fixed configuration. The fixture directory is a source constant; the only
+# public option is the --force safety switch for regenerating an existing tree.
+# ---------------------------------------------------------------------------
+CONFIG = {"fixture_dir": FIXTURE_DIR}
 
 PINNED_DATE = "2026-03-30T00:00:00Z"
 GIT_IDENTITY = {
@@ -286,16 +293,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--fixture-dir",
-        default=str(FIXTURE_DIR),
-        help="mini-dev-workflow fixture directory",
-    )
-    parser.add_argument(
         "--force",
         action="store_true",
         help="rebuild the source repository even if it already exists",
     )
-    return parser.parse_args(argv)
+    parsed = parser.parse_args(argv)
+    return argparse.Namespace(**CONFIG, force=parsed.force)
 
 
 def main(argv: list[str] | None = None) -> int:

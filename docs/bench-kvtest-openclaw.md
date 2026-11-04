@@ -21,56 +21,70 @@ does react to the journal: 4096-byte writes cost 12.5 µs/op batched versus
 ## Run / 运行
 
 ```sh
-uv run kvtest_openclaw_fs.py --dir /mnt/testfs
-uv run kvtest_openclaw_fs.py --dir /mnt/testfs --count 5000 --size 4096 --variance 2048
-uv run kvtest_openclaw_fs.py --dir /mnt/testfs --jmode delete          # journal ablation
-uv run kvtest_openclaw_fs.py --dir /mnt/testfs --nosync                # durability ablation
-uv run kvtest_openclaw_fs.py --dir /mnt/testfs --repeats 3             # repeat the write phase
+uv run python -m agent_fs_bench run kvtest --dirs /mnt/fs-a
 ```
 
-Defaults: `--count 2000`, `--size 2048`, `--variance 1024`,
-`--cache-size 1000` (KiB), `--jmode wal`, `--repeats 1`.
+There are no workload flags. Payload size/variance, writes, cache size, journal
+mode, mmap, repeats, build directory and forced refresh are the deliberate
+`CONFIG` mapping at the top of `agent_fs_bench/benchmarks/kvtest.py`; values are
+recorded in JSONL. Change that code for an ablation; do not commit private
+settings. Defaults: `count=2000`, `size=2048`, `variance=1024`,
+`cache_size=1000` KiB, `jmode=wal`, `repeats=1`, `mmap=0`, synchronous FULL.
 
 The first run downloads the SQLite 3.54.1 amalgamation and `kvtest.c` into
-`build/` next to the script (git-ignored) and compiles `build/kvtest` with
-`cc -O2`. Later runs reuse both. Set `CC` to pick a compiler,
-`--build-dir` to move the download/compile cache, or `--force-download` to
-refresh the sources.
+`build/kvtest/` at the repository root (git-ignored) and compiles `kvtest` with
+`-O2` using the compiler named by `CC`, or `cc` then `gcc` when `CC` is unset.
+The compiler path, exact compile argv, compiler `--version` line, source hashes
+and binary hash are saved beside it in `build/kvtest/kvtest-build.json`.
 
-## Single-file deployment / 单文件拷贝
+Later runs reuse the binary only when it is newer than `kvtest.c`, `sqlite3.c`
+and `sqlite3.h`, and its metadata matches both the binary hash and the current
+source hashes. Reuse does not resolve or run any compiler, so a host that only
+consumes an existing cache does not need one; results and `parameter_id` use the
+recorded compiler provenance, not the current `CC`. If an up-to-date binary has
+missing or incomplete metadata, or metadata that does not match the binary hash,
+the run fails and asks for exactly one explicit rebuild
+(`CONFIG["force_download"] = True`, or delete the binary and metadata); it never
+guesses provenance or treats an unproven binary as current. Changing a source or
+header rebuilds, as does setting force. A failed compile or version probe leaves
+the previous binary and metadata untouched. Set `CC` to choose a compiler and
+`CONFIG["build_dir"]` to move the download/compile cache.
 
-Like the other benchmark scripts this one is self-contained: the shared
-`results`-directory helper is inlined between generated markers, and no module
-outside the Python standard library is imported. Copy just
-`kvtest_openclaw_fs.py` to the test machine and run it with the system
-`python3` (verified on 3.9.6); it needs no checkout, no `uv`, and no
-`docs/` or `data/` directory.
+`CONFIG["jmode"]` is case-insensitive and must be one of `delete`, `truncate`,
+`persist`, `memory`, `wal`, `off`; the value recorded in JSONL is lowercase.
+An invalid mode fails the run before any download, build or database work.
 
-What it does need, on the test machine only:
+## Deployment / 部署
 
-- network access on the first run, to fetch the amalgamation and `kvtest.c`
-  from `sqlite.org` and `raw.githubusercontent.com`;
-- a C compiler (`cc` or `gcc`, or whatever `CC` points at);
-- SQLite's `fts5` is not required, because `kvtest` uses a plain table.
+Deploy the checkout with the shared Python package and use Python 3.12+.
+Install the project's DuckDB dependency with `uv sync --locked`; the shared
+runner derives `summary.csv` beside JSONL after the target loop completes. A
+failure raised by a target aborts before export, so earlier JSONL rows remain
+but the automatic summary CSV is not written. No single-file helper generation
+or separate script deployment is supported.
+The test host needs network access for the first source download and a C
+compiler (`CC`, `cc` or `gcc`) for the first build; a valid cached build needs
+neither. FTS5 is not required. The common runner allocates a fresh target
+subdirectory for each run. The first build uses the downloaded SQLite header and
+does not require a system SQLite development package.
 
-Both the results directory and the build cache are resolved relative to the
-script's own location, so a copied script writes
-`<copy-dir>/results/kvtest_openclaw_fs/<UTC-run-id>/` and
-`<copy-dir>/build/`, never into the original checkout.
 
-`--count` is both the number of rows seeded by `kvtest init` and the number of
-writes in the timed phase, because `kvtest run` touches `--count` keys.
+`CONFIG["count"]` is both the number of rows seeded by `kvtest init` and the
+number of writes in the timed phase, because `kvtest run` touches that many
+keys.
 
 ## What the numbers mean
 
 `kvtest` prints `Microseconds per BLOB write` and `Content write rate`; the
-harness parses both and repeats them per `--repeats` run. Each run overwrites
-existing rows, so the first repeat writes into a fresh table and later repeats
-write into a populated one — that difference is real and is kept in the report
-rather than averaged away.
+harness parses both and repeats them per configured repeat. Each timed run
+overwrites randomly selected existing initialized rows (`kvtest --random`).
+Later repeats retain the rows left by earlier overwrites; each repeat is a
+separate JSONL measurement, not an averaged result.
 
-`result.json` also records the effective pragmas, the SQLite versions, the
-exact argv of every phase, and the raw `kvtest` stdout.
+JSONL `details` includes effective PRAGMAs, SQLite versions, the recorded
+compiler path/argv/version and source/binary hashes from the build metadata,
+exact kvtest argv, and raw stdout. The numeric kvtest timings are also exposed
+in `metrics`; no external stdout file is needed for analysis.
 
 ## Pragma matching against OpenClaw
 
@@ -79,15 +93,15 @@ Reference: `src/infra/sqlite-wal.ts` and `src/state/openclaw-agent-db.ts` at
 
 | Parameter | OpenClaw agent DB | Reached here | Note |
 | --- | --- | --- | --- |
-| `journal_mode` | `WAL` | `WAL` | `--jmode wal` |
+| `journal_mode` | `WAL` | `WAL` | `CONFIG["jmode"] = "wal"` |
 | `synchronous` | `NORMAL` | **`FULL`** | kvtest offers only default `FULL` or `--nosync` (`OFF`) |
 | `busy_timeout` | `5000` ms | not set | no kvtest option |
 | `foreign_keys` | `ON` | n/a | single table, no foreign keys |
 | `journal_size_limit` | `64 MiB` | not set | no kvtest option |
 | `auto_vacuum` | `INCREMENTAL` on fresh db | not set | `kvtest init` cannot set it |
 | `wal_autocheckpoint` | `0` (worker-maintained) | `1000` | SQLite default; see below |
-| `cache_size` | default | `--cache-size`, default 1000 KiB | |
-| `mmap_size` | default | `--mmap`, default 0 | |
+| `cache_size` | default | `CONFIG["cache_size"]`, default 1000 KiB | |
+| `mmap_size` | default | `CONFIG["mmap"]`, default 0 | |
 
 `wal_autocheckpoint` is the gap that matters most. OpenClaw sets it to `0`
 because a worker checkpoints on a 10 s tick; this harness has no worker.
@@ -105,10 +119,10 @@ Deliberate workload gaps:
 - **No secondary indexes.** OpenClaw maintains 12 indexes across 7 tables in
   the write path; `kv` has one primary key.
 - **No FTS5.** OpenClaw writes an FTS5 projection inside the same transaction.
-  Measured in `openclaw_session_bench.py`, disabling it moved 383 → 646
-  turns/s, so FTS is 30–40% of that workload's cost. `kvtest` writes none.
+  The `openclaw-session` workload includes FTS by default; `kvtest` writes none.
 - **Uniform payloads.** OpenClaw payloads are 90% 1–4 KiB, 9% 256 KiB, 1% 1 MiB
-  JSON text; `kvtest` writes fixed-size BLOBs varied only by `--variance`.
+  JSON text; `kvtest` writes fixed-size BLOBs varied only by
+  `CONFIG["variance"]`.
 
 `kvtest` is a **single-table random BLOB overwrite comparison benchmark**, with
 one commit per operation, not a strict lower bound on OpenClaw latency: the
@@ -117,8 +131,8 @@ directions. `Microseconds per BLOB write` is total elapsed time divided by the
 operation count, including connection setup and the final close/checkpoint;
 it is not a sampled transaction latency distribution.
 
-The harness passes a negative SQLite `cache_size` so `--cache-size` is in KiB,
-not pages. `reached_settings.journal_mode` comes from kvtest's own connection
+The harness passes a negative SQLite `cache_size` so `CONFIG["cache_size"]` is
+in KiB, not pages. `reached_settings.journal_mode` comes from kvtest's own connection
 output (nonpersistent modes can differ on a later inspection connection).
 An integrity check other than `ok` marks the result as failed and returns a
 nonzero exit code.
@@ -126,16 +140,14 @@ nonzero exit code.
 ## Artifacts
 
 ```text
-<--dir>/kv-openclaw.sqlite   database + WAL/SHM on the filesystem under test
-build/                       downloaded sources and the compiled kvtest (git-ignored)
-results/kvtest_openclaw_fs/<UTC-run-id>/
-  result.json                parsed timings, pragmas, versions, per-repeat argv
-  summary.txt                one-screen human summary
-  manifest.txt               provenance and effective settings
-  kvtest-stdout.txt          raw kvtest output for every phase
+<target>/agent-fs-bench/kvtest/<run-id>/kv-openclaw.sqlite
+                             fresh database + WAL/SHM on the target
+build/kvtest/                sources, compiled binary (git-ignored), and
+                             kvtest-build.json build provenance
+results/kvtest/<run-id>/results.jsonl
+                             one complete measurement per repeat
 ```
 
-Runs within the same second use `-2`, `-3`, ... suffixes instead of overwriting
-previous reports. Do not run concurrently against the same `--dir`: the database
-name is fixed and each invocation deletes it before setup. The first build uses
-the bundled SQLite header and does not require a system SQLite development package.
+Source revision, compiler and workload settings must match when comparing runs.
+`microseconds_per_write` amortizes connection setup and final close/checkpoint;
+it is not a distribution of individually sampled write latencies.

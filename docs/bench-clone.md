@@ -1,177 +1,156 @@
 # Same-filesystem copy / clone benchmark
 
-Measures how fast one filesystem can copy a tree from a source to a new
-destination on the same mount. The benchmark covers large-file throughput,
-small-file throughput, and process-level copy concurrency.
+Measures tree copies from a source to a fresh destination on the same externally
+prepared filesystem. Linux and Python 3.12+ are the supported runtime; the
+benchmark never mounts or unmounts targets.
 
-测量同一文件系统内的树复制/克隆速度，覆盖大文件、小文件和并发复制三个维度。
+## Run
+
+The public workload CLI exposes a single flag, `--smoke`:
+
+```sh
+# configured experiment (CONFIG defaults: stage single, copier cp, 3 repeats)
+python -m agent_fs_bench run clone --dirs /mnt/fs-a
+
+# real small smoke workload (not a mocked or alternate implementation)
+python -m agent_fs_bench run clone --dirs /mnt/fs-a -- --smoke
+```
+
+Everything else is configured in the module-level `CONFIG` mapping at the top
+of `agent_fs_bench/benchmarks/clone.py`; edit it to change an experiment before
+running. `--smoke` replaces the selected stage with four small cases and keeps
+the configured copiers, repeats, fsync, data pattern, and `kinds` filter:
+
+- 8 MiB large file, C=1
+- 200 × 8 KiB small files, C=1
+- 16 MiB total across four 4 MiB files, one per worker, C=4
+- 400 × 8 KiB small files, C=4
+
+With the default one copier (`cp`) and three repeats this produces 12 JSONL
+measurements and exercises large/small copies at C=1 and C=4, fsync, and
+verification. Its conservative space check needs about 289 MiB free. Missing
+copiers, insufficient space, copy/fsync failures, or failed verification stop
+the run; cases are never silently skipped.
+
+### CONFIG defaults
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `stage` | `"single"` | Workload stage: `single`, `concurrency`, or `all`. |
+| `repeats` | `3` | Warm repetitions per case; must be positive. |
+| `copiers` | `["cp"]` | Ordered copier names: `cp`, `cpr`, `internal`, or names declared in `external_copier`. |
+| `external_copier` | `[]` | `NAME=COMMAND` entries adding external copiers (see below). |
+| `threads` | `1` | Value substituted for `{threads}` in external commands. |
+| `cp_binary` | `""` | Path to `cp`; empty resolves `cp` on `PATH`. |
+| `fsync` | `True` | Fsync copied files and directories during the timed section. |
+| `conc_levels` | `(1, 4, 16)` | Concurrency levels used by the `concurrency` stage. |
+| `small_count` | `10000` | Small files per full-size small-file workload. |
+| `data_pattern` | `"random"` | Source contents: `random` or `zeros`. |
+| `kinds` | `()` | Empty keeps all kinds; otherwise a subset of `("large", "small")`. |
+| `scratch_subpath` | `"scratch"` | Scratch directory relative to this run's work directory. |
+| `keep_scratch` | `False` | Keep source and destination trees for inspection. |
+
+`--smoke` is the only CLI flag; it replaces the stage selection with the four
+small cases described above.
+
+`CONFIG` is experiment setup, not an incidental switch: changing it changes the
+measured payload or semantics, so keep it fixed across the filesystems you
+compare.
 
 ## Workloads
 
-- `single`: 256 MiB and 1 GiB large files, plus 10,000 files at 4 KiB and
-  64 KiB. One copy worker.
-- `concurrency`: a 2 GiB logical dataset and the 10,000-file dataset at each
-  level of `--conc-levels` (default `1,4,16`). Large data is split evenly
-  across one shard per worker.
-- `--smoke`: four small cases for a quick end-to-end check.
+- `single`: 256 MiB and 1 GiB large files; `small_count` (default 10,000) files
+  at 4 KiB and 64 KiB. One copy worker.
+- `concurrency`: a 2 GiB logical dataset and the `small_count`-file, 64 KiB
+  dataset at each `CONFIG["conc_levels"]` value (default `1,4,16`). Large data
+  is evenly sharded across workers.
+- `all`: both stages, with duplicate specifications removed.
+- `--smoke`: the four cases listed under Run.
 
-For every case the harness:
+Each case generates and fsyncs fresh source data beneath
+`<target>/agent-fs-bench/clone/<run-id>/<scratch_subpath>` (default `scratch`),
+then prereads the source once. Each copier/repeat gets a new destination.
+Verification compares relative file names and byte sizes; file contents are
+not hashed. Source and destination trees are removed afterward unless
+`CONFIG["keep_scratch"]` is true. Scratch paths must remain inside the run
+directory.
 
-1. generates a fresh source tree under `--scratch-subpath` and fsyncs it;
-2. reads the source once to warm the page cache;
-3. removes the destination and copies into a new tree for each repeat;
-4. verifies the destination's relative file set and file sizes;
-5. removes the source and destination unless `--keep-scratch` is set.
+Random source data is the default. `CONFIG["data_pattern"] = "zeros"` is
+explicit because compression, deduplication, and sparse-file detection can
+make all-zero copies unrepresentative. `CONFIG["small_count"]` changes
+full-size small-file workloads; `CONFIG["kinds"]` filters cases.
 
-The repeat number is recorded, but every repeat has the same declared cache
-state. All repeats are aggregated with a median.
+## Copiers
 
-Source data is random by default (`--data-pattern random`). On filesystems
-with compression, deduplication, or automatic sparse-file detection, all-zero
-data can make a copy look much faster than it would for real payloads. Use
-`--data-pattern zeros` only for quick smoke runs or for reproducing the old
-prototype, and record the pattern when comparing results.
+Default: `cp`. `CONFIG["copiers"]` is an ordered list, so duplicates and
+repeated names are de-duplicated while keeping the first occurrence.
 
-## Run / 运行
-
-```sh
-uv run clone_bench.py --mount /mnt/testfs --copiers cp,cpr,internal
-uv run clone_bench.py --mount /mnt/testfs --stage concurrency \
-  --copiers cp,internal --conc-levels 1,4,16,32
-uv run clone_bench.py --mount /mnt/testfs --smoke --repeats 2
-uv run clone_bench.py report --raw results/clone_bench/<run-id>/raw.csv
-```
-
-`--copier` is repeatable and `--copiers` accepts the same comma-separated
-names. The built-ins are:
-
-| name | implementation |
+| Name | Implementation |
 | --- | --- |
 | `cp` | `cp -a` |
 | `cpr` | `cp -r` |
-| `internal` | 4 MiB chunked Python read/write, with `copystat` |
+| `internal` | 4 MiB chunked Python read/write with `copystat` |
 
-`--fsync` is on by default. It fsyncs every copied file and directory after
-the copy phase and reports that time separately. Use `--no-fsync` to measure
-only page-cache completion.
+`CONFIG["cp_binary"]` overrides the resolved executable. A generic external
+copier can be supplied without adding CLI code:
 
-### External command copiers
-
-A dedicated client no longer needs to be compiled into the benchmark. Define
-it as a command template:
-
-```sh
-uv run clone_bench.py --mount /mnt/lakebase \
-  --external-copier \
-    'lbclone=lakebase-client clone -p --threads {threads} {src} {dst}' \
-  --copier lbclone --stage single --threads 8
+```python
+CONFIG["external_copier"] = [
+    "reflink=cp -a --reflink=always {src} {dst}",
+]
+CONFIG["copiers"] = ["reflink"]
 ```
 
-The value is parsed with shell-like quoting, not through a shell. It must
-contain `{src}` and `{dst}`; `{threads}` is replaced from `--threads`. The
-command is invoked once per shard, with the destination absent. After it
-succeeds, the harness fsyncs the destination unless `--no-fsync` was passed.
+Templates use shell-like quoting but no shell execution. `{src}` and `{dst}`
+are required; optional `{threads}` takes `CONFIG["threads"]` (default 1). Each
+shard invokes the command once with an absent destination. Unsupported
+operations fail rather than selecting another copier. Copier identity,
+executable hashes, and full templates are retained in JSONL, including
+external thread settings.
 
-This keeps client-specific flags and paths in the operator's command line
-rather than in the benchmark. The same mechanism works for `pfs clone`,
-`cp --reflink=always`, a vendor sync tool, or a wrapper script.
+## Timing and cache semantics
 
-## Measurement semantics
+- `copy_s`: copier invocation or Python copy loop, excluding fsync.
+- `fsync_s`: destination file/directory fsync traversal, including its walk and
+  open/close work. `CONFIG["fsync"]` defaults on; setting it to `False`
+  measures page-cache completion instead.
+- `wall_s`: the complete shard copy operation including fsync, per-shard
+  destination existence/removal checks and parent-directory creation. C=1 runs
+  directly; C>1 also includes `ProcessPoolExecutor` startup. The per-shard
+  preparation precedes `copy_s`; directory creation performed by the copier
+  itself is part of `copy_s`. Worker `copy_s` and `fsync_s` are **independent
+  maxima**, not sums; they may come from different workers. Do not reconstruct
+  `wall_s` by adding them.
+- `mib_s` and `files_s` divide logical payload bytes/files by full `wall_s`.
+- Source generation, preread, outer destination-root creation/removal before
+  `copy_shards`, and verification are outside these timers. This does not
+  exclude the per-shard setup described above from `wall_s`.
 
-- `wall_s` is the complete timed copy operation. It includes `copy_s` and
-  `fsync_s`.
-- `copy_s` is the copier invocation or Python copy loop only. It excludes the
-  fsync phase.
-- For C=1, the copier runs in the harness process (the `cp` built-in still
-  starts a child process, as it should). For C>1, `wall_s` also includes
-  `ProcessPoolExecutor` startup; `copy_s` does not.
-- Large cases report logical payload MiB/s; small cases report files/s.
-  Both are `total_bytes` or `total_files` divided by `wall_s`.
-- A metadata-only clone is a valid external copier, but its high logical
-  MiB/s means "tree visible" speed, not data movement. The report labels the
-  copier name and does not imply that it moved the payload.
+There is no cold mode: dropping kernel caches does not reset userspace client
+caches. Every repeat declares `warm-source-preread`: one preread per case, no
+explicit cache drop, no page-pinning guarantee. Datasets exceeding RAM may
+become colder during later repeats.
 
-### Warm cache, not "cold"
+`cp` may use reflink, `copy_file_range`, or server-side copying, while an
+external metadata-only clone may move no payload at all. High logical MiB/s
+therefore means tree-visible speed, not necessarily data movement. Filesystem
+type is informational and may describe only a FUSE front end.
 
-There is no cold mode. `drop_caches` cannot evict a FUSE or other userspace
-client's cache, so a run after dropping the kernel cache can still be warm at
-the layer that dominates the measurement. Calling that "cold" would produce
-misleading comparisons. Instead, the source is pre-read once, the state is
-recorded as `warm-source-preread`, and the report never mixes cache states.
+## JSONL results
 
-Warm-up is best effort. The kernel may evict pages during a long case, and
-userspace client caches are not reset between repeats. The declared state
-therefore means "no explicit cache drop; warm-up attempted", not "pinned".
+The common runner appends one complete line per **case × copier × repeat** to
+`results/clone/<run-id>/results.jsonl`. The envelope includes run, target,
+environment, and effective `CONFIG` parameters (local executable paths are
+replaced by per-copier SHA-256 hashes so grouping is machine-independent).
+Numeric metrics include
+`total_bytes`, `total_files`, `wall_s`, `copy_s`, `fsync_s`, `mib_s`, and
+`files_s`. Details retain workload/kind, concurrency, copier/template identity,
+fsync and cache semantics, data pattern, filesystem type, and successful
+verification.
 
-### What is verified
-
-After each timed copy, the destination's relative path set and byte sizes are
-compared with the source. A missing file, extra file, or size mismatch fails
-the run. File contents are not hashed, because hashing multi-gigabyte trees
-would dominate the benchmark.
-
-## Design corrections
-
-The imported prototype had several experiment-design problems that are fixed
-here:
-
-- Removed the fake cold mode and the global `drop_caches` call. Repeats are
-  all explicitly warm and are aggregated together.
-- Removed hardcoded mount names, `/root` result paths, the
-  `/root/lakebase-client-latest` default, and the fixed mount display labels.
-- Replaced the special `lbclone` branch with generic `--external-copier`
-  command templates.
-- Fixed the single-shard path going through `ProcessPoolExecutor` and charging
-  pool startup to wall time.
-- Replaced all-zero payloads with random data by default, avoiding compression,
-  deduplication, and zero-hole detection from inflating throughput.
-- Measured `internal` fsync separately instead of hiding it inside `copy_s`.
-- Grouped reports by explicit `workload`, `kind`, `concurrency`, `copier`,
-  `fsync`, `cache_state`, and `data_pattern` fields instead of guessing
-  concurrency from a `_C` substring in the tag.
-- Stopped merging rows from different cache states in the same aggregate.
-- Added destination verification after every repeat instead of checking only
-  file counts for one clone copier.
-- Added failure cleanup, insufficient-space checks, and schema validation
-  before appending to an existing CSV.
-- Used `/proc/self/mountinfo` before falling back to `findmnt` or `stat`, so
-  ext4 on minimal Linux images is not reported as `ext2/ext3`.
-- Removed the hardcoded `[1,4,16,32,64,128]` report levels; reports use the
-  levels actually present in `raw.csv`.
-
-## Remaining limitations
-
-- `cp` may use `copy_file_range`, reflink, or a server-side copy depending on
-  the kernel and filesystem. That is real `cp` behaviour, but it means `cp`
-  and `internal` are not guaranteed to move the same amount of data.
-- Warm-up does not pin pages. For datasets larger than available memory, later
-  repeats can be colder than the first.
-- Verification checks names and sizes, not contents.
-- Process-worker startup is included in multi-shard wall time because the
-  benchmark measures the user-visible operation, not only the copy syscalls.
-- Filesystem type is informational. A FUSE mount may be reported as `fuse`
-  while the backing filesystem has different characteristics.
-
-## Artifacts
-
-Every run writes to
-`results/clone_bench/<UTC-run-id>/` next to the script:
-
-| file | contents |
-| --- | --- |
-| `raw.csv` | one row per repeat and copier |
-| `summary.md` | detail, copier comparison, mount comparison, concurrency curves |
-| `result.json` | structured metadata and all rows |
-| `manifest.txt` | argv, host, Python, mount, fstype, copier templates, cache/fsync mode |
-
-`--append-csv PATH` additionally appends the same rows to a shared CSV. The
-header is created when the file is new, and an existing file with a different
-schema is rejected rather than silently mixing formats.
-
-CSV columns:
-
-```text
-ts run_id mount fstype workload kind concurrency threads total_bytes
-total_files data_pattern copier fsync cache_state repeat wall_s copy_s fsync_s
-mib_s files_s verified
-```
+Use the common offline analysis/plot commands on exported JSONL; no live mount
+or sidecar report is needed. The common runner derives `summary.csv` only after
+every selected target succeeds. If a later target fails, earlier successful
+measurements remain in JSONL, but no automatic CSV is produced. Compare only
+matching workload, concurrency, copier/template, threads, fsync, cache state,
+and data pattern. There is no workload-specific report command or CSV append option.
