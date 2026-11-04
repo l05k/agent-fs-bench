@@ -14,17 +14,21 @@ and on the fixtures checked in next to it under ``data/mini-dev-workflow/``
 to run it outside any surrounding repository; ``--fixture-dir`` can point at an
 alternative fixture location. No network access is needed.
 
-Workflow shape (mirrors the upstream ``perf-eval`` workload):
+Workflow shape follows ``YoloFS/perf-eval`` at ``bc32d083``,
+``src/workloads/mini_dev_workflow.rs``:
 
-1. ``git worktree add --detach <repo> <base_commit>`` into the empty
-   ``--repo`` path, so worktree creation itself is measured;
+1. ``git worktree prune`` and ``git worktree add --detach <repo> <base_commit>``
+   into the empty ``--repo`` path; both are part of the timed workload;
 2. ``make`` for the initial build;
 3. per commit: search commands, read commands, edit commands (each edit is a
    checkpoint boundary), then an incremental ``make``;
-4. ``git status`` / ``git diff`` / ``git add`` / ``git commit``, and a tree
-   assertion that the replayed commit matches the fixture commit exactly;
-5. ``git worktree remove`` plus a reset of the source repository, so the run
-   leaves no worktree metadata behind.
+4. ``git status`` / ``git diff`` / ``git add`` / ``git commit``.
+
+As upstream, the workload checks command exit codes without comparing commit
+trees. Source setup and validation precede the timed workload. Upstream's
+backend manages the disposable directory; this standalone runner removes its
+worktree afterwards, outside ``elapsed_ms``, and reports ``cleanup_ms``.
+The source repository is reused without a reset.
 
 Checkpoint boundaries are recorded as zero-cost markers: this variant
 deliberately removes ckpt/backend operations, so its timings must not be
@@ -866,24 +870,6 @@ def loose_object_count(repo: Path) -> int:
     return count
 
 
-def verify_tree(worktree: Path, commit_id: str) -> dict[str, Any]:
-    actual = git_text(
-        worktree,
-        ["rev-parse", "HEAD^{tree}"],
-        what=f"reading replayed tree for {commit_id}",
-    )
-    expected = git_text(
-        worktree,
-        ["rev-parse", f"{commit_id}^{{tree}}"],
-        what=f"reading target tree for {commit_id}",
-    )
-    if actual != expected:
-        raise WorkflowError(
-            f"tree mismatch for {commit_id}: expected {expected}, got {actual}"
-        )
-    return {"commit": commit_id, "tree": actual, "ok": True}
-
-
 def record_checkpoint(step: int, phase: str, steps: list[dict[str, Any]]) -> None:
     steps.append({"step": f"checkpoint: {phase}", "ms": 0})
 
@@ -989,12 +975,10 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
 
     jobs = resolve_jobs(args)
     steps: list[dict[str, Any]] = []
-    assertions: list[dict[str, Any]] = []
     checkpoint_step = 0
     cleanup_error: str | None = None
     cleanup_ms: int | None = None
     preparation_ms: int | None = None
-    preparation_steps: list[dict[str, Any]] = []
     workflow_ms: int | None = None
     success = False
     error: str | None = None
@@ -1002,6 +986,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     timed_end: int | None = None
     repo_action = "worktree-add"
     source_repo_action = "cloned-bundle" if source_setup_ms else "reused"
+    owns_marker = False
 
     try:
         begin_run(
@@ -1012,6 +997,10 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             verbose=args.verbose,
         )
 
+        owns_marker = True
+        preparation_ms = elapsed_ms(preparation_start)
+        timed_start = time.perf_counter_ns()
+
         prune_start = time.perf_counter_ns()
         run_git(
             source_repo,
@@ -1019,7 +1008,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             what="pruning stale worktree metadata",
             verbose=args.verbose,
         )
-        preparation_steps.append(
+        steps.append(
             {"step": "worktree: prune", "ms": elapsed_ms(prune_start)}
         )
 
@@ -1030,16 +1019,9 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
             what="creating the benchmark worktree",
             verbose=args.verbose,
         )
-        preparation_steps.append(
+        steps.append(
             {"step": "worktree: add", "ms": elapsed_ms(add_start)}
         )
-
-        preparation_ms = elapsed_ms(preparation_start)
-        print(
-            f"Worktree prepared at {worktree} ({repo_action}, {preparation_ms} ms).",
-            file=sys.stderr,
-        )
-        timed_start = time.perf_counter_ns()
 
         checkpoint_step += 1
         record_checkpoint(checkpoint_step, "worktree", steps)
@@ -1148,11 +1130,6 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
 
             checkpoint_step += 1
             record_checkpoint(checkpoint_step, f"git-commit {commit_id}", steps)
-            verify_start = time.perf_counter_ns()
-            assertions.append(verify_tree(worktree, commit_id))
-            steps.append(
-                {"step": f"tree-verify: {commit_id}", "ms": elapsed_ms(verify_start)}
-            )
 
         success = True
     except WorkflowError as exc:
@@ -1172,7 +1149,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         else:
             workflow_ms = 0
         cleanup_start = time.perf_counter_ns()
-        if marker.exists():
+        if owns_marker:
             try:
                 cleanup_run(
                     source_repo,
@@ -1193,7 +1170,7 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
     ))
 
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "workflow": "mini-dev-workflow",
         "execution_mode": "git-worktree",
         "success": success,
@@ -1205,7 +1182,6 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "source_setup_ms": source_setup_ms,
         "git_dir": str(source_repo / ".git"),
         "preparation_ms": preparation_ms,
-        "preparation_steps": preparation_steps,
         "fixture_dir": str(fixture_dir),
         "series": str(series_path),
         "worktree_removed": not worktree.exists(),
@@ -1222,7 +1198,6 @@ def run_workflow(args: argparse.Namespace) -> dict[str, Any]:
         "fsync_mode": FSYNC_MODE,
         "cache_state": CACHE_STATE,
         "steps": steps,
-        "tree_assertions": assertions,
     }
 
 
@@ -1316,21 +1291,21 @@ def main(argv: list[str] | None = None) -> int:
         result = run_workflow(args)
     except WorkflowError as exc:
         result = {
-            "schema_version": 3,
+            "schema_version": 4,
             "workflow": "mini-dev-workflow",
             "success": False,
             "error": str(exc),
         }
     except KeyboardInterrupt:
         result = {
-            "schema_version": 3,
+            "schema_version": 4,
             "workflow": "mini-dev-workflow",
             "success": False,
             "error": "interrupted",
         }
     except Exception as exc:
         result = {
-            "schema_version": 3,
+            "schema_version": 4,
             "workflow": "mini-dev-workflow",
             "success": False,
             "error": f"unexpected error: {exc}",

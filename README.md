@@ -80,6 +80,16 @@ afterwards. The source repository is created from the committed
 `source-repo.bundle` on first use and reused afterwards; keep it on the
 filesystem under test, because Git stores the index, refs and objects there.
 
+The mini workflow follows upstream `perf-eval`: `git worktree prune` and
+`git worktree add` are timed steps, followed by build/search/read/edit/commit,
+with command exit-code checks and no per-commit tree comparison. Source setup
+and validation are outside the workload timer; the standalone runner removes
+the worktree afterwards and reports that separately as `cleanup_ms`, without
+resetting the source repository. Its result schema is now version 4:
+`worktree: prune` and `worktree: add` move from `preparation_steps` into `steps`,
+and `preparation_steps` and `tree_assertions` are removed. The changed timing
+boundary means `elapsed_ms` is not directly comparable with version 3 results.
+
 All five benchmarks report `fsync_mode` and `cache_state`. `dev_workflow` and
 `mini_dev_workflow` commit with `core.fsync=committed` +
 `core.fsyncMethod=fsync`; everything else (edit scripts, compiler, linker)
