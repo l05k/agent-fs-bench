@@ -222,6 +222,9 @@ __marimo__/
 # Benchmark results (reports, logs, manifests) written by the scripts
 results/
 
+# Local upstream checkouts used for reference
+/thirdparty/
+
 # Generated mini-dev-workflow Git fixture (rebuild with
 # tools/gen_mini_source_repo.py; the exported bundle is committed instead)
 data/mini-dev-workflow/source-repo/
