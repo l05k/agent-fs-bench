@@ -25,6 +25,7 @@ BEGIN = "# >>> BEGIN GENERATED results-core (source: tools/results_core.py) >>>"
 END = "# <<< END GENERATED results-core <<<"
 
 TARGETS = (
+    REPO_ROOT / "clone_bench.py",
     REPO_ROOT / "dev_workflow_fs.py",
     REPO_ROOT / "mini_dev_workflow_fs.py",
     REPO_ROOT / "multi_host_nas_fs.py",

@@ -2,10 +2,10 @@
 
 Benchmarking agent workloads on filesystems.
 
-Five single-host benchmarks, plus one multi-host NAS experiment. Each
+Six single-host benchmarks, plus one multi-host NAS experiment. Each
 single-host benchmark is a standalone script that can be copied alone to a test
-machine and run with a plain system `python3`; four need only the standard
-library, and the fifth shells out to SQLite's own C test program, which it
+machine and run with a plain system `python3`; five need only the standard
+library, and the sixth shells out to SQLite's own C test program, which it
 downloads and builds on the test machine:
 
 | Script | Workload |
@@ -13,6 +13,7 @@ downloads and builds on the test machine:
 | [`dev_workflow_fs.py`](./dev_workflow_fs.py) | Kernel dev workflow (config/build/search/edit/commit) in one disposable Linux checkout |
 | [`mini_dev_workflow_fs.py`](./mini_dev_workflow_fs.py) | Same workflow shape against a tiny C project in a disposable Git worktree; the fast reproducer |
 | [`npm_install_fs_bench.py`](./npm_install_fs_bench.py) | Warm npm/pnpm cache, cold `node_modules` install, same- or cross-filesystem cache placement |
+| [`clone_bench.py`](./clone_bench.py) | Same-filesystem tree copy/clone: `cp -a`, `cp -r`, Python, or an external command copier |
 | [`openclaw_session_bench.py`](./openclaw_session_bench.py) | OpenClaw transcript SQLite write microbenchmark |
 | [`kvtest_openclaw_fs.py`](./kvtest_openclaw_fs.py) | SQLite's official `kvtest --multitrans`: one commit per write, as an OpenClaw-shaped lower bound |
 | [`multi_host_nas_fs.py`](./multi_host_nas_fs.py) | Multi-host NAS experiment: parallel SSH mounts, synchronized concurrent writes and shared-directory contention |
@@ -22,6 +23,7 @@ Per-benchmark reference notes (EN/中文) live in
 
 - [`docs/bench-dev-workflow.md`](./docs/bench-dev-workflow.md)
 - [`docs/bench-npm-install.md`](./docs/bench-npm-install.md)
+- [`docs/bench-clone.md`](./docs/bench-clone.md)
 - [`docs/bench-openclaw-session.md`](./docs/bench-openclaw-session.md)
 - [`docs/bench-kvtest-openclaw.md`](./docs/bench-kvtest-openclaw.md)
 - [`docs/bench-multi-host-nas.md`](./docs/bench-multi-host-nas.md)
@@ -48,6 +50,9 @@ uv run npm_install_fs_bench.py --dir /mnt/testfs --fixture pnpm-bench --runs 3
 uv run npm_install_fs_bench.py --dir /mnt/nas/mount \
   --prep-dir /var/tmp/npm-prep --top-k 30 --runs 3
 uv run npm_install_fs_bench.py --dir /mnt/testfs --top-k 30 --concurrency 8
+uv run clone_bench.py --mount /mnt/testfs --copiers cp,cpr,internal
+uv run clone_bench.py --mount /mnt/testfs --stage concurrency \
+  --copiers cp,internal --conc-levels 1,4,16,32
 uv run openclaw_session_bench.py --dir /mnt/testfs --duration 30
 uv run kvtest_openclaw_fs.py --dir /mnt/testfs --count 2000
 python3 multi_host_nas_fs.py --config experiments/multi-host-nas.yaml --check
@@ -73,6 +78,13 @@ Its dependency tree comes from the top-package catalog by default (`--top-k`,
 replays one of the fixtures pnpm's own install benchmark uses from
 `data/pnpm-bench*/` (committed lockfiles, so the payload is fixed).
 
+`clone_bench.py` keeps its source and destination on `--mount` and measures
+warm-cache copies only. It does not offer a cold-cache mode: dropping the
+kernel page cache does not evict FUSE or other userspace client caches, so the
+label would be false on distributed filesystems. Any command-line clone tool
+can be used as a copier with `--external-copier NAME='command {src} {dst}'`;
+see [`docs/bench-clone.md`](./docs/bench-clone.md).
+
 `dev_workflow_fs.py` reads its fixtures from `data/dev-workflow/` next to the
 script (override with `--fixture-dir`); copy the script together with `data/`
 to run it on another machine. It requires Linux, and its fixture commits must
@@ -95,8 +107,8 @@ resetting the source repository. Its result schema is now version 4:
 and `preparation_steps` and `tree_assertions` are removed. The changed timing
 boundary means `elapsed_ms` is not directly comparable with version 3 results.
 
-All five benchmarks report `fsync_mode` and `cache_state`. `dev_workflow` and
-`mini_dev_workflow` commit with `core.fsync=committed` +
+All six single-host benchmarks report `fsync_mode` and `cache_state`.
+`dev_workflow` and `mini_dev_workflow` commit with `core.fsync=committed` +
 `core.fsyncMethod=fsync`; everything else (edit scripts, compiler, linker)
 stops at the page cache, and no cache is dropped between phases — so read
 timings are warm-cache timings.
@@ -185,6 +197,11 @@ results/
     top-packages.csv        # only when the catalog is downloaded
     manifest.txt
     logs/{npm,pnpm}-run-<n>.log
+  clone_bench/20261102T042113Z/
+    raw.csv
+    summary.md
+    result.json
+    manifest.txt
   openclaw_session_bench/20261102T042113Z/
     result.json
     report.md
