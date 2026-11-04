@@ -15,7 +15,7 @@ downloads and builds on the test machine:
 | [`npm_install_fs_bench.py`](./npm_install_fs_bench.py) | Warm npm/pnpm cache, cold `node_modules` install, same- or cross-filesystem cache placement |
 | [`clone_bench.py`](./clone_bench.py) | Same-filesystem tree copy/clone: `cp -a`, `cp -r`, Python, or an external command copier |
 | [`openclaw_session_bench.py`](./openclaw_session_bench.py) | OpenClaw transcript SQLite write microbenchmark |
-| [`kvtest_openclaw_fs.py`](./kvtest_openclaw_fs.py) | SQLite's official `kvtest --multitrans`: one commit per write, as an OpenClaw-shaped lower bound |
+| [`kvtest_openclaw_fs.py`](./kvtest_openclaw_fs.py) | SQLite's official `kvtest --multitrans`: one commit per write, as a single-table SQLite comparison workload |
 | [`multi_host_nas_fs.py`](./multi_host_nas_fs.py) | Multi-host NAS experiment: parallel SSH mounts, synchronized concurrent writes and shared-directory contention |
 
 Per-benchmark reference notes (EN/中文) live in

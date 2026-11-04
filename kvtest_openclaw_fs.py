@@ -44,6 +44,11 @@ which lets the WAL grow without bound and pushes one huge checkpoint to the
 end of the run. This harness therefore leaves the SQLite default of 1000
 pages (roughly 4 MiB at a 4 KiB page size) and records it in the result.
 
+Reported microseconds/write amortize connection setup and the final close /
+checkpoint as well as the writes. This is a single-table comparison workload,
+not a strict OpenClaw latency lower bound (FULL sync is stronger than NORMAL).
+Do not run concurrently against the same --dir: setup replaces a fixed DB name.
+
 Only the standard library is required; a C compiler and network access are
 needed for the first run of a given source revision.
 """
@@ -91,20 +96,23 @@ def results_run_dir(script_name, anchor=None, moment=None):
     """Create and return ``<project>/results/<script_name>/<utc-run-id>``.
 
     ``anchor`` is the benchmark script path (default: this file), so the
-    location never depends on the current working directory. An existing
-    directory for the same run id is reused.
+    location never depends on the current working directory. A second run in
+    the same second would otherwise overwrite the first one's artifacts, so a
+    ``-2``, ``-3``, ... suffix is appended until the directory is unused.
     """
     anchor_path = _ResultsPath(anchor if anchor is not None else __file__)
-    path = (
-        anchor_path.resolve().parent
-        / RESULTS_DIRNAME
-        / script_name
-        / utc_run_id(moment)
+    root = (
+        anchor_path.resolve().parent / RESULTS_DIRNAME / script_name
     )
+    run_id = utc_run_id(moment)
+    path = root / run_id
+    suffix = 1
+    while path.exists():
+        suffix += 1
+        path = root / f"{run_id}-{suffix}"
     path.mkdir(parents=True, exist_ok=True)
     return path
 # <<< END GENERATED results-core <<<
-
 
 SCRIPT_NAME = Path(__file__).stem
 MIB = 1024 * 1024
@@ -215,6 +223,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--jmode",
         default="wal",
+        type=str.lower,
+        choices=("delete", "truncate", "persist", "memory", "wal", "off"),
         help="kvtest --jmode; OpenClaw uses wal.",
     )
     parser.add_argument(
@@ -323,6 +333,8 @@ def build(build_dir: Path, sources: Dict[str, Path], force: bool) -> Path:
     command = [
         compiler,
         "-O2",
+        "-I",
+        str(sources["sqlite3_h"].parent),
         "-o",
         str(binary),
         str(sources["kvtest"]),
@@ -359,6 +371,7 @@ PARSE_PATTERNS = {
     "write_rate_mb_s": re.compile(r"Content write rate:\s*([0-9.]+)"),
     "total_elapsed_s": re.compile(r"Total elapsed time:\s*([0-9.]+)"),
     "page_size": re.compile(r"Database page size:\s*(\d+)"),
+    "journal_mode": re.compile(r"--jmode\s+(\w+)"),
 }
 
 
@@ -368,7 +381,10 @@ def parse_kvtest_output(text: str) -> Dict[str, Any]:
         match = pattern.search(text)
         if match:
             value = match.group(1)
-            parsed[name] = float(value) if "." in value else int(value)
+            if name == "journal_mode":
+                parsed[name] = value.upper()
+            else:
+                parsed[name] = float(value) if "." in value else int(value)
     if "microseconds_per_write" not in parsed:
         raise BenchmarkError(
             "could not parse kvtest output; expected "
@@ -475,7 +491,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "--jmode",
         args.jmode,
         "--cache-size",
-        str(args.cache_size),
+        str(-args.cache_size),
         "--mmap",
         str(args.mmap),
     ]
@@ -520,6 +536,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
 
     return {
         "workload": "sqlite-kvtest-openclaw-multitrans",
+        "status": "ok" if db_pragmas.get("integrity_check") == "ok" else "failed",
         "command": shlex.join([sys.executable, str(Path(sys.argv[0])), *sys.argv[1:]]),
         "sqlite_version": sqlite3.sqlite_version,
         "sqlite_build_version": SQLITE_VERSION,
@@ -543,6 +560,7 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "openclaw_settings": OPENCLAW_SETTINGS,
         "reached_settings": {
             **REACHED_SETTINGS,
+            "journal_mode": repeats[-1]["parsed"]["journal_mode"],
             "synchronous": reached_synchronous(args),
             "cache_size": -args.cache_size,
             "mmap_size": args.mmap,
@@ -551,7 +569,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
             "synchronous: OpenClaw NORMAL, kvtest offers only FULL or OFF",
             "busy_timeout: OpenClaw 5000 ms, kvtest cannot set it",
             "journal_size_limit: OpenClaw 64 MiB, kvtest cannot set it",
-            "wal_autocheckpoint: OpenClaw 0, kvtest default 1000",
+            (
+                "wal_autocheckpoint: OpenClaw 0, kvtest default 1000"
+                if repeats[-1]["parsed"]["journal_mode"] == "WAL"
+                else "WAL checkpointing: not applicable to the reached journal mode"
+            ),
             "auto_vacuum: OpenClaw INCREMENTAL on fresh db, kvtest cannot set it",
             "no secondary indexes, no FTS5, single kv table",
         ],
@@ -702,7 +724,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     print(f"target dir: {result['target_dir']}")
     print(f"results: {results_dir}")
-    return 0
+    return 0 if result["status"] == "ok" else 1
 
 
 if __name__ == "__main__":
