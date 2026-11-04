@@ -2,7 +2,8 @@
 
 Benchmarking agent workloads on filesystems.
 
-Five benchmarks. Each is a standalone script that can be copied alone to a test
+Five single-host benchmarks, plus one multi-host NAS experiment. Each
+single-host benchmark is a standalone script that can be copied alone to a test
 machine and run with a plain system `python3`; four need only the standard
 library, and the fifth shells out to SQLite's own C test program, which it
 downloads and builds on the test machine:
@@ -14,6 +15,7 @@ downloads and builds on the test machine:
 | [`npm_install_fs_bench.py`](./npm_install_fs_bench.py) | Warm npm/pnpm cache, cold `node_modules` install, same- or cross-filesystem cache placement |
 | [`openclaw_session_bench.py`](./openclaw_session_bench.py) | OpenClaw transcript SQLite write microbenchmark |
 | [`kvtest_openclaw_fs.py`](./kvtest_openclaw_fs.py) | SQLite's official `kvtest --multitrans`: one commit per write, as an OpenClaw-shaped lower bound |
+| [`multi_host_nas_fs.py`](./multi_host_nas_fs.py) | Multi-host NAS experiment: parallel SSH mounts, synchronized concurrent writes and shared-directory contention |
 
 Per-benchmark reference notes (EN/中文) live in
 [`docs/`](./docs):
@@ -22,6 +24,7 @@ Per-benchmark reference notes (EN/中文) live in
 - [`docs/bench-npm-install.md`](./docs/bench-npm-install.md)
 - [`docs/bench-openclaw-session.md`](./docs/bench-openclaw-session.md)
 - [`docs/bench-kvtest-openclaw.md`](./docs/bench-kvtest-openclaw.md)
+- [`docs/bench-multi-host-nas.md`](./docs/bench-multi-host-nas.md)
 
 ## Setup
 
@@ -47,6 +50,8 @@ uv run npm_install_fs_bench.py --dir /mnt/nas/mount \
 uv run npm_install_fs_bench.py --dir /mnt/testfs --top-k 30 --concurrency 8
 uv run openclaw_session_bench.py --dir /mnt/testfs --duration 30
 uv run kvtest_openclaw_fs.py --dir /mnt/testfs --count 2000
+python3 multi_host_nas_fs.py --config experiments/multi-host-nas.yaml --check
+python3 multi_host_nas_fs.py --config experiments/multi-host-nas.yaml
 ```
 
 `--repo` / `--dir` must point at the filesystem under test. Intermediate
@@ -104,6 +109,17 @@ script (git-ignored) and compiles `build/kvtest`; later runs reuse both. Set
 `CC` to choose the compiler, or `--build-dir` to move the cache. See
 [`docs/bench-kvtest-openclaw.md`](./docs/bench-kvtest-openclaw.md) for the
 parameter comparison against OpenClaw and the gaps it cannot close.
+
+`multi_host_nas_fs.py` is different from the single-host benchmarks: the
+machine that launches it is only the control plane. The YAML plan lists the SSH
+hosts, one NAS source/mountpoint, and the workload shape. The script deploys
+itself as a worker, mounts the NAS on every host in parallel, releases all
+workers through one start gate, and writes only below `nas.run_root` on the NAS.
+It is standard-library-only, so the control machine does not need the project
+environment or a local mount. Run `--check` to validate the plan without
+opening SSH connections. See
+[`docs/bench-multi-host-nas.md`](./docs/bench-multi-host-nas.md) for the plan
+format, workload phases, synchronization and cleanup rules.
 
 ## Fixtures
 
@@ -180,6 +196,17 @@ results/
     summary.txt
     manifest.txt
     kvtest-stdout.txt
+  multi_host_nas_fs/20261102T042113Z/
+    result.json
+    metrics.csv
+    aggregate.csv
+    summary.txt
+    config.yaml
+    plan.json
+    manifest.txt
+    <host>.result.json
+    logs/<host>.stdout.log
+    logs/<host>.stderr.log
 ```
 
 The path is derived from each script's own location, so the current working
