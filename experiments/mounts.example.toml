@@ -1,0 +1,29 @@
+# Copy to local/mounts.toml. Commands run locally as the invoking user, without a shell.
+# Profile names must match targets in local/targets.toml. The target path is LOCAL
+# staging storage, NOT the admin filesystem mount. Replace example hosts/meta URL.
+# admin_root is an externally mounted full-volume administrative view, kept mounted
+# throughout all scales, excluded from the per-agent mount count.
+# {source}/{subdir}/{binds} use volume-absolute paths, relative to admin_root.
+
+[profiles.nfs]
+topology = "multi-mount"
+admin_root = "/mnt/nfs-admin"
+private_mount = ["mount", "-t", "nfs", "-o", "rw", "server:/export{source}", "{mountpoint}"]
+shared_mount = ["mount", "-t", "nfs", "-o", "ro", "server:/export{source}", "{mountpoint}"]
+unmount = ["umount", "{mountpoint}"]
+
+# Example only: actual LakeBase path/permissions/options must be configured by the
+# experimenter. This repository cannot verify LakeBase without a real service.
+[profiles.lakebase]
+topology = "shared-directory"
+admin_root = "/mnt/lakebase-admin"
+private_mount = ["lakebase-client", "mount", "META_URL", "{mountpoint}", "--subdir", "{subdir}", "--bind", "{binds}"]
+unmount = ["lakebase-client", "umount", "{mountpoint}"]
+
+# Mechanism ablation: same LakeBase backend with X real mounts per agent.
+[profiles.lakebase-multi]
+topology = "multi-mount"
+admin_root = "/mnt/lakebase-admin"
+private_mount = ["lakebase-client", "mount", "META_URL", "{mountpoint}", "--subdir", "{subdir}"]
+shared_mount = ["lakebase-client", "mount", "META_URL", "{mountpoint}", "--subdir", "{source}"]
+unmount = ["lakebase-client", "umount", "{mountpoint}"]

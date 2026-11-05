@@ -1,5 +1,5 @@
-# Copy to local/targets.toml. Mount filesystems outside this repository first.
-# Paths are the only filesystem interface; no vendor names or mount commands.
+# Copy to local/targets.toml. Standard workloads use externally mounted paths.
+# mount-scale instead uses local staging paths plus local/mounts.toml profiles.
 [[targets]]
 name = "fs-a"
 path = "/mnt/fs-a"

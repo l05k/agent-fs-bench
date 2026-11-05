@@ -1,8 +1,8 @@
 # agent-fs-bench
 
-面向 agent 工作负载的文件系统科研 benchmark。**输入是已挂载的目录；唯一原始结果是 JSONL；每次运行默认生成派生汇总 CSV，图表按需生成。**
+面向 agent 工作负载的文件系统科研 benchmark。**常规 workload 输入为已挂载目录；`mount-scale` 另支持配置真实挂载命令。唯一原始结果是 JSONL；每次运行默认生成派生汇总 CSV，图表按需生成。**
 
-正式运行环境为 Linux、Python 3.12+。不包含内部文件系统实现、挂载命令或凭据；本地盘、FUSE、NFS 使用同一个目录接口。benchmark 不负责挂载、卸载、自动安装、重试或旧结果迁移。出错即停止，修正实验环境后重测。KISS：公开 CLI 只选择“测什么、在哪测”，实验默认值集中在各 workload 的 `CONFIG` 常量中。
+正式运行环境为 Linux、Python 3.12+。不包含内部文件系统实现或凭据；本地盘、FUSE、NFS 使用同一个目录接口。除 `mount-scale` 的显式挂载实验外，benchmark 不负责挂载、卸载；不自动安装、重试或迁移旧结果。出错即停止，修正实验环境后重测。KISS：公开 CLI 只选择“测什么、在哪测”，实验默认值集中在各 workload 的 `CONFIG` 常量中。
 
 ## 结构
 
@@ -12,9 +12,9 @@ agent_fs_bench/
   analysis.py             # DuckDB 汇总、查询与绘图
   results.py              # JSONL 运行上下文与复现信息
   targets.py              # 目录列表与别名
-  benchmarks/             # 7 个 workload + 顶部 CONFIG；SQLite 共用构建机制
+  benchmarks/             # 8 个 workload + 顶部 CONFIG；SQLite 共用构建机制
 experiments/              # 不含内部信息的 TOML 示例
-local/                    # 私有目标/SSH 配置，不提交
+local/                    # 私有目标、mount 与 SSH 配置，不提交
 results/<bench>/<run-id>/ # results.jsonl、summary.csv 和诊断附件
 data/                     # 固定输入、lockfile、Git bundle
 docs/                     # 各 workload 的 CONFIG 默认值和计时边界
@@ -40,12 +40,12 @@ uv sync --locked --group analysis
 
 | 工具 | 用途 | 公开参数 |
 | --- | --- | --- |
-| `run` | 在一个或多个已挂载目录上顺序测量，随后生成汇总 CSV | `benchmark`、`--dirs`、`--target` |
+| `run` | 在一个或多个目标上顺序测量，随后生成汇总 CSV | `benchmark`、`--dirs`、`--target` |
 | `analyze` | 对任意 JSONL 执行 DuckDB 查询并输出 CSV/stdout | `inputs`、`--sql`、`--database`、`--output` |
 | `plot` | 从任意 JSONL 按论文图规范绘制分组箱线图，输出 PDF/PNG 及自包含脚本 | `inputs`、`--benchmark`、`--metric`、`--cases`、`--targets`、`--parameters`、`--source-sha256`、`--ylabel`、`--size`、`--output` |
 | `tools/gen_mini_source_repo.py` | 确定性重建 mini 的 Git fixture | `--force` |
 
-`run` 的 workload 参数只剩 `clone --smoke`；其余实验设置在各模块顶部 `CONFIG` 中，修改代码属于实验配置变更，不得提交私有值。
+`run` 的 workload 参数为 `clone --smoke`、`mount-scale --directory-smoke`；其余实验设置在各模块顶部 `CONFIG` 中，修改代码属于实验配置变更，不得提交私有值。
 
 ### 目标目录
 
@@ -63,6 +63,8 @@ path = "/mnt/fs-b"
 
 `name` 是结果和图表标签；简写 `path = "fs-a"` 表示 `/mnt/fs-a`。不会扫描 `/mnt`，不会创建缺失的目标根目录，也不会验证挂载来源；仅有一个本地空目录并不证明挂载成功。
 
+`mount-scale` 例外：target 是本地 staging 根目录；`local/mounts.toml` 指定待测卷的 admin 视图与 mount／umount 命令。每个 agent 独立挂载，详见 [mount scaling](docs/bench-mount-scale.md)。`--directory-smoke` 仅使用普通目录，不执行任何挂载。
+
 ```sh
 # 默认读取 local/targets.toml，按顺序测量全部目标
 uv run python -m agent_fs_bench run clone -- --smoke
@@ -74,7 +76,7 @@ uv run python -m agent_fs_bench run clone --target fs-a -- --smoke
 uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 ```
 
-结果固定写入仓库 `results/<bench>/<run-id>/`，没有重定向参数。目标工作数据只写在 `<target>/agent-fs-bench/<bench>/<run-id>/`，不会清空目标根目录。不同目标顺序运行；bench 内原有并发 workload 不变。
+结果固定写入仓库 `results/<bench>/<run-id>/`，没有重定向参数。常规 workload 工作数据只写在 `<target>/agent-fs-bench/<bench>/<run-id>/`；`mount-scale` 的 mount points 在此，本次卷内数据另放在 admin 视图的同名 run 目录。不会清空目标根目录。不同目标顺序运行；bench 内并发 workload 不变。
 
 ## Benchmark 命令
 
@@ -87,6 +89,7 @@ uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 | `run kvtest` | SQLite 官方单写者随机 BLOB 覆写；逐次提交或整批事务 | [kvtest 与负载校准](docs/bench-kvtest-openclaw.md) |
 | `run sqlite-speedtest` | SQLite 官方 `speedtest1 main`，单连接 SQL 阶段及完整进程计时，无 Agent 假设 | [SQLite SQL microbenchmark](docs/bench-sqlite-speedtest.md) |
 | `run multi-host` | 多台 SSH 主机同时在共享文件系统执行私有树操作和目录竞争 | [multi-host](docs/bench-multi-host-nas.md) |
+| `run mount-scale` | 单机 N 个独立 client，比较 N×X mounts 与 N mounts 的 mdtest 小文件扩展性、lifecycle 与主机资源 | [mount scaling](docs/bench-mount-scale.md) |
 
 ```sh
 uv run python -m agent_fs_bench run dev-workflow --dirs /mnt/fs-a
@@ -96,13 +99,14 @@ uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a -- --smoke
 uv run python -m agent_fs_bench run kvtest --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run sqlite-speedtest --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run multi-host --dirs /mnt/fs-a
+uv run python -m agent_fs_bench run mount-scale --target lakebase
 ```
 
 ### 运行默认值
 
 `run` 不暴露规模、重复次数、并发、fsync/cache、PRAGMA、fixture/manager、资源路径等调节参数。每个模块顶部有唯一的 `CONFIG` 字典，记录该 workload 的可复现实验设置；具体默认值和计时含义见对应文档。修改 `CONFIG` 并在结果中保留源码指纹，才能说明实验条件。部分 workload 会强制校验实验条件：npm-install 要求 node/npm/pnpm 版本与 `CONFIG["tool_versions"]` 完全一致，并要求外部本地准备盘与 target 不同设备、不同文件系统类型，不满足即中止，不回退。
 
-多机模式固定读取 `local/hosts.toml`，格式见 `experiments/hosts.example.toml`。控制机无需挂载；所有 worker 必须已经以**相同绝对路径访问同一个共享文件系统**。不会尝试修复连接、重试或挂载。
+`multi-host` 固定读取 `local/hosts.toml`，格式见 `experiments/hosts.example.toml`。控制机无需挂载；所有 worker 必须已经以**相同绝对路径访问同一个共享文件系统**。不会尝试修复连接、重试或挂载。`mount-scale` 只在单个 Linux host 内扩展 agent，不使用此 SSH 配置。
 
 ## 结果
 
