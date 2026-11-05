@@ -12,7 +12,7 @@ agent_fs_bench/
   analysis.py             # DuckDB 汇总、查询与绘图
   results.py              # JSONL 运行上下文与复现信息
   targets.py              # 目录列表与别名
-  benchmarks/             # 8 个 workload + 顶部 CONFIG；SQLite 共用构建机制
+  benchmarks/             # 9 个 workload + 顶部 CONFIG；SQLite 共用构建机制
 experiments/              # 不含内部信息的 TOML 示例
 local/                    # 私有目标、mount 与 SSH 配置，不提交
 results/<bench>/<run-id>/ # results.jsonl、summary.csv 和诊断附件
@@ -42,10 +42,10 @@ uv sync --locked --group analysis
 | --- | --- | --- |
 | `run` | 在一个或多个目标上顺序测量，随后生成汇总 CSV | `benchmark`、`--dirs`、`--target` |
 | `analyze` | 对任意 JSONL 执行 DuckDB 查询并输出 CSV/stdout | `inputs`、`--sql`、`--database`、`--output` |
-| `plot` | 从任意 JSONL 按论文图规范绘制分组箱线图，输出 PDF/PNG 及自包含脚本 | `inputs`、`--benchmark`、`--metric`、`--cases`、`--targets`、`--parameters`、`--source-sha256`、`--ylabel`、`--size`、`--output` |
+| `plot` | 从任意 JSONL 按论文图规范绘制分组箱线图或数值横轴曲线，输出 PDF/PNG 及自包含脚本 | `inputs`、`--benchmark`、`--metric`、`--cases`、`--targets`、`--parameters`、`--source-sha256`、`--ylabel`、`--size`、`--output` |
 | `tools/gen_mini_source_repo.py` | 确定性重建 mini 的 Git fixture | `--force` |
 
-`run` 的 workload 参数为 `clone --smoke`、`mount-scale --directory-smoke`；其余实验设置在各模块顶部 `CONFIG` 中，修改代码属于实验配置变更，不得提交私有值。
+`run` 的 workload 参数为 `clone --smoke`、`mount-scale --directory-smoke`、`mdtest --smoke`；其余实验设置在各模块顶部 `CONFIG` 中，修改代码属于实验配置变更，不得提交私有值。
 
 ### 目标目录
 
@@ -90,6 +90,7 @@ uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 | `run sqlite-speedtest` | SQLite 官方 `speedtest1 main`，单连接 SQL 阶段及完整进程计时，无 Agent 假设 | [SQLite SQL microbenchmark](docs/bench-sqlite-speedtest.md) |
 | `run multi-host` | 多台 SSH 主机同时在共享文件系统执行私有树操作和目录竞争 | [multi-host](docs/bench-multi-host-nas.md) |
 | `run mount-scale` | 单机 N 个独立 client，比较 N×X mounts 与 N mounts 的 mdtest 小文件扩展性、lifecycle 与主机资源 | [mount scaling](docs/bench-mount-scale.md) |
+| `run mdtest` | 单客户端 POSIX 元数据吞吐；固定总对象数，private/shared 目录与进程数扫描 | [mdtest](docs/bench-mdtest.md) |
 
 ```sh
 uv run python -m agent_fs_bench run dev-workflow --dirs /mnt/fs-a
@@ -100,6 +101,7 @@ uv run python -m agent_fs_bench run kvtest --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run sqlite-speedtest --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run multi-host --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run mount-scale --target lakebase
+uv run python -m agent_fs_bench run mdtest --dirs /mnt/fs-a -- --smoke
 ```
 
 ### 运行默认值
@@ -198,12 +200,23 @@ uv run --group analysis python -m agent_fs_bench plot \
   --ylabel 'Durable install (s)' --output results/npm-latency
 ```
 
-CSV 是可随时重新生成的派生文件；DuckDB 是派生缓存，不维护数据库版本。默认分类箱线图将所选输入中的跨 run 样本合并到目标 × case，只有 `parameters` 与 `source_sha256` 完全一致的行才会进入同一个箱子；同一 case 内出现多个配置身份时，`plot` 直接报错而不是静默合并，报错会列出找到的身份，并提示用 `--parameters <json>` 和/或 `--source-sha256 <hash>[,<hash>]` 选择。clone 自动按数据量、文件数和两类并发场景生成数值横轴折线图，以 `target/copier` 为系列，延迟直接汇集原始请求样本、显示中位数和 IQR；每条扫描线同样只允许一个 `(parameters, source_sha256)` 身份，混合时报错并列出找到的身份，不会把不同参数或源码的样本画进同一张图。要分析某次运行，直接只传入该 run 的 JSONL，或使用自定义 SQL 按 `run_id` 筛选。clone 的新完整目录请求数据与旧 shard 结果不兼容，须重新测量。
+mdtest 的并发图直接使用原始 JSONL；每个操作和目录布局输出一张中位数/IQR 曲线：
+
+```sh
+uv run --group analysis python -m agent_fs_bench plot \
+  'results/mdtest/<run-id>/results.jsonl' \
+  --benchmark mdtest --metric ops_per_s \
+  --targets ours,nfs,ext4 --output results/mdtest-metadata
+```
+
+横轴为单客户端进程数，纵轴为 Kops/s，例如输出 `mdtest-metadata-file-create-private.pdf`，并附 PNG 和自包含脚本。绘图要求所选目标覆盖相同进程数，且总对象数、mdtest 版本、缓存及完成口径相同；不把这些吞吐样本解释为逐操作延迟。其余实验条件由人工保证一致。
+
+CSV 是可随时重新生成的派生文件；DuckDB 是派生缓存，不维护数据库版本。默认分类箱线图将所选输入中的跨 run 样本合并到目标 × case，只有 `parameters` 与 `source_sha256` 完全一致的行才会进入同一个箱子；同一 case 内出现多个配置身份时，`plot` 直接报错而不是静默合并，报错会列出找到的身份，并提示用 `--parameters <json>` 和/或 `--source-sha256 <hash>[,<hash>]` 选择。clone 自动按数据量、文件数和两类并发场景生成数值横轴折线图，以 `target/copier` 为系列，延迟直接汇集原始请求样本、显示中位数和 IQR；每条扫描线同样只允许一个 `(parameters, source_sha256)` 身份，混合时报错并列出找到的候选。mdtest 的每个操作/布局曲线同样只接受一组 `(parameters, source_sha256)`，`--parameters` 与 `--source-sha256` 直接过滤其输入行。
 
 - `--parameters '<json object>'`：只保留参数规范化后与该对象**完全相等**的行。键顺序与空白无关，但必须是 workload 记录的完整对象（含 `tool_versions`、`seed_input_sha256` 等）；不支持部分匹配。
 - `--source-sha256 <hash>[,<hash>…]`：只保留所列源码指纹的行。
 - 两个选择器都可与 `--targets`/`--cases` 组合；先按选择器过滤，再按 case/target 选择，所以被 `--cases`/`--targets` 排除的行不会触发歧义错误。不同 case 可以携带不同配置（例如不同并发批次大小），这不算歧义。
-- 选择器过滤后没有剩余行时报错 `no measurements match the plot selection`（clone 为 `no clone measurements match the plot selection`），并附上生效的选择器。
+- 选择器过滤后没有剩余行时报错 `no measurements match the plot selection`（clone 为 `no clone measurements match the plot selection`，mdtest 为 `no mdtest measurements match the plot selection`），并附上生效的选择器。
 
 `parameters_canonical` 是 `metrics` 视图中的规范化参数字符串列，持久化的 DuckDB 分析库也保存该列，重新打开时不需要额外函数。
 

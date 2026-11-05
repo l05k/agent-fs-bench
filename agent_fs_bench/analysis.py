@@ -80,6 +80,13 @@ def parameters_argument(text: str) -> str:
         raise argparse.ArgumentTypeError(
             'expected JSON, for example \'{"fixture": "pnpm-bench", "concurrency": 4}\'') from None
 
+MDTEST_OPERATIONS = {
+    'file-create': 'File create', 'file-stat': 'File stat',
+    'file-open': 'File open/close', 'file-unlink': 'File unlink',
+    'dir-mkdir': 'Directory mkdir', 'dir-stat': 'Directory stat',
+    'dir-rename': 'Directory rename', 'dir-rmdir': 'Directory rmdir',
+}
+
 def connect(inputs: list[str], database: Path | None = None):
     import duckdb
 
@@ -207,6 +214,13 @@ def plot(connection, args: argparse.Namespace) -> None:
 
     if args.benchmark == 'clone':
         plot_clone(connection, args)
+        return
+    if args.benchmark == 'mdtest':
+        for suffix, data in mdtest_plot_data(connection, args):
+            stem = args.output.with_name(f'{args.output.name}-{suffix}')
+            stem.parent.mkdir(parents=True, exist_ok=True)
+            write_script(stem, data, 'render_line')
+            figure.render_line(data, stem)
         return
 
     rows = connection.execute('''
@@ -397,3 +411,78 @@ def clone_line_data(group: dict, rows: list, series: list[str],
         'size': list(args.size),
     }
     return data
+
+
+def mdtest_plot_data(connection, args: argparse.Namespace) -> list[tuple[str, dict]]:
+    """Compare fixed-work metadata throughput at matching process counts."""
+    if args.metric != 'ops_per_s':
+        raise ValueError('mdtest concurrency figures require --metric ops_per_s')
+    rows = connection.execute('''
+        SELECT target->>'name', "case",
+               parameter_canonical.canonical, source_sha256,
+               parameters::VARCHAR, metrics::VARCHAR, details::VARCHAR
+        FROM measurements
+        LEFT JOIN parameter_canonical
+               ON CAST(measurements.parameters AS VARCHAR) = parameter_canonical.raw
+        WHERE benchmark = 'mdtest'
+        ORDER BY run_id, repeat, target->>'name', "case"
+    ''').fetchall()
+    wanted_parameters = getattr(args, 'parameters', None)
+    wanted_sources = getattr(args, 'source_sha256', None)
+    rows = filter_identities(rows, wanted_parameters, wanted_sources,
+                             lambda row: (row[2], row[3]))
+    if not rows:
+        raise ValueError('no mdtest measurements match the plot selection'
+                         + selection_detail(wanted_parameters, wanted_sources))
+    targets = args.targets or sorted({row[0] for row in rows})
+    cases = args.cases or sorted({row[1] for row in rows})
+    for kind, wanted, found in (
+        ('targets', targets, {row[0] for row in rows}),
+        ('cases', cases, {row[1] for row in rows}),
+    ):
+        missing = set(wanted) - found
+        if missing:
+            raise ValueError(f'no mdtest measurements for {kind}: {", ".join(sorted(missing))}')
+    selected = [(row[0], (row[2], row[3]), json.loads(row[4]),
+                 json.loads(row[5]), json.loads(row[6]))
+                for row in rows if row[0] in targets and row[1] in cases]
+    figures = []
+    for operation, title in MDTEST_OPERATIONS.items():
+        for layout in ('private', 'shared'):
+            group = [entry for entry in selected
+                     if entry[4]['operation'] == operation and entry[4]['layout'] == layout]
+            if not group:
+                continue
+            suffix = f'{operation}-{layout}'
+            conditions = {
+                tuple(parameters[key] for key in
+                      ('total_items', 'mdtest_version', 'cache_state', 'completion'))
+                for _, _, parameters, _, _ in group
+            }
+            if len(conditions) != 1:
+                raise ValueError(f'mdtest {suffix} mixes incompatible experiment conditions')
+            identities = {identity for _, identity, _, _, _ in group}
+            if len(identities) > 1:
+                raise ValueError(
+                    f'mdtest {suffix} mixes {len(identities)} configurations: '
+                    f'{describe_identities(identities)}; '
+                    'plot one with --parameters <json> and/or --source-sha256 <hash>[,<hash>]')
+            points = {target: {} for target in targets}
+            for target, _, _, metrics, _ in group:
+                x = metrics['concurrency']
+                points[target].setdefault(x, []).append(metrics['ops_per_s'] / 1000)
+            expected = set(points[targets[0]])
+            if not expected or any(set(points[target]) != expected for target in targets):
+                raise ValueError(f'mdtest {suffix} targets must cover the same x values')
+            figures.append((suffix, {
+                'series': targets,
+                'points': {target: [{'x': x, 'values': sorted(points[target][x])}
+                                    for x in sorted(points[target])] for target in targets},
+                'title': f'{title} ({layout})',
+                'xlabel': 'Client processes',
+                'ylabel': args.ylabel or 'Throughput (Kops/s)',
+                'logx': True, 'logy': False, 'size': list(args.size),
+            }))
+    if not figures:
+        raise ValueError('no mdtest measurements match the plot selection')
+    return figures
