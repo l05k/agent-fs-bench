@@ -14,7 +14,6 @@ BENCHMARKS = {
     'dev-workflow': 'dev_workflow',
     'mini-dev-workflow': 'mini_dev_workflow',
     'npm-install': 'npm_install',
-    'openclaw-session': 'openclaw_session',
     'kvtest': 'kvtest',
     'multi-host': 'multi_host',
 }
