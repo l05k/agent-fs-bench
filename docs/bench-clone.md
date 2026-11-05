@@ -104,9 +104,10 @@ CONFIG["copiers"] = ["reflink"]
 Templates use shell-like quoting but no shell execution. `{src}` and `{dst}`
 are required; optional `{threads}` takes `CONFIG["threads"]` (default 1). Each
 shard invokes the command once with an absent destination. Unsupported
-operations fail rather than selecting another copier. Copier identity,
-executable hashes, and full templates are retained in JSONL, including
-external thread settings.
+operations fail rather than selecting another copier. JSONL `parameters`
+record the resolved copier names, any external templates, `threads`, and a
+SHA-256 digest per copier executable, so the copy implementation is identified
+without repeating it in every row.
 
 ## Timing and cache semantics
 
@@ -138,19 +139,27 @@ type is informational and may describe only a FUSE front end.
 
 ## JSONL results
 
-The common runner appends one complete line per **case × copier × repeat** to
-`results/clone/<run-id>/results.jsonl`. The envelope includes run, target,
-environment, and effective `CONFIG` parameters (local executable paths are
-replaced by per-copier SHA-256 hashes so grouping is machine-independent).
-Numeric metrics include
-`total_bytes`, `total_files`, `wall_s`, `copy_s`, `fsync_s`, `mib_s`, and
-`files_s`. Details retain workload/kind, concurrency, copier/template identity,
-fsync and cache semantics, data pattern, filesystem type, and successful
-verification.
+The common runner appends one line per **case × copier × repeat** to
+`results/clone/<run-id>/results.jsonl`. Each line has `benchmark`, `run_id`,
+`target`, `case`, `repeat`, `parameters`, `source_sha256`, `metrics`, and
+`details`.
+
+`parameters` holds only experiment identity: `stage`, `smoke`, `repeats`,
+`copiers`, `external_copier`, `threads`, `fsync`, `conc_levels`,
+`small_count`, `data_pattern`, `kinds`, `cache_state`, and
+`executable_sha256` (one digest per copier binary, no local paths). Scratch
+paths and retention flags are host-local and are not recorded.
+
+`case` is `<workload>/C<concurrency>/<copier>`, so those three are not repeated
+in `details`; it keeps only `kind`, `fstype`, and the verification result.
+Numeric metrics include `total_bytes`, `total_files`, `wall_s`, `copy_s`,
+`fsync_s`, `mib_s`, and `files_s`.
 
 Use the common offline analysis/plot commands on exported JSONL; no live mount
 or sidecar report is needed. The common runner derives `summary.csv` only after
 every selected target succeeds. If a later target fails, earlier successful
-measurements remain in JSONL, but no automatic CSV is produced. Compare only
-matching workload, concurrency, copier/template, threads, fsync, cache state,
-and data pattern. There is no workload-specific report command or CSV append option.
+measurements remain in JSONL, but no automatic CSV is produced. The summary
+aggregates every row by benchmark, target, case and metric across runs and lists
+the contributing `run_ids`; it does not split by parameters, source hash, or
+host. Keep payload, copier, threads, fsync, cache state and data pattern fixed
+across the filesystems you compare, since nothing enforces that grouping.

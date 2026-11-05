@@ -1,14 +1,10 @@
 """One self-contained JSONL record per measurement, without format versions."""
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import hashlib
 import json
 import math
 from pathlib import Path
-import platform
-import socket
-import sys
 from typing import Any, TextIO
 
 from .targets import Target
@@ -43,21 +39,6 @@ def source_digest() -> str:
     return digest.hexdigest()
 
 
-def environment() -> dict[str, Any]:
-    return {
-        'hostname': socket.gethostname(),
-        'platform': platform.platform(),
-        'machine': platform.machine(),
-        'python': platform.python_version(),
-        'source_sha256': source_digest(),
-        'argv': sys.argv[1:],
-    }
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 @dataclass
 class RunContext:
     benchmark: str
@@ -66,7 +47,7 @@ class RunContext:
     work_dir: Path
     result_dir: Path
     parameters: dict[str, Any]
-    environment: dict[str, Any]
+    source_sha256: str
     output: TextIO = field(repr=False)
     records: int = 0
 
@@ -77,17 +58,14 @@ class RunContext:
                               or not math.isfinite(value)
                               for value in metrics.values()):
             raise ValueError('metrics must contain finite numeric measurements')
-        parameters = canonical_json(self.parameters)
         row = {
             'benchmark': self.benchmark,
             'run_id': self.run_id,
-            'timestamp': utc_now(),
             'target': {'name': self.target.name, 'path': str(self.target.path)},
             'case': case,
             'repeat': repeat,
-            'parameters': json.loads(parameters),
-            'parameter_id': hashlib.sha256(parameters.encode()).hexdigest(),
-            'environment': self.environment,
+            'parameters': self.parameters,
+            'source_sha256': self.source_sha256,
             'metrics': metrics,
             'details': details or {},
         }

@@ -8,26 +8,24 @@ import sys
 from typing import TextIO
 
 COLUMNS = {
-    'benchmark': 'VARCHAR', 'run_id': 'VARCHAR', 'timestamp': 'VARCHAR',
+    'benchmark': 'VARCHAR', 'run_id': 'VARCHAR',
     'target': 'JSON', 'case': 'VARCHAR', 'repeat': 'BIGINT',
-    'parameters': 'JSON', 'parameter_id': 'VARCHAR', 'environment': 'JSON',
+    'parameters': 'JSON', 'source_sha256': 'VARCHAR',
     'metrics': 'JSON', 'details': 'JSON',
 }
 METRICS_SQL = '''
-SELECT benchmark, run_id, timestamp, target->>'name' AS target,
-       target->>'path' AS target_path, "case", repeat, parameter_id, parameters,
-       environment->>'source_sha256' AS source_sha256,
-       environment->>'hostname' AS hostname,
+SELECT benchmark, run_id, target->>'name' AS target,
+       target->>'path' AS target_path, "case", repeat, parameters, source_sha256,
        item.key AS metric, CAST(item.value AS DOUBLE) AS value
 FROM measurements, json_each(metrics) AS item
 '''
 SUMMARY_SQL = '''
 SELECT target, "case", metric, count(*) AS samples, avg(value) AS mean,
        median(value) AS median, min(value) AS minimum, max(value) AS maximum,
-       stddev_samp(value) AS stddev, parameter_id, benchmark, target_path,
-       source_sha256, hostname
+       stddev_samp(value) AS stddev, benchmark,
+       string_agg(DISTINCT run_id, ';' ORDER BY run_id) AS run_ids
 FROM metrics
-GROUP BY ALL
+GROUP BY benchmark, target, "case", metric
 ORDER BY benchmark, "case", metric, target
 '''
 
@@ -84,7 +82,6 @@ def main(command: str, argv: list[str]) -> int:
         parser.add_argument('--benchmark', required=True)
         parser.add_argument('--metric', required=True, help='Metric name, including its unit')
         parser.add_argument('--case')
-        parser.add_argument('--parameter-id', help='Restrict to one exact workload configuration')
         parser.add_argument('--output', type=Path, required=True, help='Output PNG, SVG or PDF')
     args = parser.parse_args(argv)
     connection = connect(args.inputs, getattr(args, 'database', None))
@@ -114,28 +111,16 @@ def plot(connection, args: argparse.Namespace) -> None:
     if args.case:
         conditions.append('"case" = ?')
         values.append(args.case)
-    if args.parameter_id:
-        conditions.append('parameter_id = ?')
-        values.append(args.parameter_id)
     rows = connection.execute('''
-        SELECT target, target_path, "case", parameter_id, source_sha256, hostname,
-               list(value ORDER BY run_id, repeat)
+        SELECT target, "case", list(value ORDER BY run_id, repeat)
         FROM metrics WHERE ''' + ' AND '.join(conditions) + '''
-        GROUP BY ALL ORDER BY "case", parameter_id, source_sha256, hostname, target
+        GROUP BY target, "case" ORDER BY "case", target
     ''', values).fetchall()
     if not rows:
         raise ValueError('no measurements match the plot selection')
-    # Keep distinct workload parameters, source revisions and hosts separate.
-    groups = {(row[3], row[4], row[5]) for row in rows}
-    target_paths = {}
-    for row in rows:
-        target_paths.setdefault(row[0], set()).add(row[1])
-    labels = [f'{row[0]} / {row[2]}' +
-              (f'\n{row[1]}' if len(target_paths[row[0]]) > 1 else '') +
-              (f'\n{row[3][:8]} {row[4][:8]} {row[5]}' if len(groups) > 1 else '')
-              for row in rows]
+    labels = [f'{row[0]} / {row[1]}' for row in rows]
     figure, axes = plt.subplots(figsize=(max(7, len(rows) * 1.4), 5), layout='constrained')
-    axes.boxplot([row[6] for row in rows], tick_labels=labels, showmeans=True)
+    axes.boxplot([row[2] for row in rows], tick_labels=labels, showmeans=True)
     axes.set_title(args.benchmark)
     axes.set_ylabel(args.metric)
     axes.tick_params(axis='x', labelrotation=25)

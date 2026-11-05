@@ -55,8 +55,8 @@ is one executable name or absolute path, not a command with arguments.
 `ssh_args` contains individual OpenSSH argv tokens, not a shell string; include
 `-o` before each SSH option and `-i` before an identity path. Use an absolute
 identity path; a literal `~` inside TOML is not shell-expanded. Authentication
-must be noninteractive and SSH host keys must already be trusted. Host settings
-are recorded in JSONL, so do not put credentials in them.
+must be noninteractive and SSH host keys must already be trusted. JSONL records
+only logical host names, not SSH addresses, users or transport arguments.
 
 ### Code configuration
 
@@ -162,31 +162,31 @@ on the client/filesystem/server; this is not a durability proof.
 Percentiles use sorted samples at `round((n - 1) * fraction)`, not interpolation.
 Python syscall-wrapper overhead is included. Compare the same harness/Python
 version across configurations rather than interpreting this as raw storage limits.
-The overall worker interval begins after initial directory/payload setup and ends
-before private cleanup. Controller workload time includes SSH worker startup, gate
-waiting and result collection. `start_gate_control_write_ms` measures controller
-stdin-write span, not actual remote execution skew. Clock synchronization is not
-required for the start gate.
+Only per-phase and per-operation timers are retained. Worker/controller total
+time, start-gate write spans and wall-clock timestamps are not collected as
+result diagnostics. Clock synchronization is not required for the start gate.
 
 ## Results
 
 The common runner writes `results/multi-host/<run-id>/results.jsonl`. Each host,
 phase and round is a separate row: case `<host-name>/<phase>`, repeat = round.
-Numeric metrics are `ops`, `errors`, `elapsed_s`, `ops_per_s`, `bytes`, `mib_per_s`,
-`p50_ms`, `p95_ms`, `p99_ms`, `max_ms`, and `mean_ms`. Successful rows have zero
-errors. A failed target's multi-host workload emits no rows, but earlier
-successful targets in the same invocation may already have written JSONL.
+Numeric metrics are `ops`, `elapsed_s`, `ops_per_s`, `bytes`, `mib_per_s`,
+`p50_ms`, `p95_ms`, `p99_ms`, `max_ms`, and `mean_ms`. A failed target's multi-host
+workload emits no rows, but earlier successful targets may already have written
+JSONL; there is no always-zero error-count metric.
 
-`details` retains **all per-operation `latencies_ns` samples**, host identity,
-remote runtime/preflight information, worker timing, start-gate measurements,
-sentinel status, cache/fsync semantics and diagnostics. Thus exported JSONL is
-self-contained. `environment.hostname`, `machine` and runtime fields identify
-the actual worker, not the controller. Optional local `<host>.stdout.log` and
-`<host>.stderr.log` under the target's result directory are diagnostic
-artifacts, not analysis inputs. There are no workload-specific CSV, summary,
-manifest, per-host JSON or alternate raw-result reports. The common runner
-derives `summary.csv` only after all selected targets succeed. If a later
-target fails, earlier rows remain in JSONL without an automatic CSV summary.
+`parameters` contains the workload sizes, rounds, fsync/read policy and logical
+host list. Host and phase identity are already in `case`; `details` retains
+**all per-operation `latencies_ns` samples** and the shared-sentinel check.
+No SSH settings, remote runtime/preflight dumps, paths, timestamps or stdout/stderr
+are copied into JSONL. Existing local `<host>.stdout.log` and `<host>.stderr.log`
+remain diagnostic attachments, not analysis inputs.
+
+The common runner derives `summary.csv` only after all selected targets succeed.
+Default summary/plot combines runs by benchmark, target alias, case and metric,
+with contributing IDs in CSV `run_ids`. Host cases remain separate; environment
+consistency is the operator's responsibility. If a later target fails, earlier
+rows remain in JSONL without an automatic CSV summary.
 
 Hosts free-run: summing their phase rates is not a synchronized server-wide
 throughput measurement, and averaging host percentiles is not a pooled percentile.

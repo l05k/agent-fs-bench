@@ -29,8 +29,8 @@ uv run python -m agent_fs_bench run openclaw-session --dirs /mnt/fs-a
 
 There are no workload flags. Duration, rate, sessions, prefill, seed, FTS
 projection and PRAGMA overrides are the deliberate `CONFIG` mapping at the top
-of `agent_fs_bench/benchmarks/openclaw_session.py`; they are recorded in every
-JSONL row. Change that code for an ablation; do not commit private settings.
+of `agent_fs_bench/benchmarks/openclaw_session.py`. JSONL records the workload
+inputs and the effective PRAGMAs, without repeating the override strings.
 Defaults: 30 s, 10 turns/s, 4 sessions, 1000 prefill events/session, FTS on,
 seed 1, no PRAGMA overrides.
 
@@ -68,10 +68,13 @@ Payloads: 90% 1–4 KiB, 9% 256 KiB, 1% 1 MiB, stored as `event_json` TEXT with
 
 ## Output / 输出
 
-`results.jsonl` records throughput and latency statistics in `metrics`; `details`
-retains SQLite version, effective PRAGMAs, raw `turn_samples_ms`, row counts,
-DB/WAL sizes and peaks, final checkpoint and integrity check. Common parameters
-and environment are carried in every line, so no sidecar is needed for analysis.
+`results.jsonl` records throughput, latency statistics and checkpoint time only
+in `metrics`. `parameters` holds workload inputs, the SQLite version and PRAGMAs
+read from the measured connection. `details` retains raw `turn_samples_ms`, row
+counts, DB/WAL sizes and peaks, post-checkpoint sizes and the integrity check.
+Versions, settings and numeric metrics are not duplicated in `details`.
+The common summary/plot merges runs globally; the operator ensures comparable
+conditions, and CSV `run_ids` identifies the contributing runs.
 
 The existing latency timer surrounds the entire `write_turn` call, including
 payload construction and the transaction. Pacing, file-size sampling and the
@@ -86,8 +89,8 @@ Exit code is 0 only when `integrity_check == "ok"`.
 - `wal_autocheckpoint` is pinned to 16384 pages (64 MiB) and
   `journal_size_limit` to 64 MiB to model an unmaintained single writer;
   OpenClaw itself uses a worker-maintained checkpointer.
-- PRAGMA overrides come from `CONFIG["pragma"]` (repeatable `NAME=VALUE` in code)
-  and are validated and recorded in JSONL.
+- PRAGMA overrides come from `CONFIG["pragma"]` (`NAME=VALUE` strings in code)
+  and are validated; their actual connection values are recorded in JSONL.
 - To disable FTS for an ablation, set `CONFIG["no_fts"] = True`; the default keeps
   the synchronous FTS projection because OpenClaw writes it in the same
   transaction.

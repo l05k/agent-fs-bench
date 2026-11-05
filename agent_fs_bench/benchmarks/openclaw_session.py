@@ -821,25 +821,7 @@ def write_turn(
 def measure(args: argparse.Namespace, overrides: Dict[str, str]) -> Dict[str, Any]:
     use_fts = not args.no_fts
     conn = open_database(args.db, overrides)
-    result: Dict[str, Any] = {
-        "workload": "openclaw-transcript-write",
-        "source_snapshot": "openclaw@5f6f15fed0d6ba618cf781c9686a8b93f499564b",
-        "db_path": str(args.db),
-        "sqlite_version": sqlite3.sqlite_version,
-        "fts_projection": use_fts,
-        "seed": args.seed,
-        "sessions": args.sessions,
-        "prefill_events_per_session": args.prefill_events,
-        "events_per_turn": EVENTS_PER_TURN,
-        "duration_target_s": args.duration,
-        "rate_target_turns_per_s": args.rate,
-        "pragma_overrides": overrides,
-        "pragma_scope": (
-            "foreign_keys、busy_timeout、wal_autocheckpoint 和 "
-            "checkpoint_fullfsync 是连接级参数；pragmas 中的值在 benchmark "
-            "连接关闭前读取。"
-        ),
-    }
+    result: Dict[str, Any] = {}
     try:
         create_schema(conn, use_fts)
         (
@@ -949,9 +931,6 @@ def measure(args: argparse.Namespace, overrides: Dict[str, str]) -> Dict[str, An
         growth = max(0, end_db + end_wal - start_db - start_wal)
         result.update(
             {
-                "generated_at_utc": time.strftime(
-                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                ),
                 "pragmas": collect_pragmas(conn),
                 "duration_actual_s": elapsed,
                 "turns": turns,
@@ -991,11 +970,6 @@ def measure(args: argparse.Namespace, overrides: Dict[str, str]) -> Dict[str, An
                     "session_transcript_fts_rows": fts_rows,
                 },
                 "integrity_check": integrity,
-                "storage_notes": (
-                    "event_json is TEXT; zstd is intentionally disabled. "
-                    "FTS is included by default because OpenClaw's transcript "
-                    "index appender writes it in the same transaction."
-                ),
             }
         )
         if integrity != "ok":
@@ -1009,20 +983,17 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     args.db = ctx.work_dir / DB_FILENAME
     overrides = parse_pragma_overrides(args.pragma)
     result = measure(args, overrides)
-    ctx.parameters["sqlite_version"] = sqlite3.sqlite_version
-    ctx.parameters["effective_pragmas"] = result["pragmas"]
-    metrics = {name: result[name] for name in (
+    ctx.parameters = {key: getattr(args, key) for key in (
+        "duration", "rate", "sessions", "prefill_events", "seed", "no_fts",
+    )}
+    ctx.parameters["tool_versions"] = {"sqlite": sqlite3.sqlite_version}
+    ctx.parameters["pragmas"] = result.pop("pragmas")
+    metrics = {name: result.pop(name) for name in (
         "duration_actual_s", "turns", "new_events", "payload_bytes",
         "turns_per_s", "events_per_s", "payload_mib_per_s", "process_cpu_s",
     )}
     metrics.update({f"turn_{name}_ms": value for name, value in
-                    result["latency_ms"]["turn_transaction"].items()
+                    result.pop("latency_ms")["turn_transaction"].items()
                     if name != "count" and value is not None})
-    metrics["checkpoint_ms"] = result["final_checkpoint"]["elapsed_ms"]
-    result["fsync_mode"] = f"SQLite synchronous={result['pragmas']['synchronous']}"
-    result["cache_state"] = "warm: seeded database; no cache drop"
-    result["latency_scope"] = (
-        "write_turn call including payload construction and transaction; "
-        "excludes pacing, file sampling, and final checkpoint"
-    )
+    metrics["checkpoint_ms"] = result["final_checkpoint"].pop("elapsed_ms")
     ctx.emit("transcript-write", metrics, details=result)

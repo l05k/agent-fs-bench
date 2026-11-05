@@ -1,4 +1,4 @@
-"""Replay the pinned x86 Linux workflow in a runner-owned checkout.
+"""Replay the pinned Linux workflow in a runner-owned checkout.
 
 Configuration, builds, command loading/replay, commits and tree assertions are
 measured. Preparation and reset/clean cleanup are separate. Checkpoints are
@@ -11,7 +11,6 @@ import argparse
 import hashlib
 import json
 import os
-import platform
 import shlex
 import shutil
 import signal
@@ -19,13 +18,13 @@ import subprocess
 import sys
 import time
 import traceback
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
+from .build_settings import read_compiler_version
 
 DEFAULT_FIXTURE_DIR = PROJECT_ROOT / "data" / "dev-workflow"
 DEFAULT_SERIES = "overlayfs-ovl-file.json"
@@ -48,22 +47,8 @@ CONFIG = {
     "linux_url": DEFAULT_LINUX_URL,
 }
 
-# Git metadata must be durable at commit time; the default
-# ``core.fsync=committed,-loose-object`` skips the loose objects this workload
-# writes, so it is set explicitly.
-FSYNC_MODE = "git:core.fsync=committed,core.fsyncMethod=fsync"
-CACHE_STATE = "warm: no cache drop; reads hit page cache dirtied by the run"
-
 CORE_COMMANDS = ("git", "bash", "make", "patch", "grep", "sed", "python3")
 KERNEL_COMMANDS = ("bc", "bison", "flex", "perl", "openssl")
-KERNEL_BINUTILS = ("ld", "ar", "objcopy", "nm", "strip")
-LLVM_BINUTILS = {
-    "ld": "ld.lld",
-    "ar": "llvm-ar",
-    "objcopy": "llvm-objcopy",
-    "nm": "llvm-nm",
-    "strip": "llvm-strip",
-}
 KERNEL_HEADERS = (
     ("OpenSSL development headers", ("/usr/include/openssl/ssl.h",)),
     ("libelf development headers", ("/usr/include/libelf.h", "/usr/include/gelf.h")),
@@ -83,77 +68,6 @@ class CommandResult:
     stderr: str
 
 
-@dataclass(frozen=True)
-class Toolchain:
-    """Compiler and binutils selected by Kbuild's CC/LLVM/CROSS_COMPILE rules."""
-
-    compiler: tuple[str, ...]
-    source: str
-    llvm: str | None
-    make_variables: tuple[str, ...]
-    binutils: tuple[str, ...]
-
-
-def llvm_parts(value: str) -> tuple[str, str]:
-    """Split a nonempty Kbuild ``LLVM=`` value into tool prefix and suffix."""
-    if value.endswith("/"):
-        return value, ""
-    if value.startswith("-"):
-        return "", value
-    return "", ""
-
-
-def resolve_toolchain(environ: Mapping[str, str] | None = None) -> Toolchain:
-    """Resolve what the kernel Makefile will use and how to make it stick.
-
-    ``CC`` wins for the compiler and may carry arguments or a wrapper. ``LLVM``
-    nonempty selects Kbuild's LLVM tools. Otherwise the compiler is
-    ``${CROSS_COMPILE}gcc``. Command-line make variables are returned because
-    the top-level Makefile replaces environment ``CC``; forwarding ``LLVM``
-    keeps the tool selection explicit on every invocation.
-    """
-    env = os.environ if environ is None else environ
-    cross_compile = env.get("CROSS_COMPILE", "")
-    llvm = env.get("LLVM", "")
-    prefix, suffix = llvm_parts(llvm)
-    if llvm:
-        binutils = tuple(
-            f"{prefix}{name}{suffix}" for name in LLVM_BINUTILS.values()
-        )
-    else:
-        binutils = tuple(f"{cross_compile}{name}" for name in KERNEL_BINUTILS)
-
-    cc = env.get("CC", "").strip()
-    variables: list[str] = []
-    if llvm:
-        variables.append(f"LLVM={llvm}")
-    if cc:
-        try:
-            compiler = tuple(shlex.split(cc))
-        except ValueError as exc:
-            raise WorkflowError(f"cannot parse CC={cc!r}: {exc}") from exc
-        if not compiler or not compiler[0]:
-            raise WorkflowError(f"CC must name a compiler, got {cc!r}")
-        variables.append(f"CC={shlex.join(compiler)}")
-        source = "CC"
-    elif llvm:
-        compiler = (f"{prefix}clang{suffix}",)
-        source = "LLVM"
-    else:
-        compiler = (f"{cross_compile}gcc",)
-        source = "CROSS_COMPILE"
-    return Toolchain(
-        compiler=compiler,
-        source=source,
-        llvm=llvm or None,
-        make_variables=tuple(variables),
-        binutils=binutils,
-    )
-
-
-def make_command(toolchain: Toolchain, *args: str) -> list[str]:
-    """Build a make invocation that keeps the resolved toolchain in force."""
-    return ["make", *toolchain.make_variables, *args]
 
 
 def elapsed_ms(start_ns: int) -> int:
@@ -374,10 +288,6 @@ def load_commands(path: Path) -> list[str]:
 def require_linux() -> None:
     if not sys.platform.startswith("linux"):
         raise WorkflowError(f"kernel workflow requires Linux, not {sys.platform}")
-    if platform.machine().lower() not in {"x86_64", "amd64", "i386", "i486", "i586", "i686"}:
-        raise WorkflowError("the pinned 32-bit x86 kernel fixture requires an x86 Linux host; ARM is unsupported")
-    if os.environ.get("ARCH", "x86") not in {"x86", "i386", "x86_64"}:
-        raise WorkflowError("the pinned kernel fixture supports only ARCH=x86")
 
 
 def validate_fixtures(fixture_dir: Path) -> dict[str, Any]:
@@ -420,13 +330,11 @@ def validate_fixtures(fixture_dir: Path) -> dict[str, Any]:
     return series
 
 
-def missing_dependencies(toolchain: Toolchain, *, require_fstype: bool = False) -> list[str]:
+def missing_dependencies(*, require_fstype: bool = False) -> list[str]:
     missing = [name for name in CORE_COMMANDS if shutil.which(name) is None]
     if require_fstype and shutil.which("findmnt") is None:
         missing.append("findmnt")
-    if shutil.which(toolchain.compiler[0]) is None:
-        missing.append("compiler " + shlex.join(toolchain.compiler))
-    for name in (*toolchain.binutils, *KERNEL_COMMANDS):
+    for name in KERNEL_COMMANDS:
         if shutil.which(name) is None:
             missing.append(name)
     for label, paths in KERNEL_HEADERS:
@@ -436,8 +344,8 @@ def missing_dependencies(toolchain: Toolchain, *, require_fstype: bool = False) 
 
 
 
-def ensure_dependencies(toolchain: Toolchain, *, require_fstype: bool = False) -> None:
-    missing = missing_dependencies(toolchain, require_fstype=require_fstype)
+def ensure_dependencies(*, require_fstype: bool = False) -> None:
+    missing = missing_dependencies(require_fstype=require_fstype)
     if missing:
         raise WorkflowError("missing dependencies (install manually): " + ", ".join(missing))
 
@@ -513,7 +421,6 @@ def prepare_linux_checkout(
         what="removing untracked preparation artifacts",
         verbose=verbose,
     )
-    return "cloned"
 
 
 def validate_repository(
@@ -726,24 +633,9 @@ def record_checkpoint(step: int, phase: str, steps: list[dict[str, Any]]) -> Non
     steps.append({"step": f"checkpoint: {phase}", "ms": 0})
 
 
-def loose_object_count(repo: Path) -> int:
-    """Count loose objects so run-to-run repository growth stays visible."""
-    objects = repo / ".git" / "objects"
-    if not objects.is_dir():
-        return 0
-    count = 0
-    for entry in objects.iterdir():
-        if len(entry.name) == 2 and entry.is_dir():
-            count += sum(1 for _ in entry.iterdir())
-    return count
-
-
-
-
 def run_workflow(
     ctx: RunContext,
     args: argparse.Namespace,
-    toolchain: Toolchain,
 ) -> dict[str, Any]:
     repo = ctx.work_dir / "repo"
     fixture_dir = Path(args.fixture_dir).expanduser().absolute()
@@ -757,7 +649,7 @@ def run_workflow(
 
     require_filesystem(repo, args.require_fstype, "Linux checkout")
     preparation_start = time.perf_counter_ns()
-    repo_action = prepare_linux_checkout(
+    prepare_linux_checkout(
         repo,
         linux_url=args.linux_url,
         base_commit=base_commit_expression,
@@ -780,8 +672,6 @@ def run_workflow(
     # Pinned by CONFIG so timings stay comparable across machines.
     jobs = args.jobs
 
-    objects_before = loose_object_count(repo)
-
     steps: list[dict[str, Any]] = []
     assertions: list[dict[str, Any]] = []
     checkpoint_step = 0
@@ -802,14 +692,14 @@ def run_workflow(
         checkout_ready = True
         preparation_ms = elapsed_ms(preparation_start)
         print(
-            f"Linux preparation complete ({repo_action}, {preparation_ms} ms).",
+            f"Linux preparation complete ({preparation_ms} ms).",
             file=sys.stderr,
         )
         timed_start = time.perf_counter_ns()
 
         config_start = time.perf_counter_ns()
         run_command(
-            make_command(toolchain, "tinyconfig", f"-j{jobs}"),
+            ["make", "tinyconfig", f"-j{jobs}"],
             cwd=repo,
             what="make tinyconfig",
             verbose=args.verbose,
@@ -819,7 +709,7 @@ def run_workflow(
         except OSError as exc:
             raise WorkflowError(f"cannot install config fixture {config_path}: {exc}") from exc
         run_command(
-            make_command(toolchain, "olddefconfig"),
+            ["make", "olddefconfig"],
             cwd=repo,
             what="make olddefconfig",
             verbose=args.verbose,
@@ -830,7 +720,7 @@ def run_workflow(
         record_checkpoint(checkpoint_step, "config", steps)
 
         initial = run_command(
-            make_command(toolchain, f"-j{jobs}"),
+            ["make", f"-j{jobs}"],
             cwd=repo,
             what="initial build",
             verbose=args.verbose,
@@ -885,7 +775,7 @@ def run_workflow(
                         )
 
             incremental = run_command(
-                make_command(toolchain, f"-j{jobs}"),
+                ["make", f"-j{jobs}"],
                 cwd=repo,
                 what=f"incremental build for {commit_id}",
                 verbose=args.verbose,
@@ -965,6 +855,14 @@ def run_workflow(
             workflow_ms = (timed_end - timed_start) // 1_000_000
         else:
             workflow_ms = 0
+        if success:
+            try:
+                ctx.parameters.setdefault("tool_versions", {})["compiler"] = (
+                    read_compiler_version(repo)
+                )
+            except (OSError, RuntimeError) as exc:
+                success = False
+                error = str(exc)
         cleanup_start = time.perf_counter_ns()
         if checkout_ready:
             try:
@@ -990,28 +888,13 @@ def run_workflow(
     ))
 
     return {
-        "execution_mode": "single-checkout",
         "success": success,
         "error": error,
-        "repo": str(repo),
-        "repo_action": repo_action,
-        "git_dir": str(repo / ".git"),
-        "preparation_ms": preparation_ms,
-        "fixture_dir": str(fixture_dir),
-        "series": str(series_path),
-        "checkout_cleaned": checkout_ready and cleanup_error is None,
-        "filesystem": detect_filesystem(repo),
-        "required_filesystem": args.require_fstype,
         "base_commit": base_commit,
-        "checkpoint_count": checkpoint_step,
-        "jobs": jobs,
         "elapsed_ms": workflow_ms,
-        "unattributed_ms": unattributed_ms,
+        "preparation_ms": preparation_ms,
         "cleanup_ms": cleanup_ms,
-        "loose_objects_before": objects_before,
-        "loose_objects_after": loose_object_count(repo),
-        "fsync_mode": FSYNC_MODE,
-        "cache_state": CACHE_STATE,
+        "unattributed_ms": unattributed_ms,
         "steps": steps,
         "tree_assertions": assertions,
     }
@@ -1032,8 +915,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     require_linux()
     if type(args.jobs) is not int or args.jobs < 1:
         raise WorkflowError("jobs must be a positive integer")
-    toolchain = resolve_toolchain()
-    ensure_dependencies(toolchain, require_fstype=bool(args.require_fstype))
+    ensure_dependencies(require_fstype=bool(args.require_fstype))
     fixture_dir = Path(args.fixture_dir).expanduser().absolute()
     series = validate_fixtures(fixture_dir)
     names = {DEFAULT_SERIES, DEFAULT_CONFIG}
@@ -1044,35 +926,22 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         with (fixture_dir / name).open("rb") as stream:
             hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
     tools = {}
-    for name, argv in {
-        "git": ["git"],
-        "make": ["make"],
-        "compiler": list(toolchain.compiler),
-    }.items():
+    for name in ("git", "make"):
         tools[name] = run_command(
-            [*argv, "--version"], cwd=ctx.work_dir,
+            [name, "--version"], cwd=ctx.work_dir,
             what=f"reading {name} version", capture_stdout=True,
-        ).stdout.strip()
-    ctx.parameters.update(
-        jobs=args.jobs,
-        fixture={"series": series, "sha256": hashes},
-        tool_versions=tools,
-        build_environment={key: os.environ[key] for key in (
-            "ARCH", "CROSS_COMPILE", "CC", "HOSTCC", "CFLAGS", "MAKEFLAGS", "LLVM"
-        ) if key in os.environ},
-        toolchain={
-            "source": toolchain.source,
-            "command": shlex.join(toolchain.compiler),
-            "llvm": toolchain.llvm,
-            "make_variables": list(toolchain.make_variables),
-        },
-    )
-    result = run_workflow(ctx, args, toolchain)
+        ).stdout.strip().splitlines()[0]
+    ctx.parameters = {
+        "jobs": args.jobs,
+        "fixture_sha256": hashes,
+        "tool_versions": tools,
+    }
+    result = run_workflow(ctx, args)
+    ctx.parameters["base_commit"] = result.pop("base_commit")
     if not result.pop("success"):
         raise WorkflowError(result["error"] or "workflow failed")
     result.pop("error")
     metrics = {key: result.pop(key) for key in (
         "elapsed_ms", "preparation_ms", "cleanup_ms", "unattributed_ms"
     )}
-    ctx.parameters.pop("fixture_dir", None)
     ctx.emit("workflow", metrics, details=result)

@@ -35,13 +35,15 @@ mounted externally; this workload never mounts or unmounts anything.
 | `results/npm-install/<run-id>/<target>/logs/` | diagnostic install logs |
 
 The fixture's committed manifest and lockfiles are **inputs**, not result
-tables. Fixture identity, exact resolved manifests, lockfile SHA-256 hashes,
-tool versions, workspace settings, cache policy and placement/device
-information are embedded in JSONL for offline analysis. There are no
-workload-specific CSV results, text manifests, or generated reports. The common
-runner derives `summary.csv` only after all selected targets succeed. If a
-later target fails, earlier successful measurements remain in JSONL, but no
-automatic CSV is generated; these rows are a partial experiment.
+tables. JSONL `parameters` record the fixture name, tool versions, placement,
+cache policy and the SHA-256 of the seed templates actually installed
+(`package.json`, lockfile, and workspace file when present). Manifest and
+workspace text, preparation paths, device IDs and resolved executable paths are
+not embedded. There are no workload-specific CSV results, text manifests, or
+generated reports. The common runner derives `summary.csv` only after all
+selected targets succeed. If a later target fails, earlier successful
+measurements remain in JSONL, but no automatic CSV is generated; these rows are
+a partial experiment.
 
 ## Fixture / fixture
 
@@ -204,8 +206,9 @@ Deliberately **not** set, because they do not affect a timed offline install:
 | `--maxsockets` | registry sockets only, same reason as `--network-concurrency` |
 
 The seed phase uses the same values, so cache/store population and timed runs
-use the same parallelism. JSONL records the concurrency mapping, actual timed
-command arguments and effective environment pins, alongside tool versions.
+use the same parallelism. JSONL records the concurrency value, import policy,
+`ignore_scripts`, placement, fixture, tool versions and seed input hashes; the
+exact timed command is fixed by the module and identified by `source_sha256`.
 Keep concurrency and manager/version fixed when comparing runs.
 
 `CONFIG["concurrency"]` 固定计时安装的并发度，默认 **4**。两个包管理器没有共同的
@@ -262,7 +265,7 @@ cacache 解包，没有对应开关，用 `allocated_bytes / logical_bytes` 比�
 ## Output / 输出
 
 Each successful manager/repeat emits numeric metrics: `elapsed_s`, `sync_s`,
-`sync_errors`, `user_s`, `sys_s`, `files`, `dirs`, `symlinks`, `hardlinks`,
+`user_s`, `sys_s`, `files`, `dirs`, `symlinks`, `hardlinks`,
 `logical_bytes`, `allocated_bytes`, `du_kib`, `files_per_s`, `sync_files_per_s`,
 `logical_mib_per_s`, and `allocated_mib_per_s`.
 
@@ -274,17 +277,24 @@ resource-usage deltas. Manager repetitions run serially.
 
 Install failures, missing installed trees, traversal failures, fsync failures,
 and failed metrics commands abort the run. No successful row is emitted for a
-failed case; `sync_errors` is zero in completed rows. Earlier completed JSONL
+failed case; there is no always-zero error-count metric. Earlier completed JSONL
 lines remain available. Cache prereads fail on unreadable inputs, but still do
 not pin pages in memory. An untimed global sync separates seed work and repeats.
 
-The common envelope includes benchmark/run/target/environment and effective
-`CONFIG` parameters. Resolved input manifests, lock hashes, versions, fixture
-identity, concurrency, workspace settings and import policy live in parameters;
-details include actual commands, placement paths/device IDs and cache-warming
-policy. Use common offline analysis/plot commands on exported JSONL, grouping
-matching dependency identity, manager/version, placement and policies. Logs or
-a live target directory are not required to interpret the measurements.
+The common envelope is `benchmark`, `run_id`, `target`, `case`, `repeat`,
+`parameters`, `source_sha256`, `metrics`, and `details`. Parameters carry only
+experiment identity: `fixture`, `pm`, `runs`, `concurrency`, `placement`,
+`ignore_scripts`, `pnpm_import_method`, `pnpm_global_virtual_store`,
+`cache_state`, `tool_versions`, and `seed_input_sha256` (hashes of the templates
+actually seeded). `details` stays empty: the timed command, cache-warming flow
+and fsync behaviour are defined by the module and identified by `source_sha256`,
+so they are not repeated per row.
+Diagnostic install logs stay under `results/npm-install/<run-id>/<target>/logs/`
+and are not copied into JSONL. Use common offline analysis/plot commands on
+exported JSONL; `summary.csv` aggregates every row by benchmark, target, case
+and metric across runs, lists the contributing `run_ids`, and does not split by
+parameters, source hash, or host. Logs or a live target directory are not
+required to interpret the measurements.
 
 ## Notes / 注意事项
 
@@ -317,4 +327,4 @@ a live target directory are not required to interpret the measurements.
   同一个 `package.json` 在 `--legacy-peer-deps` 下的解析结果），文件数/字节数
   不可跨 manager 直接比较。
 - The npm timed command is therefore `npm install --offline
-  --legacy-peer-deps`; the JSONL `command` field records it verbatim.
+  --legacy-peer-deps`; it is fixed in the module rather than stored per row.

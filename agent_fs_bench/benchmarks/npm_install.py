@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import resource
 import shutil
@@ -76,13 +75,6 @@ FIXTURES = {
     "pnpm-bench": "data/pnpm-bench",
     "pnpm-bench-integrated": "data/pnpm-bench-integrated",
 }
-CONCURRENCY_NOTE = (
-    "one N is pinned onto the knobs with a measured effect: npm gets "
-    "UV_THREADPOOL_SIZE (its unpack fan-out itself has no limit or option), "
-    "pnpm gets RAYON_NUM_THREADS and PNPM_MACOS_LINK_THREADS. The download "
-    "and lifecycle-script limits and the pnpm 11 worker pool are not set "
-    "because they do not affect a timed offline install"
-)
 
 # ---------------------------------------------------------------------------
 # CONFIG: all experiment settings for this workload.
@@ -172,8 +164,8 @@ def raise_walk_error(error: OSError) -> None:
     raise error
 
 
-def fsync_tree(path: Path) -> tuple[float, int]:
-    """Fsync every file and directory under ``path``; return (seconds, errors).
+def fsync_tree(path: Path) -> float:
+    """Fsync every file and directory under ``path``; return fsync seconds.
 
     Opening a directory read-only and fsyncing the descriptor persists its
     entries. Walking bottom-up means a directory is synced after the entries
@@ -206,7 +198,7 @@ def fsync_tree(path: Path) -> tuple[float, int]:
         sync_path(file_path)
     for directory in reversed(directories):
         sync_path(directory)
-    return elapsed, 0
+    return elapsed
 
 
 def warm_tree(path: Path) -> None:
@@ -237,12 +229,10 @@ def npm_fixture_args(args: argparse.Namespace) -> list[str]:
     return ["--legacy-peer-deps"] if args.fixture else []
 
 
-def concurrency_for(
-    manager: str, concurrency: int
-) -> tuple[dict[str, str], list[str], str]:
-    """Return (env, extra args, description) pinning ``manager`` to ``concurrency``.
+def concurrency_env(manager: str, concurrency: int) -> dict[str, str]:
+    """Return environment pins that set ``manager`` to ``concurrency``.
 
-    ``concurrency`` of 0 keeps the tool's own defaults and returns empty
+    ``concurrency`` of 0 keeps the tool's own defaults and returns no
     overrides. The managers do not share a single knob, so one value is
     mapped onto the ones that measurably matter; see the module docstring
     and docs/bench-npm-install.md for the measurements behind this table.
@@ -256,38 +246,30 @@ def concurrency_for(
       install barely uses; measured effect under 1%.
     """
     if concurrency < 1:
-        return {}, [], "tool default"
+        return {}
 
     if manager == "npm":
         # npm has no install-wide limit: Arborist fans every pending package
         # out to pacote at once. The libuv pool is what its async file system
         # calls actually run on, so it is the only pin available.
-        env = {"UV_THREADPOOL_SIZE": str(concurrency)}
-        return env, [], f"UV_THREADPOOL_SIZE={concurrency}"
+        return {"UV_THREADPOOL_SIZE": str(concurrency)}
 
-    env = {
+    return {
         # Linux/Windows: rayon copies packages out of the store.
         "RAYON_NUM_THREADS": str(concurrency),
         # macOS: a separate, smaller pool does the copying (default 4).
         "PNPM_MACOS_LINK_THREADS": str(concurrency),
     }
-    return env, [], f"RAYON_NUM_THREADS={concurrency} PNPM_MACOS_LINK_THREADS={concurrency}"
 
 
 def manager_env(manager: str, concurrency: int) -> dict[str, str] | None:
     """Process environment for one install, or ``None`` to inherit unchanged."""
-    env, _args, _description = concurrency_for(manager, concurrency)
+    env = concurrency_env(manager, concurrency)
     if not env:
         return None
     merged = os.environ.copy()
     merged.update(env)
     return merged
-
-
-def concurrency_args(manager: str, concurrency: int) -> list[str]:
-    return concurrency_for(manager, concurrency)[1]
-
-
 
 
 def run_visible(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
@@ -361,7 +343,6 @@ def seed_npm_fixture(
         "--no-fund",
         "--cache",
         str(cache_dir),
-        *concurrency_args("npm", concurrency),
         *ignore_args(ignore_scripts),
     ]
     run_visible(command, seed_dir, env=manager_env("npm", concurrency))
@@ -403,7 +384,6 @@ def seed_pnpm_fixture(
         f"--package-import-method={PNPM_IMPORT_METHOD}",
         "--config.enable-global-virtual-store=false",
         "--reporter=append-only",
-        *concurrency_args("pnpm", concurrency),
         *ignore_args(ignore_scripts),
     ]
     env = manager_env("pnpm", concurrency)
@@ -539,21 +519,20 @@ def run_timed(
 
 def finalize_run(
     project: Path, keep_node_modules: bool
-) -> tuple[float, int, dict[str, int]]:
+) -> tuple[float, dict[str, int]]:
     """Flush the tree, measure it while it exists, then drop it."""
     node_modules = project / "node_modules"
-    sync_s, sync_errors = fsync_tree(node_modules)
+    sync_s = fsync_tree(node_modules)
     metrics = tree_metrics(node_modules)
     if not keep_node_modules:
         remove_tree(node_modules)
     sync_filesystem()
-    return sync_s, sync_errors, metrics
+    return sync_s, metrics
 
 
 def make_result(
     elapsed: float,
     sync_s: float,
-    sync_errors: int,
     user: float,
     system: float,
     metrics: dict[str, int],
@@ -577,7 +556,6 @@ def make_result(
     return {
         "elapsed_s": round(elapsed, 6),
         "sync_s": round(sync_s, 6),
-        "sync_errors": sync_errors,
         "user_s": round(user, 6),
         "sys_s": round(system, 6),
         **metrics,
@@ -596,7 +574,7 @@ def run_npm_once(
     cache_dir: Path,
     template_dir: Path,
     run_number: int,
-) -> tuple[dict[str, int | float], dict[str, object]]:
+) -> dict[str, int | float]:
     project = prepare_project(root, "npm", run_number, template_dir)
     log_path = results_dir / "logs" / f"npm-run-{run_number}.log"
     if args.warm_each_run:
@@ -612,7 +590,6 @@ def run_npm_once(
         "--no-fund",
         "--no-update-notifier",
         *(npm_fixture_args(args)),
-        *concurrency_args("npm", args.concurrency),
         *ignore_args(args.ignore_scripts),
     ]
     log(f"npm run {run_number}/{args.runs} on {project}")
@@ -621,19 +598,15 @@ def run_npm_once(
     )
     if status != 0:
         die(f"npm run {run_number} failed (exit {status}); {log_path}\n{read_tail(log_path)}")
-    sync_s, sync_errors, metrics = finalize_run(project, args.keep_node_modules)
+    sync_s, metrics = finalize_run(project, args.keep_node_modules)
     row = make_result(
         elapsed,
         sync_s,
-        sync_errors,
         user,
         system,
         metrics,
     )
-    return row, {
-        "command": command,
-        "concurrency_environment": concurrency_for("npm", args.concurrency)[0],
-    }
+    return row
 
 
 def run_pnpm_once(
@@ -645,7 +618,7 @@ def run_pnpm_once(
     pnpm_cache: Path,
     template_dir: Path,
     run_number: int,
-) -> tuple[dict[str, int | float], dict[str, object]]:
+) -> dict[str, int | float]:
     project = prepare_project(root, "pnpm", run_number, template_dir)
     log_path = results_dir / "logs" / f"pnpm-run-{run_number}.log"
     if args.warm_each_run:
@@ -668,31 +641,21 @@ def run_pnpm_once(
         "--config.enable-global-virtual-store=false",
         "--frozen-lockfile",
         "--reporter=append-only",
-        *concurrency_args("pnpm", args.concurrency),
         *ignore_args(args.ignore_scripts),
     ]
     log(f"pnpm run {run_number}/{args.runs} on {project}")
     status, elapsed, user, system = run_timed(command, project, log_path, env=env)
     if status != 0:
         die(f"pnpm run {run_number} failed (exit {status}); {log_path}\n{read_tail(log_path)}")
-    sync_s, sync_errors, metrics = finalize_run(project, args.keep_node_modules)
+    sync_s, metrics = finalize_run(project, args.keep_node_modules)
     row = make_result(
         elapsed,
         sync_s,
-        sync_errors,
         user,
         system,
         metrics,
     )
-    return row, {
-        "command": command,
-        "concurrency_environment": {
-            **concurrency_for("pnpm", args.concurrency)[0],
-            "XDG_CACHE_HOME": str(pnpm_cache),
-        },
-    }
-
-
+    return row
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -863,22 +826,6 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     if pnpm_bin:
         versions["pnpm"] = command_version(pnpm_bin)
     versions["node"] = command_version(resolve_tool("node", "node"))
-    ctx.parameters.update({
-        "tool_versions": versions,
-        "fixture": args.fixture,
-        "placement": placement,
-        "pnpm_import_method": PNPM_IMPORT_METHOD,
-        "pnpm_global_virtual_store": False,
-        "concurrency_note": CONCURRENCY_NOTE,
-        "cache_state": "warm-cache-cold-node_modules" if not args.no_prewarm else "unwarmed-cache-cold-node_modules",
-        "sync_mode": "fsync every file and directory under node_modules",
-        "sync_timing": "sum of fsync calls only, excluded from elapsed_s",
-    })
-    # Local preparation roots and executable locations vary by machine; they
-    # are not experiment identity. Tool versions and the fixture name remain.
-    ctx.parameters.pop("prep_dir", None)
-    ctx.parameters.pop("npm_bin", None)
-    ctx.parameters.pop("pnpm_bin", None)
 
     if args.pm in ("npm", "both"):
         seed_npm_fixture(
@@ -902,36 +849,35 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
             args.concurrency,
         )
 
-    inputs = {}
+    seed_input_sha256 = {}
     for manager, template in (("npm", npm_template), ("pnpm", pnpm_template)):
         if args.pm not in (manager, "both"):
             continue
         lock_name = "package-lock.json" if manager == "npm" else "pnpm-lock.yaml"
-        manifest = json.loads((template / "package.json").read_text(encoding="utf-8"))
-        hashes = {
+        seed_input_sha256[manager] = {
             name: hashlib.sha256((template / name).read_bytes()).hexdigest()
             for name in ("package.json", lock_name, "pnpm-workspace.yaml")
             if (template / name).is_file()
         }
-        inputs[manager] = {
-            "package_json": manifest,
-            "input_sha256": hashes,
-            "workspace_yaml": (template / "pnpm-workspace.yaml").read_text(encoding="utf-8")
-            if (template / "pnpm-workspace.yaml").is_file() else None,
-        }
-    ctx.parameters["resolved_inputs"] = inputs
-    ctx.parameters["fixture_input_sha256"] = {
-        name: hashlib.sha256((fixture_dir / name).read_bytes()).hexdigest()
-        for name in ("package.json", "package-lock.json", "pnpm-lock.yaml", "pnpm-workspace.yaml")
-        if (fixture_dir / name).is_file()
-    }
-    placement_details = {
+    if args.no_prewarm:
+        cache_state = "unwarmed-cache-cold-node_modules"
+    elif args.warm_once:
+        cache_state = "warm-once-cache-cold-node_modules"
+    else:
+        cache_state = "warm-cache-cold-node_modules"
+    # Keep input fingerprints, not manifest text or preparation diagnostics.
+    ctx.parameters = {
+        "fixture": args.fixture,
+        "pm": args.pm,
+        "runs": args.runs,
+        "concurrency": args.concurrency,
         "placement": placement,
-        "target_device": device_of(target_dir),
-        "prep_device": device_of(prep_dir) if prep_dir else None,
-        "paths": {name: str(path) for name, path in layout.items()},
-        "devices": {name: device_of(path) for name, path in layout.items()},
-        "work_dir": str(root),
+        "ignore_scripts": args.ignore_scripts,
+        "pnpm_import_method": PNPM_IMPORT_METHOD,
+        "pnpm_global_virtual_store": False,
+        "cache_state": cache_state,
+        "tool_versions": versions,
+        "seed_input_sha256": seed_input_sha256,
     }
 
     if not args.no_prewarm:
@@ -958,7 +904,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     for manager in managers:
         for run_number in range(1, args.runs + 1):
             if manager == "npm":
-                row, command_details = run_npm_once(
+                row = run_npm_once(
                     args,
                     root,
                     results_dir,
@@ -968,7 +914,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
                     run_number,
                 )
             else:
-                row, command_details = run_pnpm_once(
+                row = run_pnpm_once(
                     args,
                     root,
                     results_dir,
@@ -978,17 +924,4 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
                     pnpm_template,
                     run_number,
                 )
-            ctx.emit(
-                manager,
-                row,
-                repeat=run_number,
-                details={
-                    "manager": manager,
-                    "placement": placement_details,
-                    **command_details,
-                    "ignore_scripts": args.ignore_scripts,
-                    "prewarm": not args.no_prewarm,
-                    "warm_each_run": args.warm_each_run,
-                    "returncode": 0,
-                },
-            )
+            ctx.emit(manager, row, repeat=run_number)

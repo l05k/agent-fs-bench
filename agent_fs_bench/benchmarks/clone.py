@@ -432,7 +432,8 @@ def copy_shard(
     do_fsync: bool,
     threads: int,
     cp_binary: str,
-) -> dict[str, float]:
+) -> tuple[float, float]:
+    """Copy one shard; return ``(copy_s, fsync_s)``."""
     if os.path.exists(destination):
         shutil.rmtree(destination)
     os.makedirs(os.path.dirname(destination) or ".", exist_ok=True)
@@ -459,11 +460,7 @@ def copy_shard(
         fsync_tree(destination)
         fsync_seconds = time.perf_counter() - fsync_started
 
-    return {
-        "copy_s": copy_seconds,
-        "fsync_s": fsync_seconds,
-        "wall_s": copy_seconds + fsync_seconds,
-    }
+    return copy_seconds, fsync_seconds
 
 
 def _copy_one(
@@ -474,7 +471,7 @@ def _copy_one(
     do_fsync: bool,
     threads: int,
     cp_binary: str,
-) -> dict[str, float]:
+) -> tuple[float, float]:
     destination = os.path.join(destination_root, f"shard_{index}")
     return copy_shard(
         source, destination, copier, do_fsync, threads, cp_binary
@@ -497,17 +494,17 @@ def copy_shards(
     """
     if len(shards) == 1:
         started = time.perf_counter()
-        result = _copy_one(
+        copy_seconds, fsync_seconds = _copy_one(
             0, shards[0], destination_root, copier, do_fsync, threads, cp_binary
         )
         return (
             time.perf_counter() - started,
-            result["copy_s"],
-            result["fsync_s"],
+            copy_seconds,
+            fsync_seconds,
         )
 
     started = time.perf_counter()
-    results: list[dict[str, float] | None] = [None] * len(shards)
+    results: list[tuple[float, float] | None] = [None] * len(shards)
     with cf.ProcessPoolExecutor(max_workers=len(shards)) as executor:
         futures = {
             executor.submit(
@@ -528,8 +525,8 @@ def copy_shards(
     complete = [result for result in results if result is not None]
     return (
         wall,
-        max((result["copy_s"] for result in complete), default=0.0),
-        max((result["fsync_s"] for result in complete), default=0.0),
+        max((copy_seconds for copy_seconds, _ in complete), default=0.0),
+        max((fsync_seconds for _, fsync_seconds in complete), default=0.0),
     )
 
 
@@ -623,19 +620,9 @@ def run_case(
                     },
                     repeat=repeat,
                     details={
-                        "fstype": fs_type,
-                        "workload": workload,
                         "kind": spec["kind"],
-                        "concurrency": concurrency,
-                        "threads": args.threads,
-                        "data_pattern": args.data_pattern,
-                        "copier": copier.name,
-                        "copier_kind": copier.kind,
-                        "copier_argv": list(copier.argv),
-                        "fsync": args.fsync,
-                        "cache_state": CACHE_STATE,
-                        "verified": True,
-                        "verification": "relative file paths and sizes",
+                        "fstype": fs_type,
+                        "verified": "relative paths and sizes match source",
                     },
                 )
                 log(
@@ -780,6 +767,32 @@ def dedupe_plan(plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return unique
 
 
+def experiment_parameters(
+    args: argparse.Namespace,
+    copiers: Sequence[Copier],
+    executable_sha256: dict[str, str],
+) -> dict[str, Any]:
+    """Return JSONL parameters: experiment inputs and provenance only.
+
+    Scratch layout, scratch retention, and the local ``cp`` path are host
+    details, not experiment identity; copier names plus external templates
+    describe the copy implementations without repeating them per row.
+    """
+    return {
+        "stage": args.stage,
+        "smoke": args.smoke,
+        "repeats": args.repeats,
+        "copiers": [copier.name for copier in copiers],
+        "external_copier": list(args.external_copier),
+        "threads": args.threads,
+        "fsync": args.fsync,
+        "conc_levels": list(args.conc_levels),
+        "small_count": args.small_count,
+        "data_pattern": args.data_pattern,
+        "kinds": list(args.kinds),
+        "cache_state": CACHE_STATE,
+        "executable_sha256": executable_sha256,
+    }
 
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
@@ -831,15 +844,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
             with open(executable, "rb") as handle:
                 executable_hashes[copier.name] = hashlib.file_digest(handle, "sha256").hexdigest()
 
-    ctx.parameters.update({
-        "executable_sha256": executable_hashes,
-        "cache_state": CACHE_STATE,
-        "resolved_copiers": [
-            {"name": copier.name, "kind": copier.kind, "argv": list(copier.argv)}
-            for copier in copiers
-        ],
-    })
-    ctx.parameters.pop("cp_binary", None)
+    ctx.parameters = experiment_parameters(args, copiers, executable_hashes)
     log(
         f"=== mount={mount} stage={args.stage} "
         f"copiers={','.join(copier.name for copier in copiers)} "

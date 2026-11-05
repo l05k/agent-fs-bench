@@ -62,10 +62,10 @@ on PATH, and a working compiler/linker. Python dependencies are pinned by
 default `summary.csv` export. Install system prerequisites yourself.
 `findmnt` is required when `CONFIG["require_fstype"]` is set.
 
-Mini needs a usable `cc` (or set `CC` to the desired compiler), libc development
-files, and all of `data/mini-dev-workflow/`, including `source-repo.bundle`.
-The fixture Makefile respects `CC`/`CFLAGS`; its default compiler is Make's
-built-in `cc`. It needs no network, sudo, fixture regeneration, or shortened
+Mini needs a compiler selected by its Makefile, libc development files, and all
+of `data/mini-dev-workflow/`, including `source-repo.bundle`. The fixture uses
+Make's built-in `cc` by default and honours inherited `CC`/`CFLAGS` under normal
+make precedence. It needs no network, sudo, fixture regeneration, or shortened
 smoke mode. This runs its **entire** two-commit workload:
 
 ```sh
@@ -79,39 +79,44 @@ Inside a Linux VM, use a guest-local target rather than a host-shared project
 path if testing the guest filesystem. Mini supports native ARM64 Linux.
 
 Kernel additionally requires a full, non-partial, non-shallow, non-sparse Linux
-repository containing the fixture's base and five commits, plus a C compiler
-selected as described below, its matching binutils (`ld`, `ar`, `objcopy`,
-`nm`, `strip`), patch, bc, bison, flex, Perl, OpenSSL, and OpenSSL/libelf
-development headers. GCC is only the default fallback; LLVM and cross
-toolchains are supported. The default source is
+repository containing the fixture's base and five commits, plus the compiler
+and binutils selected by Kbuild, patch, bc, bison, flex, Perl, OpenSSL, and
+OpenSSL/libelf development headers. Missing compiler tools fail in make rather
+than in a separate Python toolchain resolver. The default source is
 `https://github.com/torvalds/linux.git`; it needs network and substantial disk
 space. A prepared local mirror avoids the network: set `CONFIG["linux_url"]` to
 the mirror path in `agent_fs_bench/benchmarks/dev_workflow.py`.
 
-Kernel toolchain selection mirrors the top-level kernel Makefile:
+### Upstream build-environment semantics
 
-- With neither `CC` nor `LLVM` set, the compiler is
-  `${CROSS_COMPILE}gcc` and binutils are prefixed by `CROSS_COMPILE`.
-- `CC` overrides the compiler and may contain arguments or a wrapper, for
-  example `CC="ccache clang"`. Its shlex-normalized value is passed as a
-  command-line `CC=` assignment to every `make` invocation, because the kernel
-  Makefile would otherwise replace an environment-only `CC`. `CROSS_COMPILE`
-  still prefixes the non-LLVM binutils.
-- A nonempty `LLVM` enables Kbuild's LLVM tools, and every invocation receives
-  `LLVM=<value>`. Standard forms are `LLVM=1`, a tool directory ending in `/`
-  (for example `LLVM=/opt/llvm/bin/`), and a version suffix such as `LLVM=-14`
-  (selecting `clang-14`, `ld.lld-14`, and so on). As in Kbuild, any other
-  nonempty bare value behaves like `LLVM=1`.
-- If `CC` and `LLVM` are both set, `CC` selects the compiler while `LLVM`
-  selects the remaining tools.
-- Preflight checks the selected compiler and selected binutils rather than an
-  unrelated host GCC, so an LLVM-only host needs no GCC for `LLVM=1`. With
-  `CC=clang` and `LLVM` unset, Kbuild's host tools still follow its default
-  `HOSTCC`; set `LLVM` for a fully GCC-free build.
+Both workflows follow [perf-eval at `bc32d083`](https://github.com/YoloFS/perf-eval/tree/bc32d083):
+invoke `make` with the inherited environment. The runner does not turn environment
+variables into command-line make assignments, clear build overrides, or choose a
+compiler itself. The configured `-j` values remain this harness's experiment
+settings; this change does not alter parallelism or workflow timing boundaries.
 
-The resolved compiler command, `LLVM` value, and make variable assignments are
-recorded in portable parameters alongside the compiler version, and the same
-assignments are used for configuration and every full/incremental build.
+- Kernel Kbuild chooses its GCC/LLVM/cross tools. An environment-only `CC` can
+  be overridden by the kernel Makefile, unlike mini's `CC ?=`. Normal make
+  precedence, including inherited `MAKEFLAGS`, applies; the runner does not
+  promote `CC` or `LLVM` to stronger assignments.
+- Upstream does not explicitly set or record `KCFLAGS`. Kbuild still consumes
+  inherited `KCFLAGS`, `KAFLAGS`, and related overrides. The runner inherits
+  them without recording resolved values or changing their semantics.
+- As upstream, the config fixture is copied to `.config`. An inherited
+  `KCONFIG_CONFIG` can select another file, so that run may not use the fixture.
+  This is deliberately preserved, not repaired by silently forcing a path.
+- `ARCH` is inherited, not fixed or rejected by a Python architecture allowlist.
+  The supplied fixture describes 32-bit x86; `olddefconfig` can change that
+  selection under a different `ARCH`. Cross-architecture execution is not a
+  claim that the same kernel workload was measured.
+
+Runs aggregate globally; kernel configuration, host, and environment are not
+recorded, and no automatic grouping or invalidation protects comparisons.
+Neither the kernel config nor inherited make variables are saved. Keep builds
+comparable by using a controlled build environment, leaving
+`KCONFIG_CONFIG`/output-directory overrides unset, and checking the intended
+configuration yourself before comparing runs. A successful Git tree check
+proves the edit replay, not that the intended files were compiled.
 
 Then run a complete replay:
 
@@ -126,10 +131,10 @@ This is a complete kernel replay, not a reduced smoke. Local clones use
 `--no-local` to avoid sharing source object files across filesystems. Missing
 fixture commits fail immediately; no fallback fetch or alternate workload runs.
 
-**The pinned kernel config is 32-bit x86.** Kernel runs require an x86 Linux
-host and a toolchain able to build that config; ARM hosts and non-x86 `ARCH`
-are rejected. This migration does not port the kernel fixture to ARM. Do not
-use mini's ARM support as evidence that the kernel fixture supports ARM.
+**The supplied kernel config is 32-bit x86, not a forced runtime architecture.**
+The runner requires Linux but leaves architecture and toolchain compatibility to
+Kbuild, matching upstream environment inheritance. Mini's native ARM64 support
+does not establish equivalence of kernel workloads across architectures.
 
 ## Workload and timing boundaries
 
@@ -140,16 +145,18 @@ and `tinyconfig-overlayfs.config`. The base expression `c2c54b5f34f6^` is
 resolved to a full commit ID before measurement.
 
 1. **Preparation:** clone, verify repository/object availability, clean,
-   detached checkout of the base, clean, check HEAD/cleanliness, count objects.
-2. **Measured configuration:** `make tinyconfig`, copy the fixture config,
-   `make olddefconfig`; these remain one configuration step. Every make
-   invocation carries the same resolved toolchain assignments.
+   detached checkout of the base, clean, check HEAD/cleanliness.
+2. **Measured configuration:** `make tinyconfig`, copy the fixture to `.config`,
+   `make olddefconfig`; these remain one configuration step. Every make call
+   inherits the build environment without injected toolchain assignments.
 3. **Measured work:** full build, then each commit's search/read/edit commands,
    incremental build, `git status`, `git diff --stat`, `git add`, `git commit`.
    Command-file loading is measured separately from command execution.
 4. **Measured assertions:** after every commit, `HEAD^{tree}` must equal the
    fixture commit's tree. A mismatch fails the run.
-5. **Cleanup:** `git reset --hard <base>` and `git clean -fdx`, separately timed.
+5. **Untimed provenance:** query the compiler version through the actual
+   Makefile's `$(CC)`. This happens after the workload timer, before cleanup.
+6. **Cleanup:** `git reset --hard <base>` and `git clean -fdx`, separately timed.
 
 The shipped fixture has five commits, 15 search + 10 read + 41 edit commands,
 53 zero-cost checkpoint markers, one full build and five incremental builds.
@@ -162,17 +169,18 @@ real Git history. Source cloning is `source_setup_ms`, separate from
 `preparation_ms` and the measured workload. Source validation checks commit
 availability and cleanliness. **`git worktree prune` and `git worktree add`
 remain measured**, followed by the initial build and both commits' complete
-search/read/edit/incremental-build/status/diff/add/commit sequences. Worktree
-removal/pruning is cleanup, outside the workload timer. As upstream, command
-exit codes are checked but commit trees are not compared.
+search/read/edit/incremental-build/status/diff/add/commit sequences. The
+compiler version selected by make is collected after timing, before worktree
+removal/pruning. As upstream, command exit codes are checked but commit trees
+are not compared.
 
 Mini defaults to two build jobs via `CONFIG["jobs"]` and never exceeds two; a
 value of one is supported. The shipped fixture builds one C translation unit. A
 complete run records 35 step entries, including eight zero-cost checkpoints. Its
-source repository remains after cleanup with any loose objects produced by the
-run. `tools/gen_mini_source_repo.py` is fixture maintenance only, not a runtime
-helper; it rebuilds `data/mini-dev-workflow/source-repo`, rewrites `series.json`,
-and exports the committed bundle. Keep the bundle and matching series together.
+source repository remains after cleanup. `tools/gen_mini_source_repo.py` is
+fixture maintenance only, not a runtime helper; it rebuilds
+`data/mini-dev-workflow/source-repo`, rewrites `series.json`, and exports the
+committed bundle. Keep the bundle and matching series together.
 Its fixture path is fixed in that tool, and its only option is `--force`:
 
 ```sh
@@ -196,15 +204,22 @@ only after **every selected target has completed successfully** and the JSONL
 file has closed. An export failure returns a nonzero status but keeps the
 completed JSONL; measurements are not rerun.
 
-The common envelope includes benchmark, run ID/time, target, environment and
-parameters. Parameters include the **effective jobs**, Git/Make/compiler
-versions, the resolved toolchain (`source`, normalized compiler `command`,
-`llvm`, and the make variable assignments passed to every invocation),
-relevant build-environment overrides (including `CC`, `CROSS_COMPILE`, and
-`LLVM`), the complete fixture series, and SHA-256 hashes of every selected
-fixture input (including mini's bundle or kernel's config). Exported JSONL
-therefore carries fixture identity and provenance without relying on a
-host-local manifest.
+The common envelope includes benchmark, run ID, target, case, repeat,
+parameters, a harness source fingerprint, metrics and details. Parameters
+include only the necessary experiment inputs:
+
+- `jobs`: the effective build parallelism;
+- `base_commit`: the resolved fixture base commit;
+- `fixture_sha256`: SHA-256 hashes of the fixture series, command files and
+  config/bundle inputs;
+- `tool_versions`: concise Git, Make and actual compiler versions.
+
+The compiler version is read through the makefile-selected `$(CC)`, not a
+Python guess based on environment `CC`. Collection is outside workload and
+cleanup timers. No full fixture body, kernel config, inherited build-variable
+dictionary, resolved make variables, host, or environment record is stored.
+Runs aggregate globally; environment consistency is the operator's
+responsibility.
 
 Numeric metrics are:
 
@@ -214,14 +229,12 @@ Numeric metrics are:
 - `unattributed_ms`: `max(0, elapsed_ms - sum(non-checkpoint step ms))`;
 - mini only: `source_setup_ms` for the bundle clone.
 
-`details` retains the complete ordered `steps` array (`step`, `ms`), zero-cost
-checkpoint boundaries/count, kernel `tree_assertions`, resolved base commit,
-filesystem requirement/detection, paths/actions, cleanup outcome, loose-object
-counts, and `fsync_mode`/`cache_state`. Durations are integer milliseconds
-floored from a monotonic nanosecond clock. Compare measured totals separately
-from preparation and cleanup; do not treat dependent steps as independent
-samples. Fresh directories remove stale-owner recovery and cross-run checkout
-reuse, but do not make reads cold.
+`details` retains only the complete ordered `steps` array (`step`, `ms`) and
+kernel `tree_assertions` (`commit`, `tree`, `ok`). Durations are integer
+milliseconds floored from a monotonic nanosecond clock. Compare measured totals
+separately from preparation and cleanup; do not treat dependent steps as
+independent samples. Fresh directories remove stale-owner recovery and cross-run
+checkout reuse, but do not make reads cold.
 
 ## Durability, limitations and provenance
 

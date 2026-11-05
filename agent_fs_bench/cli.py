@@ -6,7 +6,7 @@ import importlib
 import signal
 import sys
 
-from .results import PROJECT_ROOT, RunContext, environment
+from .results import PROJECT_ROOT, RunContext, source_digest
 from .targets import load_targets
 
 BENCHMARKS = {
@@ -46,7 +46,7 @@ def run_benchmark(argv: list[str]) -> int:
     run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
     run_dir = results_root / options.benchmark / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
-    env = environment()
+    source_sha256 = source_digest()
     output_path = run_dir / 'results.jsonl'
     with output_path.open('x', encoding='utf-8') as output:
         for target in targets:
@@ -60,7 +60,7 @@ def run_benchmark(argv: list[str]) -> int:
             # A new Namespace per target prevents workload setup from leaking state.
             target_args = module.parse_args(workload_argv)
             context = RunContext(options.benchmark, run_id, target, work_dir,
-                                 result_dir, vars(target_args).copy(), env, output)
+                                 result_dir, vars(target_args).copy(), source_sha256, output)
             print(f'[{options.benchmark}] {target.name}: {target.path}', flush=True)
             module.run(context, target_args)
             print(f'  {context.records} measurements', flush=True)
