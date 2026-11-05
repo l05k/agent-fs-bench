@@ -1,282 +1,229 @@
-# Multi-host NAS contention experiment
+# Multi-host shared-filesystem contention
 
-Measures what several independent Linux hosts see when they mount the same NAS
-and write to it at the same time.
+Run one single-threaded Python worker on each Linux SSH host against the same
+externally mounted filesystem. The controller does not need the target mounted
+locally. Mounting, mount options, credentials and unmounting are entirely external.
+All hosts must see the **same absolute target path and shared namespace**.
 
-测量多台相互独立的 Linux 服务器同时挂载同一个 NAS、并发读写时，每台主机看到的
-吞吐与尾延迟，以及所有主机在同一共享目录里竞争元数据操作时的表现。
+## Run
 
-Unlike the single-host benchmarks in this repository, this is an orchestrated
-experiment. The machine that runs `multi_host_nas_fs.py` is the control plane;
-it never needs a local NAS mount. It deploys the same self-contained script as a
-worker to every host listed in YAML, mounts the NAS there, releases all workers
-together, and collects their reports.
-
-与仓库中的单机 benchmark 不同，这是一个编排型实验。运行
-`multi_host_nas_fs.py` 的机器只作为控制机，本地不需要 NAS 挂载；脚本会把自身
-作为 worker 部署到 YAML 中的每台服务器，在这些服务器上挂载 NAS、统一放行，
-最后回收各主机的结果。
-
-## Artifacts / 产物
-
-| Path | Where | Purpose |
-| --- | --- | --- |
-| `multi_host_nas_fs.py` | repo root | control plane, YAML parser and remote worker |
-| `experiments/multi-host-nas.yaml` | repo | example SSH/NAS/workload plan |
-| `<nas.run_root>/<run-id>/hosts/<host>/` | NAS | private trees written by each host |
-| `<nas.run_root>/<run-id>/shared/` | NAS | one directory all hosts contend on |
-| `<nas.run_root>/<run-id>/_results/<host>.json` | NAS | per-host archival result |
-| `results/multi_host_nas_fs/<UTC-run-id>/` | control machine | reports and logs |
-
-The result directory contains `result.json`, `metrics.csv`, `aggregate.csv`,
-`summary.txt`, `manifest.txt`, `config.yaml`, `plan.json`, one
-`<host>.result.json` per host, and `logs/<host>.{stdout,stderr}.log`.
-
-## Plan / 计划文件
-
-```yaml
-version: 1
-
-experiment:
-  name: shared-nas-contention
-
-ssh:
-  user: bench
-  identity_file: ~/.ssh/id_ed25519
-  options:
-    - StrictHostKeyChecking=accept-new
-    - ServerAliveInterval=30
-
-hosts:
-  - name: node-a
-    address: 10.10.0.11
-  - name: node-b
-    address: 10.10.0.12
-
-nas:
-  source: nas01.example.com:/export/agent-fs
-  fstype: nfs
-  options: vers=4.2,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2
-  mountpoint: /mnt/agent-fs-nas
-  run_root: /mnt/agent-fs-nas/agent-fs-bench/shared-nas
-  privileged: true
-  verify_source: true
-
-workload:
-  files_per_host: 512
-  file_size_bytes: 8192
-  directories: 16
-  shared_files_per_host: 256
-  rounds: 3
-  fsync: true
-  read_back: true
-  cleanup_private: false
-
-remote:
-  python: python3
-  worker_dir: /var/tmp/agent-fs-bench
-  ready_timeout_s: 180
-  run_timeout_s: 1800
-```
-
-Required keys are `experiment.name`, `hosts`, `nas.source`, `nas.mountpoint`,
-`nas.run_root`, and the `workload` counts. `nas.run_root` must be inside
-`nas.mountpoint`; the script refuses a plan whose test path could escape onto a
-local filesystem. Relative remote paths are also rejected.
-
-必填项是 `experiment.name`、`hosts`、`nas.source`、`nas.mountpoint`、
-`nas.run_root` 以及各 workload 数量。`nas.run_root` 必须位于
-`nas.mountpoint` 内，否则脚本会拒绝，以防测试数据误写到本地盘。
-
-Common optional fields and defaults:
-
-| Field | Default | Meaning |
-| --- | --- | --- |
-| `ssh.user` | none | default SSH user; a host can override it |
-| `ssh.identity_file` | none | private key passed to `ssh -i` |
-| `ssh.options` | none | extra `ssh -o KEY=VALUE` options |
-| `ssh.connect_timeout_s` | `15` | SSH connect timeout |
-| `ssh.command_timeout_s` | `120` | timeout for deploy and setup commands |
-| `hosts[].port` | `22` | per-host SSH port |
-| `hosts[].options` | none | per-host extra SSH options |
-| `nas.fstype` | auto | passed as `mount -t` when set |
-| `nas.options` | none | passed as `mount -o` when set |
-| `nas.privileged` | `true` | prefix mount operations with `sudo -n --` |
-| `nas.verify_source` | `true` | require an existing mount's source to match |
-| `nas.mount_timeout_s` | `120` | parallel mount timeout per host |
-| `nas.unmount_timeout_s` | `60` | parallel unmount timeout per host |
-| `nas.lazy_unmount` | `false` | add `umount -l` |
-| `nas.unmount_on_exit` | `true` | unmount mounts owned by this run |
-| `workload.rounds` | required | repeat the full phase set |
-| `workload.fsync` | `true` | run `*_fsync` phases |
-| `workload.read_back` | `true` | run `*_read` phases |
-| `workload.cleanup_private` | `false` | remove each host's private tree |
-| `remote.python` | `python3` | remote interpreter command/absolute path |
-| `remote.worker_dir` | `/var/tmp/agent-fs-bench` | remote staging root |
-| `remote.ready_timeout_s` | `180` | maximum wait before all workers are ready |
-| `remote.run_timeout_s` | `1800` | remote workload alarm after the gate |
-
-The built-in YAML reader deliberately supports a strict subset: block
-mappings/sequences, comments, plain or quoted scalars, booleans, null, integers
-and floats. Anchors, aliases, flow collections (`[...]`, `{...}`), folded or
-literal multiline scalars, and multi-document streams are rejected with a line
-number. This keeps the control script standard-library-only and the accepted
-configuration unambiguous.
-
-## Prerequisites / 前置条件
-
-- The control machine has OpenSSH `ssh` and can log in to every host without an
-  interactive password (key-based or agent authentication).
-- Every target is Linux and has Python 3.9 or newer.
-- Every target has `mountpoint`, `findmnt`, `df`, and the userspace mount helper
-  for the NAS protocol (for example `nfs-common` for NFS or `cifs-utils` for
-  SMB).
-- If `nas.privileged: true`, passwordless `sudo -n true` works on every host.
-- The NAS is reachable from every host and `nas.source` is the source string
-  that `mount` accepts there.
-
-The plan is validated locally first:
+The hosts file is private input read from `local/hosts.toml` (the fixed
+`CONFIG["hosts"]` in `agent_fs_bench/benchmarks/multi_host.py`; `local/` is
+git-ignored). Copy `experiments/hosts.example.toml` there and edit the host
+entries. Select storage using the common targets file or `--dirs`:
 
 ```sh
-python3 multi_host_nas_fs.py \
-  --config experiments/multi-host-nas.yaml --check
+uv run python -m agent_fs_bench run multi-host --dirs /mnt/shared
 ```
 
-`--check` parses and prints the normalized topology, but opens no SSH
-connections, mounts nothing and writes nothing to the NAS.
-
-Only after that should the experiment be launched from a control machine that
-has the real SSH/NAS environment:
+There are no workload tuning flags. Workload help accepts only `--help`:
 
 ```sh
-python3 multi_host_nas_fs.py \
-  --config experiments/multi-host-nas.yaml
+uv run python -m agent_fs_bench run multi-host -- --help
 ```
 
-Use `--keep-mounted` to leave mounts created by the controller in place, or
-`--keep-remote` to retain the uploaded worker and job files.
+The workload implementation is `agent_fs_bench/benchmarks/multi_host.py`. The
+public interface is the common runner, not direct execution of that module.
+Workload help opens no SSH connections. If `local/hosts.toml` is missing, the
+run fails with a message pointing at `experiments/hosts.example.toml`.
 
-## Execution / 执行流程
+### Hosts TOML
 
-1. **Preflight (parallel).** Check SSH, Python, required commands, the mount
-   helpers, and `sudo -n` where configured.
-2. **Deploy (parallel).** Write this script and a JSON job file below
-   `remote.worker_dir/<run-id>/<host>/`; the existing remote repository is not
-   needed.
-3. **Mount (parallel).** Create the mountpoint if absent, then run the
-   configured `mount`. An existing mount is accepted only when its source
-   matches `nas.source` (unless `verify_source: false`); it is never unmounted
-   by this run. New mounts are checked against the same source rule. A source
-   mismatch aborts the experiment before any workload.
-4. **Start gate.** Start one worker over SSH on every host. Each worker prints
-   `READY` and blocks on stdin. After every host is ready, the controller writes
-   one `GO` line to all SSH stdin pipes, so all hosts are released together.
-   `start_gate_control_write_ms` records the controller-side span of those
-   writes. There is no per-phase barrier after the gate.
-5. **Workload.** Each host runs the same phases against
-   `<run_root>/<run-id>/hosts/<host>/` and the common `shared/` directory.
-6. **Collect and clean up.** The controller parses `RESULT_JSON` from stdout,
-   saves per-host logs, unmounts only mounts it created, and removes its remote
-   staging directory. Private trees stay on the NAS unless
-   `workload.cleanup_private: true`; shared test files are always removed by
-   their owner.
+```toml
+[[hosts]]
+name = "node-a"
+address = "node-a.example.net"
+user = "bench"
+port = 22
+python = "python3"
+ssh_args = ["-i", "/home/operator/.ssh/bench_ed25519", "-o", "ServerAliveInterval=30"]
 
-If preflight or any mount fails, the workload is not started. Successfully
-mounted hosts are unmounted during cleanup. Interrupting the controller closes
-the start gate and terminates the local SSH processes.
+[[hosts]]
+name = "node-b"
+address = "node-b.example.net"
+user = "bench"
+```
 
-## Workload / 工作负载
+Only `[[hosts]]` entries are accepted; there is no mount plan or configuration
+version. `name` and `address` are required. Names are unique safe path components
+(letters, digits, `.`, `_`, `-`, starting with a letter or digit, at most 64
+characters). Duplicate `(user, address, port)` endpoints are rejected.
+`user` defaults to the SSH configuration, `port` to 22, `python` to `python3`, and
+`ssh_args` to an empty array. SSH aliases in `address` are supported. `python`
+is one executable name or absolute path, not a command with arguments.
 
-All hosts start at the same gate but then free-run; this models independent
-clients rather than a globally lock-stepped benchmark.
+`ssh_args` contains individual OpenSSH argv tokens, not a shell string; include
+`-o` before each SSH option and `-i` before an identity path. Use an absolute
+identity path; a literal `~` inside TOML is not shell-expanded. Authentication
+must be noninteractive and SSH host keys must already be trusted. Host settings
+are recorded in JSONL, so do not put credentials in them.
 
-| Phase | Location | Operation |
+### Code configuration
+
+All counts, timeouts and toggles are constants in the `CONFIG` dictionary at the
+top of `agent_fs_bench/benchmarks/multi_host.py`; edit them in source for a
+deliberate experiment. Defaults are:
+
+| `CONFIG` key | Default | Meaning |
 | --- | --- | --- |
-| `private_create` | per-host tree | create `files_per_host` files across `directories` |
-| `private_fsync` | per-host tree | `fsync` every file, then the directories |
-| `private_read` | per-host tree | read every file back and check its length |
-| `private_stat` | per-host tree | `stat` every file |
-| `private_rename` | per-host tree | rename every file in place |
-| `shared_create` | common `shared/` | create unique files beside every other host |
-| `shared_fsync` | common `shared/` | `fsync` every shared file and the directory |
-| `shared_read` | common `shared/` | read every shared file back |
-| `shared_stat` | common `shared/` | `stat` every shared file |
-| `shared_delete` | common `shared/` | unlink every shared file |
+| `hosts` | `local/hosts.toml` | private TOML SSH host list |
+| `files_per_host` | 1000 | private files per worker per round |
+| `file_size_bytes` | 4096 | bytes in every file |
+| `directories` | 32 | private subdirectories per round |
+| `shared_files_per_host` | 200 | shared-directory files per worker per round |
+| `rounds` | 3 | repetitions of the complete phase sequence |
+| `fsync` | `True` | include file and directory fsync phases |
+| `read_back` | `True` | include read phases |
+| `cleanup_private` | `False` | delete successful worker private trees after timing |
+| `worker_dir` | `/var/tmp/agent-fs-bench` | remote staging root, outside the measured target |
+| `connect_timeout_s` | 15 | SSH connect timeout |
+| `command_timeout_s` | 120 | preflight, deployment and setup timeout per command |
+| `ready_timeout_s` | 180 | start-gate timeout |
+| `run_timeout_s` | 1800 | worker alarm after GO; controller allows 60 extra seconds |
+| `keep_remote` | `False` | retain uploaded package and internal job files |
 
-`fsync` and `read_back` can disable their corresponding optional phases. Each
-host is single-threaded; concurrency comes from the number of hosts. Every file
-is the same size (`file_size_bytes`), and each worker's payload is deterministic
-from its host name.
+All counts and timeouts must be positive and the boolean keys must be booleans;
+this is validated at run start. The former workload flags for every setting above
+are removed and rejected, with no compatibility path.
 
-The private phase measures normal per-client behavior. The shared phase is the
-contention probe: all hosts create and manipulate uniquely named files in one
-directory, so directory creation, lookup, cache invalidation and server-side
-metadata locking are exercised across clients.
+## Execution and safety
 
-## Suggested experiment matrix / 建议实验矩阵
+1. Preflight every host over real SSH: require Linux, Python 3.12+, and a writable
+   existing target directory. No sudo, mount utilities or remote checkout is needed.
+2. Upload the actual Python package and a JSON **input job**, using SSH stdin,
+   under `<worker-dir>/<run-id>/<target-name>/<host-name>/`. The worker imports
+   shared package code; workers need no third-party Python dependency. The
+   controller needs DuckDB for the final CSV. Deployment uses a fresh directory with mode 0700.
+3. Create the unique shared run directory on the first host:
+   `<target>/agent-fs-bench/multi-host/<run-id>/`. Write a random owner sentinel;
+   every host reads it and writes its own sentinel. Each worker must read all host
+   sentinels before READY. This catches disconnected namespaces without depending
+   on mount source strings. It does not verify a particular storage vendor, mount
+   type or durability guarantee.
+4. Start each worker with its configured interpreter, unbuffered:
+   `python -u -m agent_fs_bench.benchmarks.multi_host --worker --job <job-path>`.
+   The remote working directory is the uploaded package root. Every worker prints
+   READY and waits for GO on SSH stdin. The controller releases all workers only
+   after every READY. There are **no per-round or per-phase barriers**: independent
+   workers free-run after the original start gate.
+5. Collect the in-memory phase results over stdout, retain diagnostic logs locally,
+   remove deployed package/job directories unless requested otherwise, and emit
+   JSONL measurements. No raw result files are written to the shared filesystem.
 
-Run the same plan with one host, then two, four, and eight hosts while holding
-the NAS mount options fixed. Keep `files_per_host` constant to measure how
-aggregate client throughput and tail latency scale with added clients; divide
-it by the host count to keep total bytes/files constant and isolate contention.
-Repeat each configuration enough times to report a median and spread.
+The controller never creates the target path locally and never deletes the shared
+run root or target root. Targets and staging paths must be absolute non-root paths
+without `..`. Workers reject existing private directories and symlinked run
+subdirectories. Run-root resolution must stay inside the target. These checks are
+not protection against another process maliciously changing paths during a run.
+The staging directory must not be on the measured target.
 
-固定 NAS 挂载参数后，分别用 1、2、4、8 台主机运行同一计划：保持
-`files_per_host` 不变可观察总吞吐与尾延迟随客户端数的扩展；按主机数同比例
-缩小 `files_per_host` 则可在总写入量不变的条件下隔离竞争效应。每种配置重复
-多次，报告中位数与离散度。
+Shared filenames are uniquely owned by host/round/index; the timed delete phase
+removes only that host's files. Private cleanup is opt-in and occurs after successful
+work. Failed workers can leave partial files for diagnosis; remove only the selected
+run directory manually after confirming no worker is still running. Repeated runs
+with retained private files consume space. There are no retries or substitute
+workloads. An operation failure, including unsupported directory fsync, fails the
+run rather than producing successful rows with ignored errors. Set
+`CONFIG["fsync"] = False` only when that is the intended measurement.
 
-The interesting signals are the difference between `private_*` and `shared_*`
-phases, the growth of `max_host_p95_ms`, the gap between
-`sum_host_ops_per_s` and linear scaling, and any `errors` reported by fsync
-phases.
+An interrupted controller closes SSH pipes and terminates local SSH processes.
+That does not guarantee immediate remote termination: workers have alarms, but
+blocked filesystem calls may delay them. Inspect workers/storage after interrupts.
+Externally managed mounts are always left untouched.
 
-## Output / 输出
+## Workload and measurement boundaries
 
-`metrics.csv` has one row per host/round/phase:
+Each host performs the following sequence in each round:
 
-`host, round, phase, ops, errors, elapsed_s, ops_per_s, bytes, mib_per_s,
-p50_ms, p95_ms, p99_ms, max_ms, mean_ms`
+| Phase | Operation |
+| --- | --- |
+| `private_create` | exclusively create private files with deterministic host-specific payload |
+| `private_fsync` | fsync every private file, then the round root and subdirectories |
+| `private_read` | read private files and verify their length |
+| `private_stat` | stat each private file |
+| `private_rename` | rename each private file in place |
+| `shared_create` | exclusively create uniquely named files in one common directory |
+| `shared_fsync` | fsync each owned shared file, then the common directory |
+| `shared_read` | read owned shared files and verify their length |
+| `shared_stat` | stat each owned shared file |
+| `shared_delete` | unlink each owned shared file |
 
-`errors` counts failed `fsync` calls; they are reported rather than aborting
-the whole run, because some NAS clients reject directory fsync. Other operation
-errors fail the worker.
+Private files are distributed across the configured subdirectories **plus the
+round directory itself**. Shared workers operate on their own files, but contend
+on a single directory. Each host is single-threaded; concurrency comes from hosts.
 
-`aggregate.csv` groups those rows by round and phase:
+Directory setup, filename preparation and payload generation are outside create
+phase timing. Create does not implicitly fsync. Per-operation and phase timing
+use `perf_counter_ns`; phase timing includes the loop and sample collection, not
+subsequent percentile calculation. Reads validate byte count, not content hashes.
+No cache is dropped: reads may be served from client cache. Fsync semantics depend
+on the client/filesystem/server; this is not a durability proof.
 
-`round, phase, hosts, total_ops, total_bytes, total_errors, sum_host_ops_per_s,
-max_host_elapsed_s, max_host_p95_ms`
+Percentiles use sorted samples at `round((n - 1) * fraction)`, not interpolation.
+Python syscall-wrapper overhead is included. Compare the same harness/Python
+version across configurations rather than interpreting this as raw storage limits.
+The overall worker interval begins after initial directory/payload setup and ends
+before private cleanup. Controller workload time includes SSH worker startup, gate
+waiting and result collection. `start_gate_control_write_ms` measures controller
+stdin-write span, not actual remote execution skew. Clock synchronization is not
+required for the start gate.
 
-Because phases free-run after the start gate, `sum_host_ops_per_s` is the sum of
-each host's measured phase rate, not a server-wide rate over a perfectly aligned
-window. Use `max_host_p95_ms` as a conservative tail-latency indicator. The JSON
-results retain every raw phase row and the mount/preflight details.
+## Results
 
-`result.json` records each host's `gate_wait_s`; the duplicated full worker
-payload, including every raw phase row, lives in `<host>.result.json`.
+The common runner writes `results/multi-host/<run-id>/results.jsonl`. Each host,
+phase and round is a separate row: case `<host-name>/<phase>`, repeat = round.
+Numeric metrics are `ops`, `errors`, `elapsed_s`, `ops_per_s`, `bytes`, `mib_per_s`,
+`p50_ms`, `p95_ms`, `p99_ms`, `max_ms`, and `mean_ms`. Successful rows have zero
+errors. A failed target's multi-host workload emits no rows, but earlier
+successful targets in the same invocation may already have written JSONL.
 
-## Safety and limitations / 安全与限制
+`details` retains **all per-operation `latencies_ns` samples**, host identity,
+remote runtime/preflight information, worker timing, start-gate measurements,
+sentinel status, cache/fsync semantics and diagnostics. Thus exported JSONL is
+self-contained. `environment.hostname`, `machine` and runtime fields identify
+the actual worker, not the controller. Optional local `<host>.stdout.log` and
+`<host>.stderr.log` under the target's result directory are diagnostic
+artifacts, not analysis inputs. There are no workload-specific CSV, summary,
+manifest, per-host JSON or alternate raw-result reports. The common runner
+derives `summary.csv` only after all selected targets succeed. If a later
+target fails, earlier rows remain in JSONL without an automatic CSV summary.
 
-- Workers remove only the `shared/` files they created, after the timed delete
-  phase completes; a failed worker can leave its partial files behind. The
-  controller never deletes the NAS run root. `cleanup_private` is opt-in, so
-  repeated experiments can fill the NAS.
-- `nas.options` may contain credentials if configured badly. Prefer a
-  credentials file for CIFS and do not put passwords in YAML; the plan is
-  copied into local results verbatim.
-- Existing mounts are treated as externally owned. Their source is checked and
-  they are not unmounted automatically.
-- Read phases use the page cache and are not cold-cache measurements. A NAS
-  client can return writes/reads from its local cache before the server has
-  committed them.
-- Per-operation latency includes the Python harness's syscall wrapper overhead.
-  Compare configurations measured with the same script and Python version, not
-  raw NAS vendor numbers.
-- The start gate synchronizes release, not the start of every workload phase.
-  Clock skew does not affect the gate because it is an SSH stdin signal.
-- If a controller or SSH connection dies, a running remote worker may continue
-  until its `run_timeout_s` alarm. Check the target hosts and the NAS run root
-  after an interrupted run.
-- This experiment is not a replacement for vendor NAS benchmarks or a
-  durability test. It is a reproducible concurrency probe for the same workload
-  shape across a set of machines.
+Hosts free-run: summing their phase rates is not a synchronized server-wide
+throughput measurement, and averaging host percentiles is not a pooled percentile.
+Compare private versus shared phases, per-host tails, and scaling across 1/2/4/8
+independent clients while keeping mount options and per-host work fixed. To hold
+total work fixed instead, divide file counts by host count. Repeat configurations
+to measure spread.
+
+## Smoke strategies
+
+A real local Linux SSH server with one host entry exercises upload, shared-package
+imports, sentinel setup, the READY/GO protocol, workload, JSONL and remote cleanup.
+The defaults are a full-sized run, so set the smoke values in `CONFIG` first:
+`files_per_host = 8`, `file_size_bytes = 128`, `directories = 2`,
+`shared_files_per_host = 4`, `rounds = 2`, `cleanup_private = True`. Then run:
+
+```sh
+uv run python -m agent_fs_bench run multi-host --dirs /mnt/smoke-share
+```
+
+Create `/mnt/smoke-share` externally first. With fsync/read enabled, expect 20
+rows per host, 8 private operations (except private fsync: 11), and 4 shared
+operations (except shared fsync: 5), with a matching number of latency samples.
+Two genuinely independent Linux hosts using an externally prepared common share
+are required to test cross-client contention and namespace visibility. A mismatched
+namespace should fail before any READY gate release and emit no measurement rows.
+
+For a worker-only smoke, use a freshly prepared unique run directory and an input
+job made with `_job_for_host` (the same input retained when `CONFIG["keep_remote"]`
+is `True`). It must name the target/run root and matching owner/host sentinels;
+an already completed job cannot be replayed over existing private files. From
+the deployed package root:
+
+```sh
+printf 'GO\n' | python3 -u -m agent_fs_bench.benchmarks.multi_host --worker --job /absolute/path/job.json
+```
+
+The internal worker emits READY then one RESULT_JSON protocol message, not a public
+result file. This isolated smoke does not test SSH, controller gates, deployment,
+JSONL collection or actual multi-client storage.

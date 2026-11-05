@@ -10,25 +10,29 @@ OpenClaw per-agent transcript: one transaction per simulated turn.
 
 | Path | Where | Purpose |
 | --- | --- | --- |
-| `openclaw_session_bench.py` | repo root | the benchmark (stdlib + SQLite only) |
-| `<--dir>/openclaw-session-bench/session-bench.sqlite` | target FS | database + WAL/SHM |
-| `results/openclaw_session_bench/<UTC-run-id>/` | project | reports |
+| `agent_fs_bench/benchmarks/openclaw_session.py` | shared package | workload (stdlib + SQLite) |
+| `<target>/agent-fs-bench/openclaw-session/<run-id>/session-bench.sqlite` | target FS | fresh database + WAL/SHM |
+| `results/openclaw-session/<run-id>/results.jsonl` | project | one portable measurement per target |
+| `results/openclaw-session/<run-id>/summary.csv` | project | derived target/case/metric statistics |
 
-Report files: `result.json`, `report.md`, `report.md.tmpl`, `summary.txt`,
-`manifest.txt`. The database is deleted at the start of every run, so each run
-re-seeds from scratch.
+Each run seeds a fresh database in its exclusive work directory. The shared
+runner derives `summary.csv` only after all selected targets succeed. If a
+later target fails, earlier successful measurements remain in JSONL without
+an automatic CSV. No duplicate JSON document, Markdown report, template or
+manifest is generated.
 
 ## Run / 运行
 
 ```sh
-uv run openclaw_session_bench.py --dir /mnt/testfs --duration 30
-uv run openclaw_session_bench.py --dir /mnt/testfs --rate 0 --sessions 8
-uv run openclaw_session_bench.py --dir /mnt/testfs --pragma synchronous=FULL
-uv run openclaw_session_bench.py --dir /mnt/testfs --no-fts      # ablation only
+uv run python -m agent_fs_bench run openclaw-session --dirs /mnt/fs-a
 ```
 
-Defaults: `--duration 30`, `--rate 10` turns/s, `--sessions 4`,
-`--prefill-events 1000`, FTS on, `--seed 1`.
+There are no workload flags. Duration, rate, sessions, prefill, seed, FTS
+projection and PRAGMA overrides are the deliberate `CONFIG` mapping at the top
+of `agent_fs_bench/benchmarks/openclaw_session.py`; they are recorded in every
+JSONL row. Change that code for an ablation; do not commit private settings.
+Defaults: 30 s, 10 turns/s, 4 sessions, 1000 prefill events/session, FTS on,
+seed 1, no PRAGMA overrides.
 
 ## Schema and workload / 模式与负载
 
@@ -37,8 +41,9 @@ Tables model OpenClaw's transcript store (`session_nodes`, `session_windows`,
 `session_transcript_active_events`, `session_transcript_index_state`,
 `session_transcript_fts` + `session_transcript_fts_rows`, all `STRICT`).
 
-**Setup (untimed)** — create schema, seed `--prefill-events` events per session,
-then `wal_checkpoint(TRUNCATE)` so every run starts from the same sidecar state.
+**Setup (untimed)** — create schema, seed `CONFIG["prefill_events"]` events per
+session, then `wal_checkpoint(TRUNCATE)` so every run starts from the same
+sidecar state.
 
 **Timed loop** — pick a session at random and run one `write_turn`:
 
@@ -50,7 +55,7 @@ BEGIN IMMEDIATE
   4 × INSERT transcript_event_identities
   4 × INSERT session_transcript_active_events
   4 × UPDATE session_transcript_index_state
-  4 × INSERT FTS row + FTS mapping row        (unless --no-fts)
+  4 × INSERT FTS row + FTS mapping row        (unless CONFIG["no_fts"])
   UPDATE session_windows.transcript_updated_at
 COMMIT
 ```
@@ -63,11 +68,14 @@ Payloads: 90% 1–4 KiB, 9% 256 KiB, 1% 1 MiB, stored as `event_json` TEXT with
 
 ## Output / 输出
 
-`result.json` reports environment (Python/SQLite/platform), pragmas actually in
-effect, `turns`, `new_events`, `turns_per_s`, `events_per_s`,
-`payload_mib_per_s`, `process_cpu_s`, per-turn transaction latency
-(count/mean/p50/p95/p99/max), DB/WAL sizes and peaks, storage amplification,
-final checkpoint time, row counts and `integrity_check`.
+`results.jsonl` records throughput and latency statistics in `metrics`; `details`
+retains SQLite version, effective PRAGMAs, raw `turn_samples_ms`, row counts,
+DB/WAL sizes and peaks, final checkpoint and integrity check. Common parameters
+and environment are carried in every line, so no sidecar is needed for analysis.
+
+The existing latency timer surrounds the entire `write_turn` call, including
+payload construction and the transaction. Pacing, file-size sampling and the
+final checkpoint are outside this timer. It is not pure BEGIN-to-COMMIT latency.
 
 Exit code is 0 only when `integrity_check == "ok"`.
 
@@ -78,9 +86,10 @@ Exit code is 0 only when `integrity_check == "ok"`.
 - `wal_autocheckpoint` is pinned to 16384 pages (64 MiB) and
   `journal_size_limit` to 64 MiB to model an unmaintained single writer;
   OpenClaw itself uses a worker-maintained checkpointer.
-- `--pragma` accepts only the whitelisted connection pragmas; values are
-  validated and recorded in `result.json`.
-- `--no-fts` is an ablation; the default keeps the synchronous FTS projection
-  because OpenClaw writes it in the same transaction.
+- PRAGMA overrides come from `CONFIG["pragma"]` (repeatable `NAME=VALUE` in code)
+  and are validated and recorded in JSONL.
+- To disable FTS for an ablation, set `CONFIG["no_fts"] = True`; the default keeps
+  the synchronous FTS projection because OpenClaw writes it in the same
+  transaction.
 - Synthetic payloads, one process, one writer: no zstd, cold archive,
   concurrent writers or real session replay. 合成负载，单进程单写入者。

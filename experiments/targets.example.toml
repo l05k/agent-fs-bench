@@ -1,0 +1,9 @@
+# Copy to local/targets.toml. Mount filesystems outside this repository first.
+# Paths are the only filesystem interface; no vendor names or mount commands.
+[[targets]]
+name = "fs-a"
+path = "/mnt/fs-a"
+
+[[targets]]
+name = "fs-b"
+path = "/mnt/fs-b"
