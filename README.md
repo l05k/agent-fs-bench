@@ -42,7 +42,7 @@ uv sync --locked --group analysis
 | --- | --- | --- |
 | `run` | 在一个或多个已挂载目录上顺序测量，随后生成汇总 CSV | `benchmark`、`--dirs`、`--target` |
 | `analyze` | 对任意 JSONL 执行 DuckDB 查询并输出 CSV/stdout | `inputs`、`--sql`、`--database`、`--output` |
-| `plot` | 从任意 JSONL 按论文图规范绘制分组箱线图，输出 PDF/PNG 及自包含脚本 | `inputs`、`--benchmark`、`--metric`、`--cases`、`--targets`、`--ylabel`、`--size`、`--output` |
+| `plot` | 从任意 JSONL 按论文图规范绘制分组箱线图，输出 PDF/PNG 及自包含脚本 | `inputs`、`--benchmark`、`--metric`、`--cases`、`--targets`、`--parameters`、`--source-sha256`、`--ylabel`、`--size`、`--output` |
 | `tools/gen_mini_source_repo.py` | 确定性重建 mini 的 Git fixture | `--force` |
 
 `run` 的 workload 参数只剩 `clone --smoke`；其余实验设置在各模块顶部 `CONFIG` 中，修改代码属于实验配置变更，不得提交私有值。
@@ -82,7 +82,7 @@ uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 | --- | --- | --- |
 | `run dev-workflow` | Linux 内核配置、编译、搜索、修改、提交、树验证；固定 x86 配置输入 | [dev workflow](docs/bench-dev-workflow.md) |
 | `run mini-dev-workflow` | 固定小型 C 项目的完整 Git worktree 开发流程 | [dev workflow](docs/bench-dev-workflow.md) |
-| `run npm-install` | warm cache、cold `node_modules` 的离线 npm/pnpm 安装；固定 lockfile fixture | [npm install](docs/bench-npm-install.md) |
+| `run npm-install` | 外部本地盘上预热源、冷 `node_modules` 的离线 npm/pnpm 物化；按外部并发批次计时，固定 lockfile fixture | [npm install](docs/bench-npm-install.md) |
 | `run clone` | 同文件系统持久化目录克隆；完整目录请求并发、数据量/文件数扫描，支持按目标选择原生命令 | [clone](docs/bench-clone.md) |
 | `run kvtest` | SQLite 官方单表随机 BLOB 覆写，每次写入一个事务；不是 OpenClaw 重放 | [kvtest 与负载校准](docs/bench-kvtest-openclaw.md) |
 | `run multi-host` | 多台 SSH 主机同时在共享文件系统执行私有树操作和目录竞争 | [multi-host](docs/bench-multi-host-nas.md) |
@@ -98,7 +98,7 @@ uv run python -m agent_fs_bench run multi-host --dirs /mnt/fs-a
 
 ### 运行默认值
 
-`run` 不暴露规模、重复次数、并发、fsync/cache、PRAGMA、fixture/manager、资源路径等调节参数。每个模块顶部有唯一的 `CONFIG` 字典，记录该 workload 的可复现实验设置；具体默认值和计时含义见对应文档。修改 `CONFIG` 并在结果中保留源码指纹，才能说明实验条件。
+`run` 不暴露规模、重复次数、并发、fsync/cache、PRAGMA、fixture/manager、资源路径等调节参数。每个模块顶部有唯一的 `CONFIG` 字典，记录该 workload 的可复现实验设置；具体默认值和计时含义见对应文档。修改 `CONFIG` 并在结果中保留源码指纹，才能说明实验条件。部分 workload 会强制校验实验条件：npm-install 要求 node/npm/pnpm 版本与 `CONFIG["tool_versions"]` 完全一致，并要求外部本地准备盘与 target 不同设备、不同文件系统类型，不满足即中止，不回退。
 
 多机模式固定读取 `local/hosts.toml`，格式见 `experiments/hosts.example.toml`。控制机无需挂载；所有 worker 必须已经以**相同绝对路径访问同一个共享文件系统**。不会尝试修复连接、重试或挂载。
 
@@ -118,7 +118,7 @@ results/
     summary.csv
 ```
 
-每行对应一个 case / repeat；完整开发流程是一条测量，步骤在 `details` 中。多机以 host / phase / round 拆分。公共字段：
+每行对应一个 case / repeat；完整开发流程是一条测量，步骤在 `details` 中。多机以 host / phase / round 拆分。npm-install 每行是一个 manager × 外部并发批次大小 × 一个批次（`case` 形如 `npm/c1`、`pnpm/c2`），批次内每个 worker 的原始样本放在 `details.tasks` 中，指标是批次聚合值。公共字段：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -144,10 +144,12 @@ uv run python -m agent_fs_bench run clone \
 只有全部目标测量成功且 JSONL 关闭后，才自动生成 `results/<bench>/<run-id>/summary.csv`，无需开关。若后续目标失败，前面已完成的测量行仍保留在 JSONL，但不会生成自动汇总 CSV；这些行不代表完整实验。汇总与 `analyze` 共用 DuckDB 查询及 CSV 写出函数，不是第二套结果机制：
 
 ```text
-target,case,metric,samples,mean,median,minimum,maximum,stddev,benchmark,run_ids
+target,case,metric,samples,mean,median,minimum,maximum,stddev,benchmark,run_ids,parameters,source_sha256
 ```
 
-一行是 `benchmark × target × case × metric` 的全局统计。clone 的汇总系列为 `target.name/copier`，区分同一文件系统上的原生 clone 与 `cp-r`；其他 benchmark 仍使用 `target.name`。多次运行的样本合并；`run_ids` 按字典序列出参与该行统计的去重运行标识，以分号分隔。不同参数、源码、目标路径或机器环境不再自动拆组，实验者必须确保同一系列下的输入可比较。导出在计时之外执行；导出失败返回非零并保留 JSONL，不重跑 benchmark。
+一行是 `benchmark × target.name × case × metric × parameters × source_sha256` 的统计。clone 的汇总系列为 `target.name/copier`，区分同一文件系统上的原生 clone 与 `cp-r`；其他 benchmark 仍使用 `target.name`。多次运行的样本合并；`run_ids` 按字典序列出参与该行统计的去重运行标识，以分号分隔。`parameters` 是该行参数对象的规范化 JSON（键递归排序、无空格），`source_sha256` 是源码指纹；两者都是分组键，因此不同实验配置或不同源码不会被静默合并到同一个统计里，而同一实验在不同 run ID 中的重复可以聚合。导出在计时之外执行；导出失败返回非零并保留 JSONL，不重跑 benchmark。
+
+参数键顺序不影响分组，但参数内容会：改变 `CONFIG`、工具版本或固定输入后，结果自然落到另一组。要比较两组，就在分析时显式选择其中一组。
 
 CSV 的用途是快速比较本次各目标、用表格工具检查统计量，以及直接交给只接受扁平表格的绘图或分析工具。它不是原始数据归档的替代品：保留 JSONL，CSV 丢失或需重新汇总时直接重建，不必重跑 benchmark。重新计算逐操作分位数、检查离群值或分析详细步骤时，应读取 JSONL。
 
@@ -166,26 +168,46 @@ uv run python -m agent_fs_bench analyze \
 uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl' \
   --database results/analysis.duckdb
 
-# measurements 保留嵌套 JSON；metrics 是数值长表
+# measurements 保留嵌套 JSON；metrics 是数值长表（含 parameters_canonical）
 uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl' \
   --sql 'SELECT benchmark, "case", metric, value FROM metrics'
+
+# 列出每个 case 实际出现的配置身份，供绘图选择器使用
+uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl' \
+  --sql 'SELECT DISTINCT benchmark, "case", parameters_canonical, source_sha256 FROM metrics ORDER BY 1,2'
 
 # 写出 results/clone.pdf、clone.png（600 dpi）和内嵌数据的 clone.py
 uv run --group analysis python -m agent_fs_bench plot \
   'results/clone/*/results.jsonl' \
   --benchmark clone --metric mib_s --ylabel 'Throughput (MiB/s)' \
   --cases L256M/C1/cp,L1G/C1/cp --targets ours,ext4,nfs --output results/clone
+
+# 只画某一个配置身份（参数取 summary.csv 的 parameters 列原文）
+PARAMS='<parameters column from summary.csv>'
+uv run --group analysis python -m agent_fs_bench plot \
+  'results/npm-install/*/results.jsonl' \
+  --benchmark npm-install --metric durable_mean_s \
+  --cases npm/c1 --targets fs-a,fs-b \
+  --parameters "$PARAMS" --source-sha256 <hash> \
+  --ylabel 'Durable install (s)' --output results/npm-latency
 ```
 
-CSV 是可随时重新生成的派生文件；DuckDB 是派生缓存，不维护数据库版本。默认分类箱线图将所选输入中的跨 run 样本合并到目标 × case；clone 自动按数据量、文件数和两类并发场景生成数值横轴折线图，以 `target/copier` 为系列，延迟直接汇集原始请求样本、显示中位数和 IQR。分析前由人工保证运行环境、参数和目标别名一致；要分析某次运行，直接只传入该 run 的 JSONL，或使用自定义 SQL 按 `run_id` 筛选。clone 的新完整目录请求数据与旧 shard 结果不兼容，须重新测量。
+CSV 是可随时重新生成的派生文件；DuckDB 是派生缓存，不维护数据库版本。默认分类箱线图将所选输入中的跨 run 样本合并到目标 × case，只有 `parameters` 与 `source_sha256` 完全一致的行才会进入同一个箱子；同一 case 内出现多个配置身份时，`plot` 直接报错而不是静默合并，报错会列出找到的身份，并提示用 `--parameters <json>` 和/或 `--source-sha256 <hash>[,<hash>]` 选择。clone 自动按数据量、文件数和两类并发场景生成数值横轴折线图，以 `target/copier` 为系列，延迟直接汇集原始请求样本、显示中位数和 IQR；每条扫描线同样只允许一个 `(parameters, source_sha256)` 身份，混合时报错并列出找到的身份，不会把不同参数或源码的样本画进同一张图。要分析某次运行，直接只传入该 run 的 JSONL，或使用自定义 SQL 按 `run_id` 筛选。clone 的新完整目录请求数据与旧 shard 结果不兼容，须重新测量。
+
+- `--parameters '<json object>'`：只保留参数规范化后与该对象**完全相等**的行。键顺序与空白无关，但必须是 workload 记录的完整对象（含 `tool_versions`、`seed_input_sha256` 等）；不支持部分匹配。
+- `--source-sha256 <hash>[,<hash>…]`：只保留所列源码指纹的行。
+- 两个选择器都可与 `--targets`/`--cases` 组合；先按选择器过滤，再按 case/target 选择，所以被 `--cases`/`--targets` 排除的行不会触发歧义错误。不同 case 可以携带不同配置（例如不同并发批次大小），这不算歧义。
+- 选择器过滤后没有剩余行时报错 `no measurements match the plot selection`（clone 为 `no clone measurements match the plot selection`），并附上生效的选择器。
+
+`parameters_canonical` 是 `metrics` 视图中的规范化参数字符串列，持久化的 DuckDB 分析库也保存该列，重新打开时不需要额外函数。
 
 图样式遵循 `.agents/skills/paper-figure-style/SKILL.md`（Arial 9pt、矢量 PDF、图例在上、主系统首位用首色、hatch/marker 区分、四边框、无网格），共享实现在 `agent_fs_bench/figure.py`。`--targets` 决定图例顺序，第一个为主系统；clone 使用 `target/copier` 系列名，其他图直接显示 target 别名。`--cases` 决定分类图的 x 轴顺序并筛选 case，clone 数值扫描只筛选、仍按横轴数值排序。`--ylabel` 默认为 metric 名（clone 常用指标自带易读标签）。`--size` 按实验设定英寸尺寸，默认单栏 `3.5 1.5`。clone 为各扫描输出 `<stem>-bytes`、`<stem>-files`、`<stem>-concurrency-large`、`<stem>-concurrency-small`，只输出输入中存在的组；每组的 Python 脚本内含原始样本与绘图代码，无需 JSONL 即可重新生成 PDF/PNG。图中文字均为英文，缺少 Arial 时直接报错，不替换字体。
 
 ## 可复现性与资源边界
 
 - 保留运行所用 checkout、`uv.lock`、私有目标/主机配置及导出的 JSONL。源码指纹识别实际源码和固定输入，包括未提交修改，但不替代源码归档。
-- 跨文件系统、跨 run 比较的 workload 参数、工具版本、内核/Python、挂载和构建环境由人工保证一致；默认全局汇总不会检查或拆分这些差异。
-- 不宣称 cold-cache：page cache、FUSE 客户端缓存和服务端缓存是不同层；保持原 bench 的计时、同步与 cache 语义。
+- 跨文件系统、跨 run 比较的 workload 参数、工具版本、内核/Python、挂载和构建环境由人工保证一致。默认汇总按 `parameters` 与 `source_sha256` 分组，能防止不同配置或不同源码被静默合并，但目标路径、主机环境与挂载条件不在分组键里。
+- 不宣称 cold-cache：page cache、FUSE 客户端缓存和服务端缓存是不同层；保持原 bench 的计时、同步与 cache 语义。个别 workload 的计时边界和持久化协议（例如 npm-install 的全 project flush）以各自文档为准，不能当作被调用工具的默认语义。
 - 本次不实现 cgroup，也不放空插件接口。FUSE 客户端、服务端和 benchmark 的资源限制由外部实验脚本设置；限制客户端时应控制真实客户端进程所在 cgroup，并保存这些私有条件。
 - smoke 只证明命令、测量和分析链路可运行，不代表真实 FUSE/NFS 性能或一致性验证。
 

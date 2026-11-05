@@ -1,74 +1,34 @@
-"""Benchmark warm npm/pnpm caches against cold node_modules trees.
+"""Offline npm/pnpm materialization from prewarmed external local sources.
 
-The setup phase populates an npm cache and pnpm store. Timed runs then use
-an empty node_modules directory on the target filesystem:
+Each batch starts independent projects together. Every worker has a private
+cache/store and measures command execution followed by a full project fsync.
+Source preparation, project creation, inventories and cleanup are untimed.
+The internal pool width and external project concurrency are separate inputs;
+neither is a claim about the package manager's total thread count.
 
-    npm install --offline
-    pnpm install --offline --package-import-method=copy \
-      --config.enable-global-virtual-store=false
-
-Each completed install emits one JSONL measurement through the shared runner.
-Cache/store setup and prewarming happen outside the timed section.
-
-Two placements are supported, both selected through ``CONFIG['prep_dir']``:
-
-* same filesystem (default, ``prep_dir`` None) -- cache/store live next to
-  the timed node_modules, so the filesystem may hardlink or server-side clone
-  package contents instead of writing them.
-* cross filesystem (``prep_dir`` set) -- npm cache, pnpm store, pnpm XDG
-  cache, templates and seed projects move to another filesystem, so every
-  timed write lands on the target filesystem as real data. The placement is
-  verified with ``st_dev`` and the run is aborted if it was not achieved.
-
-``pnpm`` always imports packages with ``copy``; ``hardlink``/``auto`` can
-short-circuit the write path this benchmark is meant to measure.
-
-``CONFIG['concurrency']`` (default 4) pins the parallelism knobs that actually
-govern a timed offline install. The managers do not share one knob, so N
-is applied per manager:
-
-* npm has **no** install-wide limit and no option for one: Arborist fans
-  every pending package out to pacote at once. Its writes are async
-  ``fs.write`` calls, so ``UV_THREADPOOL_SIZE`` is the one pin available;
-  at 4 the default is unchanged, and lowering it measurably serialises
-  the writes (1 is ~20% slower on the reference tree).
-* pnpm's store-to-``node_modules`` copy is what the timed install mostly
-  does. ``RAYON_NUM_THREADS`` sizes that pool (Linux/Windows);
-  ``PNPM_MACOS_LINK_THREADS`` sizes the separate macOS copy pool, whose
-  default of 4 is why the two are set together -- on macOS the rayon
-  variable alone changes nothing.
-
-``PNPM_MAX_WORKERS`` (pnpm 11's Node worker pool, unread by pnpm 12) and
-``--network-concurrency`` / ``--child-concurrency`` (which bound downloads
-and lifecycle scripts, not an offline materialisation) are deliberately not
-set. A concurrency of 0 keeps each tool's own defaults instead.
-
-After each timed install the tree is fsynced file by file and directory by
-directory. That flush is timed separately as ``sync_s`` and is not part of
-``elapsed_s``.
-
-Only committed fixtures are installed: ``CONFIG['fixture']`` names one of the
-vendored trees under ``data/``, and its committed lockfiles define the
-payload. The public CLI exposes no workload flags; edit ``CONFIG`` for a
-deliberate experiment setup.
+This is not an empty-cache sandbox install or a physical write-bandwidth test.
+Registry traffic and lifecycle scripts are excluded; target FS traffic remains.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import multiprocessing
 import os
 import resource
 import shutil
+import stat
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
+from agent_fs_bench.benchmarks.clone import fstype
 
 PNPM_IMPORT_METHOD = "copy"
-DEFAULT_CONCURRENCY = 4
+LOCAL_PREP_FILESYSTEMS = {"tmpfs", "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs"}
 # Upstream pnpm fixtures vendored under data/, so the benchmark can replay the
 # dependency trees pnpm's own install benchmark uses.
 FIXTURES = {
@@ -76,27 +36,19 @@ FIXTURES = {
     "pnpm-bench-integrated": "data/pnpm-bench-integrated",
 }
 
-# ---------------------------------------------------------------------------
-# CONFIG: all experiment settings for this workload.
-#
-# The public CLI exposes no workload flags; change these values (in code) to
-# run a different experiment setup. ``fixture`` names a committed tree from
-# ``FIXTURES``. ``prep_dir`` is None for same-filesystem placement; point it
-# at an existing directory on another filesystem for cross-filesystem
-# placement (``allow_same_device`` permits a same-device prep_dir).
-# ---------------------------------------------------------------------------
+# All experiment settings are code-only. Change the version pins deliberately
+# when changing runtimes; the benchmark never installs tools automatically.
 CONFIG: dict[str, Any] = {
     "fixture": "pnpm-bench",
     "pm": "both",
-    "runs": 5,
-    "concurrency": DEFAULT_CONCURRENCY,
-    "prep_dir": None,
-    "allow_same_device": False,
+    "runs": 10,
+    "concurrency": 4,
+    "concurrent_jobs": [1],
+    "prep_dir": "/dev/shm",
     "npm_bin": "npm",
     "pnpm_bin": "pnpm",
+    "tool_versions": {"node": "v24.22.2", "npm": "11.19.1", "pnpm": "12.16.1"},
     "ignore_scripts": True,
-    "no_prewarm": False,
-    "warm_once": False,
     "keep_node_modules": False,
     "seed_only": False,
 }
@@ -164,41 +116,47 @@ def raise_walk_error(error: OSError) -> None:
     raise error
 
 
+def fsync_path(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def fsync_tree(path: Path) -> float:
-    """Fsync every file and directory under ``path``; return fsync seconds.
+    """Sync regular files and bottom-up directories without following links.
 
-    Opening a directory read-only and fsyncing the descriptor persists its
-    entries. Walking bottom-up means a directory is synced after the entries
-    it gained. The walk itself is not timed: only the fsync calls are, so
-    ``elapsed_s`` and ``sync_s`` stay additive.
+    The entire walk/open/fsync/close sequence is timed. Symlink entries are
+    persisted through their containing directories, not by syncing targets.
     """
+    started = time.monotonic()
     if not path.is_dir():
-        die(f"installed node_modules tree is missing: {path}")
-
-    directories: list[Path] = []
-    files: list[Path] = []
-    for dirpath, _dirnames, filenames in os.walk(path, followlinks=False, onerror=raise_walk_error):
-        directories.append(Path(dirpath))
+        die(f"installed project tree is missing: {path}")
+    for dirpath, _dirnames, filenames in os.walk(
+        path, topdown=False, followlinks=False, onerror=raise_walk_error
+    ):
+        directory = Path(dirpath)
         for filename in filenames:
-            files.append(Path(dirpath) / filename)
+            file_path = directory / filename
+            if stat.S_ISREG(file_path.lstat().st_mode):
+                fsync_path(file_path)
+        fsync_path(directory)
+    return time.monotonic() - started
 
-    elapsed = 0.0
 
-    def sync_path(item: Path) -> None:
-        nonlocal elapsed
-        descriptor = os.open(item, os.O_RDONLY)
-        try:
-            started = time.monotonic()
-            os.fsync(descriptor)
-            elapsed += time.monotonic() - started
-        finally:
-            os.close(descriptor)
-
-    for file_path in files:
-        sync_path(file_path)
-    for directory in reversed(directories):
-        sync_path(directory)
-    return elapsed
+def sync_prepared_project(project: Path, target: Path) -> None:
+    """Persist input files and every newly created ancestor before timing."""
+    project, target = project.resolve(), target.resolve()
+    if not project.is_relative_to(target):
+        die(f"project is outside the measured target: {project}")
+    fsync_tree(project)
+    ancestor = project.parent
+    while True:
+        fsync_path(ancestor)
+        if ancestor == target:
+            break
+        ancestor = ancestor.parent
 
 
 def warm_tree(path: Path) -> None:
@@ -218,58 +176,42 @@ def ignore_args(ignore_scripts: bool) -> list[str]:
     return ["--ignore-scripts"] if ignore_scripts else []
 
 
-def npm_fixture_args(args: argparse.Namespace) -> list[str]:
-    """Extra npm flags a fixture tree needs.
-
-    pnpm's own fixtures pin dependency versions whose peer ranges conflict
-    under npm's resolver (e.g. `eslint@9` against `@typescript-eslint/parser@7`
-    in the pnpm-bench fixture), so a fixture run has to resolve the same way
-    the seed did.
-    """
-    return ["--legacy-peer-deps"] if args.fixture else []
 
 
 def concurrency_env(manager: str, concurrency: int) -> dict[str, str]:
-    """Return environment pins that set ``manager`` to ``concurrency``.
-
-    ``concurrency`` of 0 keeps the tool's own defaults and returns no
-    overrides. The managers do not share a single knob, so one value is
-    mapped onto the ones that measurably matter; see the module docstring
-    and docs/bench-npm-install.md for the measurements behind this table.
-
-    Only knobs with a measured effect are set. Dropped on purpose:
-
-    * ``PNPM_MAX_WORKERS`` -- the pnpm 11 Node worker pool; pnpm 12's binary
-      does not read it at all.
-    * ``--network-concurrency`` / ``--child-concurrency`` -- these bound
-      download and lifecycle-script concurrency, which the offline timed
-      install barely uses; measured effect under 1%.
-    """
-    if concurrency < 1:
+    """Pool-width pins, not package fan-out or total process thread limits."""
+    if concurrency == 0:
         return {}
-
     if manager == "npm":
-        # npm has no install-wide limit: Arborist fans every pending package
-        # out to pacote at once. The libuv pool is what its async file system
-        # calls actually run on, so it is the only pin available.
         return {"UV_THREADPOOL_SIZE": str(concurrency)}
-
     return {
-        # Linux/Windows: rayon copies packages out of the store.
         "RAYON_NUM_THREADS": str(concurrency),
-        # macOS: a separate, smaller pool does the copying (default 4).
         "PNPM_MACOS_LINK_THREADS": str(concurrency),
     }
 
 
-def manager_env(manager: str, concurrency: int) -> dict[str, str] | None:
-    """Process environment for one install, or ``None`` to inherit unchanged."""
-    env = concurrency_env(manager, concurrency)
-    if not env:
-        return None
-    merged = os.environ.copy()
-    merged.update(env)
-    return merged
+def manager_env(manager: str, concurrency: int, sandbox: Path) -> dict[str, str]:
+    """Use private local HOME/TMP and explicit package manager configuration."""
+    env = os.environ.copy()
+    for name in list(env):
+        if name.lower().startswith("npm_config_") or name in {
+            "NODE_ENV", "NODE_OPTIONS", "UV_THREADPOOL_SIZE", "RAYON_NUM_THREADS",
+            "PNPM_MACOS_LINK_THREADS", "PNPM_MAX_WORKERS", "PNPM_WORKERS",
+        }:
+            del env[name]
+    env.update(concurrency_env(manager, concurrency))
+    env.update({
+        "HOME": str(ensure_dir(sandbox / "home")),
+        "TMPDIR": str(ensure_dir(sandbox / "tmp")),
+        "XDG_CACHE_HOME": str(ensure_dir(sandbox / "xdg")),
+        "XDG_CONFIG_HOME": str(ensure_dir(sandbox / "config")),
+        "XDG_DATA_HOME": str(ensure_dir(sandbox / "data")),
+        "NPM_CONFIG_USERCONFIG": str(sandbox / "user.npmrc"),
+        "NPM_CONFIG_GLOBALCONFIG": str(sandbox / "global.npmrc"),
+        "CI": "1",
+        "NO_UPDATE_NOTIFIER": "1",
+    })
+    return env
 
 
 def run_visible(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
@@ -337,7 +279,7 @@ def seed_npm_fixture(
 
     command = [
         npm_bin,
-        "install",
+        "ci",
         "--legacy-peer-deps",
         "--no-audit",
         "--no-fund",
@@ -345,13 +287,14 @@ def seed_npm_fixture(
         str(cache_dir),
         *ignore_args(ignore_scripts),
     ]
-    run_visible(command, seed_dir, env=manager_env("npm", concurrency))
+    run_visible(
+        command, seed_dir,
+        env=manager_env("npm", concurrency, seed_dir.parent / "npm-env"),
+    )
 
-    package_lock = seed_dir / "package-lock.json"
-    if not package_lock.is_file():
-        die("npm fixture seed did not create package-lock.json")
-    shutil.copy2(seed_dir / "package.json", templates_dir / "package.json")
-    shutil.copy2(package_lock, templates_dir / "package-lock.json")
+    if (seed_dir / "package-lock.json").read_bytes() != fixture_lockfile.read_bytes():
+        die("npm seed changed the committed lockfile")
+    copy_fixture_manifest(fixture_dir, templates_dir, "package-lock.json")
     remove_tree(seed_dir / "node_modules")
 
 
@@ -386,17 +329,13 @@ def seed_pnpm_fixture(
         "--reporter=append-only",
         *ignore_args(ignore_scripts),
     ]
-    env = manager_env("pnpm", concurrency)
-    if env is None:
-        env = os.environ.copy()
+    env = manager_env("pnpm", concurrency, seed_dir.parent / "pnpm-env")
     env["XDG_CACHE_HOME"] = str(cache_dir)
     run_visible(command, seed_dir, env=env)
 
-    template_dir.mkdir(parents=True, exist_ok=True)
-    for name in ("package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"):
-        source = seed_dir / name
-        if source.is_file():
-            shutil.copy2(source, template_dir / name)
+    if (seed_dir / "pnpm-lock.yaml").read_bytes() != (fixture_dir / "pnpm-lock.yaml").read_bytes():
+        die("pnpm seed changed the committed lockfile")
+    copy_fixture_manifest(fixture_dir, template_dir, "pnpm-lock.yaml")
     remove_tree(seed_dir / "node_modules")
 
 
@@ -455,473 +394,279 @@ def tree_metrics(node_modules: Path) -> dict[str, int]:
     return metrics
 
 
-def prepare_project(
-    root: Path,
-    manager: str,
-    run_number: int,
-    template_dir: Path,
-) -> Path:
-    # Same-filesystem mode keeps timed and seed projects as siblings.
-    # Cross-filesystem mode moves the seed projects to CONFIG['prep_dir'].
-    project = root / "work" / f"{manager}-run-{run_number}"
-    ensure_dir(project)
-    shutil.copy2(template_dir / "package.json", project / "package.json")
-    if manager == "npm":
-        shutil.copy2(template_dir / "package-lock.json", project / "package-lock.json")
-    else:
-        shutil.copy2(template_dir / "pnpm-lock.yaml", project / "pnpm-lock.yaml")
-        # A fixture workspace manifest carries settings the fixture needs
-        # (`supportedArchitectures`, `enableGlobalVirtualStore`). Its
-        # `storeDir` is overridden by the explicit --store-dir.
-        workspace_manifest = template_dir / "pnpm-workspace.yaml"
-        if workspace_manifest.is_file():
-            shutil.copy2(workspace_manifest, project / "pnpm-workspace.yaml")
-    remove_tree(project / "node_modules")
+def prepare_project(project: Path, manager: str, template_dir: Path) -> Path:
+    lockfile = "package-lock.json" if manager == "npm" else "pnpm-lock.yaml"
+    copy_fixture_manifest(template_dir, project, lockfile)
     return project
 
 
 def read_tail(path: Path, line_count: int = 20) -> str:
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return ""
-    return "\n".join(lines[-line_count:])
+    return "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-line_count:])
 
 
-def run_timed(
-    command: list[str],
-    cwd: Path,
-    log_path: Path,
-    env: dict[str, str] | None = None,
-) -> tuple[int, float, float, float]:
-    before = resource.getrusage(resource.RUSAGE_CHILDREN)
-    started = time.monotonic()
+def install_command(
+    manager: str, binary: str, source: Path, ignore_scripts: bool,
+) -> list[str]:
+    if manager == "npm":
+        return [
+            binary, "ci", "--offline", "--cache", str(source / "cache"),
+            "--legacy-peer-deps", "--no-audit", "--no-fund", "--no-update-notifier",
+            *ignore_args(ignore_scripts),
+        ]
+    return [
+        binary, "install", "--offline", "--frozen-lockfile",
+        "--store-dir", str(source / "store"), "--cache-dir", str(source / "cache"),
+        f"--package-import-method={PNPM_IMPORT_METHOD}",
+        "--config.enable-global-virtual-store=false", "--reporter=append-only",
+        *ignore_args(ignore_scripts),
+    ]
+
+
+def install_worker(
+    command: list[str], project: Path, log_path: Path, env: dict[str, str],
+    barrier: Any, connection: Any,
+) -> None:
+    """One Python process owns one child and its resource-usage counters."""
     try:
         with log_path.open("w", encoding="utf-8") as log_handle:
+            connection.send({"ready": True})
+            barrier.wait()
+            before = resource.getrusage(resource.RUSAGE_CHILDREN)
+            started = time.monotonic()
             result = subprocess.run(
-                command,
-                cwd=str(cwd),
-                env=env,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                check=False,
+                command, cwd=project, env=env, stdout=log_handle,
+                stderr=subprocess.STDOUT, check=False,
             )
-        status = result.returncode
-    except OSError as exc:
-        log_path.write_text(f"{exc}\n", encoding="utf-8")
-        status = 1
-    elapsed = time.monotonic() - started
-    after = resource.getrusage(resource.RUSAGE_CHILDREN)
-    user = max(0.0, after.ru_utime - before.ru_utime)
-    system = max(0.0, after.ru_stime - before.ru_stime)
-    return status, elapsed, user, system
+            exited = time.monotonic()
+            if result.returncode != 0:
+                die(f"install exited {result.returncode}; {log_path}\n{read_tail(log_path)}")
+            fsync_tree(project)
+            durable = time.monotonic()
+            after = resource.getrusage(resource.RUSAGE_CHILDREN)
+        connection.send({
+            "started": started,
+            "install_s": exited - started,
+            "flush_s": durable - exited,
+            "durable_s": durable - started,
+            "user_s": after.ru_utime - before.ru_utime,
+            "sys_s": after.ru_stime - before.ru_stime,
+        })
+    except Exception as exc:
+        connection.send({"error": f"{type(exc).__name__}: {exc}"})
+    finally:
+        connection.close()
 
 
-def finalize_run(
-    project: Path, keep_node_modules: bool
-) -> tuple[float, dict[str, int]]:
-    """Flush the tree, measure it while it exists, then drop it."""
-    node_modules = project / "node_modules"
-    sync_s = fsync_tree(node_modules)
-    metrics = tree_metrics(node_modules)
-    if not keep_node_modules:
-        remove_tree(node_modules)
-    sync_filesystem()
-    return sync_s, metrics
+def run_workers(jobs: list[dict[str, Any]]) -> list[dict[str, int | float]]:
+    """Release ready workers together; retain actual start offsets."""
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(len(jobs) + 1)
+    processes = []
+    connections = []
+    try:
+        for job in jobs:
+            receiver, sender = context.Pipe(duplex=False)
+            process = context.Process(
+                target=install_worker,
+                args=(job["command"], job["project"], job["log"], job["env"], barrier, sender),
+            )
+            process.start()
+            sender.close()
+            processes.append(process)
+            connections.append(receiver)
+        for connection in connections:
+            ready = connection.recv()
+            if "error" in ready:
+                die(ready["error"])
+        batch_started = time.monotonic()
+        barrier.wait()
+        tasks = []
+        for task_number, connection in enumerate(connections, 1):
+            result = connection.recv()
+            if "error" in result:
+                die(result["error"])
+            result["start_offset_s"] = result.pop("started") - batch_started
+            result["task"] = task_number
+            tasks.append(result)
+        for process in processes:
+            process.join()
+            if process.exitcode != 0:
+                die(f"install worker exited {process.exitcode}")
+        return tasks
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join()
+        for connection in connections:
+            connection.close()
 
 
-def make_result(
-    elapsed: float,
-    sync_s: float,
-    user: float,
-    system: float,
-    metrics: dict[str, int],
+def batch_metrics(
+    tasks: list[dict[str, int | float]], trees: list[dict[str, int]],
 ) -> dict[str, int | float]:
-    elapsed_for_rate = elapsed if elapsed > 0 else 0.0
-    files_per_s = metrics["files"] / elapsed_for_rate if elapsed_for_rate else 0.0
-    logical_mib_s = (
-        (metrics["logical_bytes"] / 1048576.0) / elapsed_for_rate
-        if elapsed_for_rate
-        else 0.0
-    )
-    allocated_mib_s = (
-        (metrics["allocated_bytes"] / 1048576.0) / elapsed_for_rate
-        if elapsed_for_rate
-        else 0.0
-    )
-    sync_for_rate = sync_s if sync_s > 0 else 0.0
-    sync_files_per_s = (
-        metrics["files"] / sync_for_rate if sync_for_rate else 0.0
-    )
+    count = len(tasks)
+    install_s = max(task["start_offset_s"] + task["install_s"] for task in tasks)
+    durable_s = max(task["start_offset_s"] + task["durable_s"] for task in tasks)
+    metrics = {
+        f"{phase}_mean_s": sum(task[f"{phase}_s"] for task in tasks) / count
+        for phase in ("install", "flush", "durable")
+    }
+    metrics.update({
+        "batch_install_s": install_s,
+        "batch_durable_s": durable_s,
+        "installs_per_s": count / install_s,
+        "durable_installs_per_s": count / durable_s,
+        "user_s": sum(task["user_s"] for task in tasks),
+        "sys_s": sum(task["sys_s"] for task in tasks),
+    })
     return {
-        "elapsed_s": round(elapsed, 6),
-        "sync_s": round(sync_s, 6),
-        "user_s": round(user, 6),
-        "sys_s": round(system, 6),
-        **metrics,
-        "files_per_s": round(files_per_s, 3),
-        "sync_files_per_s": round(sync_files_per_s, 3),
-        "logical_mib_per_s": round(logical_mib_s, 3),
-        "allocated_mib_per_s": round(allocated_mib_s, 3),
+        **{key: round(value, 6) for key, value in metrics.items()},
+        **{key: sum(tree[key] for tree in trees) for key in trees[0]},
     }
 
 
-def run_npm_once(
-    args: argparse.Namespace,
-    root: Path,
-    results_dir: Path,
-    npm_bin: str,
-    cache_dir: Path,
-    template_dir: Path,
-    run_number: int,
-) -> dict[str, int | float]:
-    project = prepare_project(root, "npm", run_number, template_dir)
-    log_path = results_dir / "logs" / f"npm-run-{run_number}.log"
-    if args.warm_each_run:
-        warm_tree(cache_dir)
-
-    command = [
-        npm_bin,
-        "install",
-        "--offline",
-        "--cache",
-        str(cache_dir),
-        "--no-audit",
-        "--no-fund",
-        "--no-update-notifier",
-        *(npm_fixture_args(args)),
-        *ignore_args(args.ignore_scripts),
-    ]
-    log(f"npm run {run_number}/{args.runs} on {project}")
-    status, elapsed, user, system = run_timed(
-        command, project, log_path, env=manager_env("npm", args.concurrency)
-    )
-    if status != 0:
-        die(f"npm run {run_number} failed (exit {status}); {log_path}\n{read_tail(log_path)}")
-    sync_s, metrics = finalize_run(project, args.keep_node_modules)
-    row = make_result(
-        elapsed,
-        sync_s,
-        user,
-        system,
-        metrics,
-    )
-    return row
-
-
-def run_pnpm_once(
-    args: argparse.Namespace,
-    root: Path,
-    results_dir: Path,
-    pnpm_bin: str,
-    store_dir: Path,
-    pnpm_cache: Path,
-    template_dir: Path,
-    run_number: int,
-) -> dict[str, int | float]:
-    project = prepare_project(root, "pnpm", run_number, template_dir)
-    log_path = results_dir / "logs" / f"pnpm-run-{run_number}.log"
-    if args.warm_each_run:
-        warm_tree(store_dir)
-        warm_tree(pnpm_cache)
-
-    env = manager_env("pnpm", args.concurrency)
-    if env is None:
-        env = os.environ.copy()
-    env["XDG_CACHE_HOME"] = str(pnpm_cache)
-    command = [
-        pnpm_bin,
-        "install",
-        "--offline",
-        "--store-dir",
-        str(store_dir),
-        "--cache-dir",
-        str(pnpm_cache),
-        f"--package-import-method={PNPM_IMPORT_METHOD}",
-        "--config.enable-global-virtual-store=false",
-        "--frozen-lockfile",
-        "--reporter=append-only",
-        *ignore_args(args.ignore_scripts),
-    ]
-    log(f"pnpm run {run_number}/{args.runs} on {project}")
-    status, elapsed, user, system = run_timed(command, project, log_path, env=env)
-    if status != 0:
-        die(f"pnpm run {run_number} failed (exit {status}); {log_path}\n{read_tail(log_path)}")
-    sync_s, metrics = finalize_run(project, args.keep_node_modules)
-    row = make_result(
-        elapsed,
-        sync_s,
-        user,
-        system,
-        metrics,
-    )
-    return row
+def run_batch(
+    ctx: RunContext, args: argparse.Namespace, manager: str, binary: str,
+    source: Path, template: Path, prep: Path, count: int, repeat: int,
+) -> tuple[dict[str, int | float], list[dict[str, int | float]]]:
+    name = f"{manager}-c{count}-r{repeat}"
+    source_batch = prep / "batches" / name
+    project_batch = ctx.work_dir / name
+    jobs = []
+    for task_number in range(1, count + 1):
+        sandbox = source_batch / f"task-{task_number}"
+        task_source = sandbox / "source"
+        shutil.copytree(source, task_source)
+        project = prepare_project(project_batch / f"task-{task_number}", manager, template)
+        env = manager_env(manager, args.concurrency, sandbox)
+        if manager == "pnpm":
+            env["XDG_CACHE_HOME"] = str(task_source / "cache")
+        sync_prepared_project(project, ctx.target.path.resolve())
+        jobs.append({
+            "project": project, "env": env,
+            "command": install_command(manager, binary, task_source, args.ignore_scripts),
+            "log": ctx.result_dir / "logs" / f"{name}-task-{task_number}.log",
+        })
+    # No source writes, metrics or deletions overlap timed workers.
+    sync_filesystem()
+    for task_number in range(1, count + 1):
+        warm_tree(source_batch / f"task-{task_number}" / "source")
+    log(f"{manager}: {count} projects, batch {repeat}/{args.runs}")
+    tasks = run_workers(jobs)
+    trees = [tree_metrics(job["project"] / "node_modules") for job in jobs]
+    metrics = batch_metrics(tasks, trees)
+    if not args.keep_node_modules:
+        remove_tree(project_batch)
+    remove_tree(source_batch)
+    sync_filesystem()
+    return metrics, tasks
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Benchmark warm-cache offline npm/pnpm installs on a target "
-            "filesystem. No workload flags are exposed; edit CONFIG at the "
-            "top of the module."
-        )
+        description="Offline installation batches; edit CONFIG for experiment settings."
     )
-    parsed = parser.parse_args(argv)
-    namespace = argparse.Namespace(**CONFIG, **vars(parsed))
-    namespace.warm_each_run = (
-        not namespace.no_prewarm and not namespace.warm_once
-    )
+    namespace = argparse.Namespace(**CONFIG, **vars(parser.parse_args(argv)))
     if namespace.fixture not in FIXTURES:
-        raise BenchError(
-            f"unknown fixture {namespace.fixture!r}; choose from: "
-            + ", ".join(sorted(FIXTURES))
-        )
+        die(f"unknown fixture {namespace.fixture!r}; choose from: {', '.join(FIXTURES)}")
     if namespace.pm not in ("npm", "pnpm", "both"):
-        raise BenchError("pm must be 'npm', 'pnpm' or 'both'")
-    if namespace.runs < 1:
-        raise BenchError("runs must be greater than zero")
-    if namespace.concurrency < 0:
-        raise BenchError("concurrency must be zero or greater")
+        die("pm must be npm, pnpm or both")
+    if namespace.runs < 1 or namespace.concurrency < 0:
+        die("runs must be positive and concurrency must be nonnegative")
+    if not namespace.concurrent_jobs or any(count < 1 for count in namespace.concurrent_jobs):
+        die("concurrent_jobs must contain positive batch sizes")
+    if len(set(namespace.concurrent_jobs)) != len(namespace.concurrent_jobs):
+        die("concurrent_jobs must not contain duplicate batch sizes")
+    if not namespace.prep_dir:
+        die("prep_dir must name an external local filesystem")
     return namespace
 
 
-def device_of(path: Path) -> int:
-    return path.stat().st_dev
+def check_placement(target: Path, prep: Path) -> tuple[str, str]:
+    """Different device IDs alone do not exclude cross-mount copy offload."""
+    target_type, prep_type = fstype(str(target)), fstype(str(prep))
+    if prep_type not in LOCAL_PREP_FILESYSTEMS:
+        die(f"prep_dir must use a local filesystem, not {prep_type}: {prep}")
+    if target.stat().st_dev == prep.stat().st_dev or target_type == prep_type:
+        die("prep_dir must use a different device and filesystem type from the target")
+    log(f"placement: external local {prep_type} -> {target_type}")
+    return target_type, prep_type
 
 
-
-
-def check_placement(
-    target_dir: Path,
-    prep_dir: Path | None,
-    allow_same_device: bool,
-) -> str:
-    """Validate the requested cache placement against actual device IDs."""
-    target_device = device_of(target_dir)
-    if prep_dir is None:
-        log("placement: same filesystem (prep_dir is None)")
-        return "same"
-
-    prep_device = device_of(prep_dir)
-    if prep_device == target_device:
-        if not allow_same_device:
-            die(
-                f"prep_dir {prep_dir} is on the same filesystem as target "
-                f"{target_dir} (both device {target_device}); the filesystem "
-                "can then hardlink or clone package contents instead of "
-                "writing them. Point CONFIG['prep_dir'] at another filesystem, "
-                "or set CONFIG['allow_same_device'] to run anyway."
-            )
-        log(
-            "warning: prep_dir shares the target filesystem; cache reads keep "
-            "competing with the timed writes"
-        )
-        return "cross-same-device"
-
-    log(f"placement: cross filesystem ({target_device} -> {prep_device})")
-    return "cross"
-
-
-def same_device_of(first: Path, second: Path) -> bool:
-    try:
-        return device_of(first) == device_of(second)
-    except OSError:
-        return False
-
-
-def make_layout(
-    root: Path, prep_dir: Path | None
-) -> dict[str, object]:
-    """Build the cache/store/template/work layout for one placement mode.
-
-    In cross-filesystem mode everything the timed install only reads lives on
-    ``prep_dir``; only each run's ``node_modules`` is written to ``root``.
-    """
-    if prep_dir is None:
-        cache_root = root / "cache"
-        return {
-            "npm_cache": ensure_dir(cache_root / "npm"),
-            "pnpm_store": ensure_dir(cache_root / "pnpm"),
-            "pnpm_cache": ensure_dir(cache_root / "pnpm-xdg"),
-            "npm_template": ensure_dir(root / "templates" / "npm"),
-            "pnpm_template": ensure_dir(root / "templates" / "pnpm"),
-            "work_root": ensure_dir(root / "work"),
-        }
-
-    npm_cache = ensure_dir(prep_dir / "cache" / "npm")
-    # The pnpm store and its XDG cache must share a filesystem, so they are
-    # always built as siblings under prep_dir.
-    pnpm_store = ensure_dir(prep_dir / "cache" / "pnpm")
-    pnpm_cache = ensure_dir(prep_dir / "cache" / "pnpm-xdg")
-    if not same_device_of(pnpm_store, pnpm_cache):
-        die(
-            f"pnpm store {pnpm_store} and pnpm XDG cache {pnpm_cache} are on "
-            "different filesystems; they must share one"
-        )
-    return {
-        "npm_cache": npm_cache,
-        "pnpm_store": pnpm_store,
-        "pnpm_cache": pnpm_cache,
-        "npm_template": ensure_dir(prep_dir / "templates" / "npm"),
-        "pnpm_template": ensure_dir(prep_dir / "templates" / "pnpm"),
-        "work_root": ensure_dir(prep_dir / "work"),
-    }
-
-
-def warn_if_pnpm_split(npm_cache: Path, pnpm_store: Path) -> None:
-    if same_device_of(npm_cache, pnpm_store):
-        return
-    log(
-        "note: the npm cache and the pnpm store are on different filesystems; "
-        "each manager is then measured with its own cache placement"
-    )
+def checked_tools(args: argparse.Namespace, managers: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+    binaries = {manager: resolve_tool(getattr(args, f"{manager}_bin"), manager) for manager in managers}
+    versions = {manager: command_version(binary) for manager, binary in binaries.items()}
+    versions["node"] = command_version(resolve_tool("node", "node"))
+    for tool, version in versions.items():
+        if version != args.tool_versions[tool]:
+            die(f"{tool} version {version} does not match pinned {args.tool_versions[tool]}")
+    return binaries, versions
 
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
-    target_dir = ctx.target.path
-    prep_dir = None
-    if args.prep_dir:
-        prep_root = Path(args.prep_dir).expanduser().resolve()
-        if not prep_root.is_dir():
-            die(f"preparation directory does not exist: {prep_root}; mount it first")
-        prep_dir = prep_root / "agent-fs-bench" / "npm-install" / ctx.run_id / ctx.target.name
-        if not prep_dir.resolve().is_relative_to(prep_root):
-            die(f"preparation directory escapes its root: {prep_dir}")
-        prep_dir.mkdir(parents=True, exist_ok=False)
-    placement = check_placement(target_dir, prep_dir, args.allow_same_device)
-    root = ctx.work_dir
-    results_dir = ctx.result_dir
-
-    layout = make_layout(root, prep_dir)
-    npm_cache = layout["npm_cache"]
-    pnpm_store = layout["pnpm_store"]
-    pnpm_cache = layout["pnpm_cache"]
-    npm_template = layout["npm_template"]
-    pnpm_template = layout["pnpm_template"]
-    work_root = layout["work_root"]
-    warn_if_pnpm_split(npm_cache, pnpm_store)
-    seed_npm_dir = work_root / "seed-npm"
-    seed_pnpm_dir = work_root / "seed-pnpm"
-    # Reuse caches, not stale manifests/locks/workspace settings from another tree.
-    for directory in (npm_template, pnpm_template, seed_npm_dir, seed_pnpm_dir):
-        remove_tree(directory)
-        ensure_dir(directory)
-    ensure_dir(results_dir / "logs")
-
-    fixture_dir = fixture_dir_for(args.fixture)
-    required_locks = []
-    if args.pm in ("npm", "both"):
-        required_locks.append("package-lock.json")
-    if args.pm in ("pnpm", "both"):
-        required_locks.append("pnpm-lock.yaml")
-    for name in required_locks:
-        if not (fixture_dir / name).is_file():
-            die(f"fixture {args.fixture} is missing {name}: {fixture_dir}")
-
-    npm_bin = resolve_tool(args.npm_bin, "npm") if args.pm in ("npm", "both") else ""
-    pnpm_bin = resolve_tool(args.pnpm_bin, "pnpm") if args.pm in ("pnpm", "both") else ""
-    versions = {}
-    if npm_bin:
-        versions["npm"] = command_version(npm_bin)
-    if pnpm_bin:
-        versions["pnpm"] = command_version(pnpm_bin)
-    versions["node"] = command_version(resolve_tool("node", "node"))
-
-    if args.pm in ("npm", "both"):
-        seed_npm_fixture(
-            npm_bin,
-            npm_cache,
-            seed_npm_dir,
-            npm_template,
-            fixture_dir,
-            args.ignore_scripts,
-            args.concurrency,
-        )
-    if args.pm in ("pnpm", "both"):
-        seed_pnpm_fixture(
-            pnpm_bin,
-            pnpm_store,
-            pnpm_cache,
-            seed_pnpm_dir,
-            pnpm_template,
-            fixture_dir,
-            args.ignore_scripts,
-            args.concurrency,
-        )
-
-    seed_input_sha256 = {}
-    for manager, template in (("npm", npm_template), ("pnpm", pnpm_template)):
-        if args.pm not in (manager, "both"):
-            continue
-        lock_name = "package-lock.json" if manager == "npm" else "pnpm-lock.yaml"
-        seed_input_sha256[manager] = {
+    if not Path("/proc/self/mountinfo").is_file():
+        die("npm-install requires Linux; run it inside the benchmark client or Colima")
+    target = ctx.target.path.resolve()
+    prep_root = Path(args.prep_dir).expanduser().resolve()
+    if not prep_root.is_dir():
+        die(f"preparation directory does not exist: {prep_root}")
+    target_type, prep_type = check_placement(target, prep_root)
+    managers = [manager for manager in ("npm", "pnpm") if args.pm in (manager, "both")]
+    binaries, versions = checked_tools(args, managers)
+    prep = prep_root / "agent-fs-bench" / "npm-install" / ctx.run_id / ctx.target.name
+    prep.mkdir(parents=True, exist_ok=False)
+    ensure_dir(ctx.result_dir / "logs")
+    fixture = fixture_dir_for(args.fixture)
+    sources, templates, fingerprints = {}, {}, {}
+    for manager in managers:
+        source = ensure_dir(prep / "sources" / manager)
+        template = ensure_dir(prep / "templates" / manager)
+        seed = ensure_dir(prep / "seeds" / manager)
+        if manager == "npm":
+            seed_npm_fixture(
+                binaries[manager], ensure_dir(source / "cache"), seed, template,
+                fixture, args.ignore_scripts, args.concurrency,
+            )
+        else:
+            seed_pnpm_fixture(
+                binaries[manager], ensure_dir(source / "store"), ensure_dir(source / "cache"),
+                seed, template, fixture, args.ignore_scripts, args.concurrency,
+            )
+        lockfile = "package-lock.json" if manager == "npm" else "pnpm-lock.yaml"
+        fingerprints[manager] = {
             name: hashlib.sha256((template / name).read_bytes()).hexdigest()
-            for name in ("package.json", lock_name, "pnpm-workspace.yaml")
+            for name in ("package.json", lockfile, "pnpm-workspace.yaml")
             if (template / name).is_file()
         }
-    if args.no_prewarm:
-        cache_state = "unwarmed-cache-cold-node_modules"
-    elif args.warm_once:
-        cache_state = "warm-once-cache-cold-node_modules"
-    else:
-        cache_state = "warm-cache-cold-node_modules"
-    # Keep input fingerprints, not manifest text or preparation diagnostics.
-    ctx.parameters = {
-        "fixture": args.fixture,
-        "pm": args.pm,
-        "runs": args.runs,
-        "concurrency": args.concurrency,
-        "placement": placement,
-        "ignore_scripts": args.ignore_scripts,
-        "pnpm_import_method": PNPM_IMPORT_METHOD,
-        "pnpm_global_virtual_store": False,
-        "cache_state": cache_state,
-        "tool_versions": versions,
-        "seed_input_sha256": seed_input_sha256,
-    }
-
-    if not args.no_prewarm:
-        if args.pm in ("npm", "both"):
-            warm_tree(npm_cache)
-        if args.pm in ("pnpm", "both"):
-            warm_tree(pnpm_store)
-            warm_tree(pnpm_cache)
-
-    log("flushing seed/cache writes before timed runs")
+        sources[manager], templates[manager] = source, template
     sync_filesystem()
-
     if args.seed_only:
-        log("seed complete; timed runs skipped (seed_only)")
-        log(f"root: {root}")
+        log(f"seed complete; sources retained at {prep}")
         return
-
-    managers = []
-    if args.pm in ("npm", "both"):
-        managers.append("npm")
-    if args.pm in ("pnpm", "both"):
-        managers.append("pnpm")
-
     for manager in managers:
-        for run_number in range(1, args.runs + 1):
-            if manager == "npm":
-                row = run_npm_once(
-                    args,
-                    root,
-                    results_dir,
-                    npm_bin,
-                    npm_cache,
-                    npm_template,
-                    run_number,
+        for count in args.concurrent_jobs:
+            ctx.parameters = {
+                "fixture": args.fixture,
+                "concurrent_jobs": count,
+                "concurrency": args.concurrency,
+                "placement": "external-local",
+                "prep_fstype": prep_type,
+                "ignore_scripts": args.ignore_scripts,
+                "pnpm_import_method": PNPM_IMPORT_METHOD,
+                "pnpm_global_virtual_store": False,
+                "cache_state": "warm-source-empty-node_modules",
+                "tool_versions": {tool: versions[tool] for tool in ("node", manager)},
+                "seed_input_sha256": {manager: fingerprints[manager]},
+                "cpu_count": len(os.sched_getaffinity(0)),
+            }
+            for repeat in range(1, args.runs + 1):
+                metrics, tasks = run_batch(
+                    ctx, args, manager, binaries[manager], sources[manager],
+                    templates[manager], prep, count, repeat,
                 )
-            else:
-                row = run_pnpm_once(
-                    args,
-                    root,
-                    results_dir,
-                    pnpm_bin,
-                    pnpm_store,
-                    pnpm_cache,
-                    pnpm_template,
-                    run_number,
+                ctx.emit(
+                    f"{manager}/c{count}", metrics, repeat=repeat,
+                    details={"tasks": tasks, "target_fstype": target_type},
                 )
-            ctx.emit(manager, row, repeat=run_number)
+    remove_tree(prep)

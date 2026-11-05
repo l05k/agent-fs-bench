@@ -8,7 +8,8 @@ import unittest
 from unittest import mock
 
 from agent_fs_bench.benchmarks import clone
-from agent_fs_bench.analysis import SUMMARY_SQL, connect, export_summary
+from agent_fs_bench.analysis import (SUMMARY_SQL, connect, export_summary,
+                                     main as analysis_main)
 from agent_fs_bench.cli import run_benchmark
 from agent_fs_bench.results import RunContext
 from agent_fs_bench.targets import Target, load_targets
@@ -103,39 +104,46 @@ class PortableResultsTests(unittest.TestCase):
                      repeat=repeat,
                      details={'samples_ms': [1.0, 3.0], 'nested': {'mode': 'FULL'}})
 
-    def test_global_summary_retains_runs_and_portable_raw_samples(self):
-        # The only transferred artifact is JSONL; no target, log, or source paths exist.
+    def summary_rows(self, connection):
+        cursor = connection.execute(SUMMARY_SQL)
+        columns = [column[0] for column in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def test_summary_canonicalizes_parameters_and_separates_configurations(self):
+        # Parameter key order, including nested objects, must not create a new group.
         output = io.StringIO()
-        self.emit(output, {'fsync': True, 'size': 4}, 1)
-        self.emit(output, {'size': 4, 'fsync': True}, 2)
-        self.emit(output, {'size': 8, 'fsync': True}, run_id='run-a', value=6.0,
-                  source='another-source')
+        self.emit(output, {'fsync': True, 'nested': {'b': 2, 'a': 1}, 'size': 4}, 1, value=2.0)
+        self.emit(output, {'size': 4, 'nested': {'a': 1, 'b': 2}, 'fsync': True}, 2, value=4.0)
+        self.emit(output, {'fsync': True, 'nested': {'b': 2, 'a': 1}, 'size': 8},
+                  run_id='run-a', value=6.0)
+        self.emit(output, {'fsync': True, 'nested': {'b': 2, 'a': 1}, 'size': 4},
+                  run_id='run-a', source='other-source', value=8.0)
+        canonical = '{"fsync":true,"nested":{"a":1,"b":2},"size":4}'
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'export.jsonl'
             path.write_text(output.getvalue())
             connection = connect([str(path)])
             self.addCleanup(connection.close)
-            groups = connection.execute(SUMMARY_SQL).fetchall()
-            self.assertEqual(len(groups), 1)
-            self.assertEqual(groups[0][:9], ('fs-a', 'write', 'latency_ms', 3,
-                                            4.0, 4.0, 2.0, 6.0, 2.0))
-            self.assertEqual(groups[0][9:], ('example', 'run-a;run-b'))
-            samples = connection.execute(
-                "SELECT details->'samples_ms' FROM measurements LIMIT 1").fetchone()[0]
-            self.assertEqual(json.loads(samples), [1.0, 3.0])
-            database = Path(directory) / 'analysis.duckdb'
-            archived = connect([str(path)], database)
-            archived.close()
+            rows = self.summary_rows(connection)
             summary = Path(directory) / 'summary.csv'
-            self.assertEqual(export_summary(path, summary), 1)
+            self.assertEqual(export_summary(path, summary), 3)
             with summary.open(newline='') as handle:
                 exported = list(csv.DictReader(handle))
-            self.assertEqual(exported[0]['run_ids'], 'run-a;run-b')
-            self.assertEqual(int(exported[0]['samples']), 3)
-            path.unlink()
-            import duckdb
-            with duckdb.connect(str(database)) as reopened:
-                self.assertEqual(reopened.execute('SELECT sum(value) FROM metrics').fetchone()[0], 12.0)
+        groups = {(row['parameters'], row['source_sha256']): row for row in rows}
+        self.assertEqual(set(groups), {
+            (canonical, 'source'),
+            ('{"fsync":true,"nested":{"a":1,"b":2},"size":8}', 'source'),
+            (canonical, 'other-source'),
+        })
+        combined = groups[(canonical, 'source')]
+        self.assertEqual(
+            (combined['samples'], combined['mean'], combined['median'],
+             combined['minimum'], combined['maximum'], combined['run_ids']),
+            (2, 3.0, 3.0, 2.0, 4.0, 'run-b'))
+        self.assertAlmostEqual(combined['stddev'], 2 ** 0.5)
+        self.assertEqual({(row['parameters'], row['source_sha256']) for row in exported},
+                         set(groups))
+        self.assertEqual(sum(int(row['samples']) for row in exported), 4)
 
     def test_global_summary_keeps_benchmarks_targets_cases_and_metrics_separate(self):
         output = io.StringIO()
@@ -151,8 +159,9 @@ class PortableResultsTests(unittest.TestCase):
             path.write_text(output.getvalue())
             connection = connect([str(path), str(Path(directory) / '*.jsonl')])
             self.addCleanup(connection.close)
-            rows = connection.execute(SUMMARY_SQL).fetchall()
-        observed = {(row[9], row[0], row[1], row[2]): (row[3], row[4]) for row in rows}
+            rows = self.summary_rows(connection)
+        observed = {(row['benchmark'], row['target'], row['case'], row['metric']):
+                    (row['samples'], row['mean']) for row in rows}
         self.assertEqual(observed, {
             ('example', 'fs-a', 'write', 'latency_ms'): (1, 2.0),
             ('other', 'fs-a', 'write', 'latency_ms'): (1, 7.0),
@@ -160,6 +169,28 @@ class PortableResultsTests(unittest.TestCase):
             ('example', 'fs-a', 'read', 'latency_ms'): (1, 13.0),
             ('example', 'fs-a', 'write', 'throughput_mib_s'): (1, 17.0),
         })
+
+    def test_portable_archive_preserves_identity_and_raw_samples(self):
+        output = io.StringIO()
+        self.emit(output, {'fsync': True, 'size': 4}, 1, value=2.0)
+        self.emit(output, {'size': 8, 'fsync': True}, 2, value=6.0, run_id='run-a')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'export.jsonl'
+            path.write_text(output.getvalue())
+            database = Path(directory) / 'analysis.duckdb'
+            connect([str(path)], database).close()
+            path.unlink()
+            import duckdb
+            with duckdb.connect(str(database)) as reopened:
+                self.assertEqual(
+                    reopened.execute('SELECT sum(value) FROM metrics').fetchone()[0], 8.0)
+                rows = self.summary_rows(reopened)
+                samples = reopened.execute(
+                    "SELECT details->'samples_ms' FROM measurements LIMIT 1").fetchone()[0]
+                self.assertEqual(json.loads(samples), [1.0, 3.0])
+        self.assertEqual({row['parameters'] for row in rows},
+                         {'{"fsync":true,"size":4}', '{"fsync":true,"size":8}'})
+        self.assertEqual(sum(row['samples'] for row in rows), 2)
 
     def test_nonfinite_measurement_does_not_corrupt_jsonl(self):
         output = io.StringIO()
@@ -171,6 +202,88 @@ class PortableResultsTests(unittest.TestCase):
             context.emit('write', {'latency_ms': float('nan')})
         self.assertEqual(output.getvalue(), before)
 
+
+class PlotSelectionTests(unittest.TestCase):
+    """Check plot data selection without rendering real graphics."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.output = io.StringIO()
+
+    def emit(self, target, case, parameters, *, value, source='source',
+             run_id='run-b', repeat=1):
+        context = RunContext('bench', run_id, Target(target, Path('/mnt') / target),
+                             Path('/work'), Path('/results'), parameters, source,
+                             self.output)
+        context.emit(case, {'latency_ms': value}, repeat=repeat)
+
+    def arguments(self, *extra):
+        path = self.root / 'data.jsonl'
+        path.write_text(self.output.getvalue())
+        return [str(path), '--benchmark', 'bench', '--metric', 'latency_ms',
+                '--output', str(self.root / 'figure'), *extra]
+
+    def render(self, *extra):
+        with mock.patch('agent_fs_bench.figure.render') as render:
+            self.assertEqual(analysis_main('plot', self.arguments(*extra)), 0)
+        return render.call_args.args[0]
+
+    def test_rejects_mixed_identity_across_targets_in_one_case(self):
+        self.emit('fs-a', 'c1', {'size': 4}, value=1.0)
+        self.emit('fs-b', 'c1', {'size': 8}, value=2.0)
+        with mock.patch('agent_fs_bench.figure.render') as render:
+            with self.assertRaisesRegex(ValueError, 'mixes 2 configurations') as caught:
+                analysis_main('plot', self.arguments())
+        render.assert_not_called()
+        message = str(caught.exception)
+        self.assertIn('--parameters', message)
+        self.assertIn('--source-sha256', message)
+        self.assertIn('"size":4', message)
+        self.assertIn('"size":8', message)
+
+    def test_parameters_selector_chooses_one_configuration(self):
+        self.emit('fs-a', 'c1', {'size': 4, 'fsync': True}, value=1.0)
+        self.emit('fs-b', 'c1', {'fsync': True, 'size': 8}, value=2.0)
+        self.emit('fs-b', 'c1', {'fsync': True, 'size': 4}, value=3.0, run_id='run-a')
+        data = self.render('--parameters', '{"fsync": true, "size": 4}')
+        self.assertEqual(data['targets'], ['fs-a', 'fs-b'])
+        self.assertEqual(data['samples'],
+                         {'fs-a': {'c1': [1.0]}, 'fs-b': {'c1': [3.0]}})
+
+    def test_source_selector_separates_equal_parameters(self):
+        self.emit('fs-a', 'c1', {'size': 4}, value=1.0, source='source-a')
+        self.emit('fs-b', 'c1', {'size': 4}, value=2.0, source='source-b')
+        with mock.patch('agent_fs_bench.figure.render') as render:
+            with self.assertRaisesRegex(ValueError, 'mixes 2 configurations'):
+                analysis_main('plot', self.arguments())
+        render.assert_not_called()
+        data = self.render('--source-sha256', 'source-b')
+        self.assertEqual(data['targets'], ['fs-b'])
+        self.assertEqual(data['samples'], {'fs-b': {'c1': [2.0]}})
+
+    def test_target_and_case_filters_run_before_identity_check(self):
+        self.emit('fs-a', 'c1', {'size': 4}, value=1.0)
+        self.emit('fs-b', 'c1', {'size': 8}, value=2.0)
+        self.emit('fs-a', 'c2', {'size': 8}, value=3.0)
+        self.emit('fs-b', 'c2', {'size': 8}, value=4.0)
+        self.assertEqual(self.render('--targets', 'fs-a')['samples'],
+                         {'fs-a': {'c1': [1.0], 'c2': [3.0]}})
+        self.assertEqual(self.render('--cases', 'c2')['samples'],
+                         {'fs-a': {'c2': [3.0]}, 'fs-b': {'c2': [4.0]}})
+
+    def test_distinct_configurations_in_distinct_cases_are_plotted(self):
+        self.emit('fs-a', 'c1', {'size': 4}, value=1.0)
+        self.emit('fs-a', 'c2', {'size': 8}, value=2.0)
+        data = self.render()
+        self.assertEqual(data['cases'], ['c1', 'c2'])
+        self.assertEqual(data['samples'], {'fs-a': {'c1': [1.0], 'c2': [2.0]}})
+
+    def test_same_identity_aggregates_across_runs(self):
+        self.emit('fs-a', 'c1', {'size': 4}, value=2.0, run_id='run-b')
+        self.emit('fs-a', 'c1', {'size': 4}, value=1.0, run_id='run-a')
+        self.assertEqual(self.render()['samples'], {'fs-a': {'c1': [1.0, 2.0]}})
 
 class SummaryRunTests(unittest.TestCase):
     """Exercise real tree copies and their derived CSV lifecycle."""
