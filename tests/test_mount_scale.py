@@ -1,11 +1,14 @@
 """Consumer-visible mount topology invariants; no privileged mounts required."""
 
+import os
 from pathlib import Path
+import signal
+import sys
 import tempfile
 import unittest
 
 from agent_fs_bench.benchmarks.mount_scale_mdtest import Mdtest
-from agent_fs_bench.benchmarks.mount_scale_mounts import Layout, Profile
+from agent_fs_bench.benchmarks.mount_scale_mounts import Layout, Profile, _run
 
 
 class MountTopologyTests(unittest.TestCase):
@@ -21,7 +24,8 @@ class MountTopologyTests(unittest.TestCase):
             path.mkdir()
         profile = Profile(topology, admin, ('mount', '{subdir}', '{mountpoint}'),
                           ('mount', '{source}', '{mountpoint}'), ('umount', '{mountpoint}'))
-        return Layout(profile, staging, private, shared, agents)
+        return Layout(profile, staging, private, shared, agents,
+                      log_dir=root / 'logs', timeout_s=5)
 
     def test_directory_count_and_agent_count_are_independent(self):
         for agents, directories in ((1, 3), (4, 2), (2, 1)):
@@ -30,7 +34,7 @@ class MountTopologyTests(unittest.TestCase):
                     with tempfile.TemporaryDirectory() as directory:
                         layout = self.layout(directory, topology, agents, directories)
                         self.assertEqual(len(layout.clients), agents)
-                        self.assertEqual(layout.expected_mounts,
+                        self.assertEqual(len(layout.mountpoints),
                                          agents * (directories if topology == 'multi-mount' else 1))
                         self.assertEqual(len({client.workspace for client in layout.clients}), agents)
                         for index, client in enumerate(layout.clients):
@@ -50,8 +54,48 @@ class MountTopologyTests(unittest.TestCase):
             (admin / 'escape').symlink_to(outside, target_is_directory=True)
             profile = Profile('shared-directory', admin, ('mount',), (), ('umount',))
             with self.assertRaisesRegex(ValueError, 'under admin_root'):
-                Layout(profile, stage, admin / 'escape', [], 1)
+                Layout(profile, stage, admin / 'escape', [], 1,
+                       log_dir=root / 'logs', timeout_s=5)
             self.assertFalse((outside / 'agent-0000').exists())
+
+
+@unittest.skipUnless(hasattr(os, 'fork'), 'requires POSIX daemon behavior')
+class LifecycleCommandTests(unittest.TestCase):
+    def test_daemon_inheriting_stdio_does_not_hold_command_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pid_path = root / 'daemon.pid'
+            log_path = root / 'mount-agent-0000-00'
+            command = '''import os, sys, time
+from pathlib import Path
+pid = os.fork()
+if pid == 0:
+    time.sleep(10)
+    os._exit(0)
+Path(sys.argv[1]).write_text(str(pid))
+print('client returned', flush=True)
+print('client diagnostic', file=sys.stderr, flush=True)
+'''
+            try:
+                _run([sys.executable, '-c', command, str(pid_path)], log_path, 2)
+                # The child is still alive with stdout/stderr inherited, but
+                # the completed launcher's output is already available.
+                os.kill(int(pid_path.read_text()), 0)
+                self.assertEqual(log_path.with_suffix('.stdout.txt').read_text(),
+                                 'client returned\n')
+                self.assertEqual(log_path.with_suffix('.stderr.txt').read_text(),
+                                 'client diagnostic\n')
+            finally:
+                if pid_path.exists():
+                    os.kill(int(pid_path.read_text()), signal.SIGTERM)
+
+    def test_nonreturning_command_times_out_with_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / 'unmount-agent-0000-00'
+            command = 'import time; print("waiting", flush=True); time.sleep(10)'
+            with self.assertRaisesRegex(RuntimeError, 'command exceeded 0.5s'):
+                _run([sys.executable, '-c', command], log_path, 0.5)
+            self.assertEqual(log_path.with_suffix('.stdout.txt').read_text(), 'waiting\n')
 
 
 class NativeTimingTests(unittest.TestCase):

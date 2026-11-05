@@ -40,8 +40,8 @@ make -j2
 | `repeats` | `3` | 每个 N 重复次数 |
 | `mdtest` | `mdtest` | 原版二进制 |
 | `mpi_launcher` | `('mpiexec',)` | 本地 launcher argv；禁止传入多 host 列表 |
-| `command_timeout_s` | `300` | 每个 mdtest／launcher 命令的超时，不是 mount 超时 |
-| `idle_sample_s` | `1.0` | 基线、挂载后、卸载后主机采样区间 |
+| `command_timeout_s` | `300` | 每条 mount／umount、mdtest／launcher 命令的超时 |
+| `idle_sample_s` | `1.0` | 基线、挂载后、卸载后主机采样区间；`--directory-smoke` 固定为 `0.1` |
 | `resource_sample_s` | `0.1` | 整个 workload 期间的内存采样周期 |
 | `profiles` | `local/mounts.toml` | 不提交的真实挂载命令 |
 
@@ -77,7 +77,7 @@ mount 命令是 TOML argv 数组，用 `format_map` 展开，不经 shell。支�
 
 示例中的 NFS server、export、LakeBase META_URL 必须替换。NFS 示例保留常规 cache 默认值，不强行加 `nosharecache`：**N×X 个 mount entries 不等于 N×X 份内核客户端、连接或 cache**。若研究独立 cache 实例，应单列、报告该选项，不得把它暗中加到基线以放大成本。FUSE 命令也必须保证每次 mount 真正创建所需客户端，不能用单 mount 加 Linux bind 冒充多客户端。
 
-LakeBase 命令须在 mount 建立后返回（daemon 模式），卸载命令须在 mount 释放后返回；计时以命令返回为边界。若实际客户端需要不同参数，修改私有 profile，不添加第二套内置厂商接口。X=1 时没有共享目录，应从 LakeBase profile 中移除空的 `--bind` 参数。
+LakeBase 命令须在 mount 建立后返回（daemon 模式），卸载命令须在 mount 释放后返回；计时以命令返回为边界。每条命令使用 `command_timeout_s` 超时；stdout、stderr 分别写入本点结果目录的 `lifecycle/<mount|unmount>-agent-<id>-<step>.stdout.txt`／`.stderr.txt`，不等待 daemon 持有的输出管道关闭。超时即失败，不重试或自动恢复。若实际客户端需要不同参数，修改私有 profile，不添加第二套内置厂商接口。X=1 时没有共享目录，应从 LakeBase profile 中移除空的 `--bind` 参数。
 
 共享目录只执行只读负载；权限由实验环境配置。NFS 示例使用 `ro`；LakeBase 的只读保护依赖非 root agent 与 POSIX 权限。这里不验证恶意写入隔离，不把 workload 不写等价成强制只读权限。正式主机应预配运行用户可执行的 mount／umount 权限；benchmark 本身从不提权。
 
@@ -93,7 +93,7 @@ uv run python -m agent_fs_bench run mount-scale \
   --dirs /tmp/mdtest-directory-smoke -- --directory-smoke
 ```
 
-`--directory-smoke` 固定 N=1,2、每目录 32 文件、1 次重复；保留 CONFIG 的 X 和文件大小。不会读取挂载 profile，也不会输出 mount／unmount rows。不允许把它混入论文挂载性能样本。
+`--directory-smoke` 固定 N=1,2、每目录 32 文件、1 次重复、`idle_sample_s=0.1` 秒；其余设置（包括 X 和文件大小）保留 CONFIG 的值。不会读取挂载 profile，也不会输出 mount／unmount rows。不允许把它混入论文挂载性能样本。
 
 ## 执行与计时边界
 
@@ -131,7 +131,7 @@ uv run python -m agent_fs_bench run mount-scale \
 资源单独为 `resources/baseline`、`mounted-idle`、`released-idle`、`workload` rows：
 
 - `/proc/stat` 给出全机 busy CPU 秒、平均 busy cores 与百分比；排除 idle/iowait，不重复计 guest。包含其他进程和内核，不是文件系统归因 CPU。
-- `/proc/meminfo` 给出 `MemTotal−MemAvailable`（`used_bytes`）、cache、dirty、slab 及可回收／不可回收 slab。挂载后／卸载后 row 记录相对本点 baseline 的增量，可能为负。
+- `/proc/meminfo` 给出 `MemTotal−MemAvailable`（`used_bytes`）、cache、dirty、slab 及可回收／不可回收 slab。挂载后／卸载后的 idle row **仅对 `used_bytes`、`slab_bytes`、`slab_unreclaimable_bytes`、`mount_entries`** 提供相对本点 baseline 的 `_delta`，可能为负；`cached_bytes`、`dirty_bytes`、`slab_reclaimable_bytes` 只保留原值，不提供该 baseline delta。
 - workload row 周期采样给出观察到的峰值与相对 workload 起点的增量；**包含整个 MPI job 启停、Python harness 与阶段间隙**，不等于纯 mdtest phase 资源用量，也不保证捕获瞬时峰值。
 - mount entries 来自当前进程的 mount namespace；daemon 应在同一个 namespace 建立 mount。
 - admin mount、Python、MPI、cache 和 slab 都会影响总量。要求专用闲置 Linux host，保持后台负载一致。没有 FUSE RSS 或 FUSE 进程数指标，不能把主机 used-memory delta 标为它们。
@@ -144,7 +144,7 @@ uv run python -m agent_fs_bench run mount-scale \
 
 默认按 N 递增、目标顺序运行，没有随机化；正式测量应在独立 runs 中交错目标顺序，检查温度、cache／slab 历史和后台噪声，绘制重复样本的离散度。接近零的轻量阶段不能据此声称极限吞吐或尾延迟；若单机负载不足，先增大文件数／N，再另行实现多 host 方案，而不是把现有 multi-host 结果直接拼入单机曲线。
 
-本次仅完成 Colima 普通目录 smoke，未执行真实 mount、NFS 或 LakeBase，不能据此写出它们的性能结论。
+已通过 Colima 非 root 的 `--directory-smoke`：N=1/2、X=3、每目录 32 个 4 KiB 文件、1 次重复、`idle_sample_s=0.1`，生成 24 条测量与 212 条汇总记录；这些是本地临时产物，未提交。另已通过 X=1、N=1/2、2 次重复的私有目录 smoke。**真实 mount／umount、NFS、LakeBase 与 FUSE 挂载 profile 均未执行**；不能用这些普通目录结果证明挂载开销或这些系统的性能。
 
 ## 依据
 

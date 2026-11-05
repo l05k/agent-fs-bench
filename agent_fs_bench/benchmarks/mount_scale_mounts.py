@@ -106,19 +106,24 @@ def _inside(path: Path, root: Path) -> bool:
     return path == root or path.is_relative_to(root)
 
 
-def _run(argv: list[str]) -> None:
+def _run(argv: list[str], log_path: Path, timeout_s: float) -> None:
     try:
-        completed = subprocess.run(
-            argv, stdin=subprocess.DEVNULL, capture_output=True,
-            text=True, errors="replace",
-        )
-    except OSError as exc:
-        raise RuntimeError(f"cannot execute command: {exc}") from exc
-    if completed.returncode:
-        detail = (completed.stderr or completed.stdout).strip()
+        with log_path.with_suffix('.stdout.txt').open('w') as out, \
+                log_path.with_suffix('.stderr.txt').open('w') as err:
+            completed = subprocess.run(
+                argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                text=True, timeout=timeout_s,
+            )
+    except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
-            f"command exited with status {completed.returncode}"
-            + (f": {detail[-500:]}" if detail else "")
+            f'command exceeded {timeout_s:g}s; inspect {log_path.parent}'
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f'cannot execute command: {exc}') from exc
+    if completed.returncode:
+        raise RuntimeError(
+            f'command exited with status {completed.returncode}; '
+            f'inspect {log_path.parent}'
         )
 
 
@@ -132,6 +137,9 @@ class Layout:
         data_root: Path,
         shared_paths: Sequence[Path],
         clients: int,
+        *,
+        log_dir: Path,
+        timeout_s: float,
     ) -> None:
         if not isinstance(profile.topology, str) or profile.topology not in _TOPOLOGIES:
             raise ValueError(f"unsupported topology: {profile.topology!r}")
@@ -161,7 +169,9 @@ class Layout:
         multi = profile.topology == MULTI_MOUNT
         self.profile, self.work_dir, self.data_root = profile, work_dir, data_root
         self.shared_paths = shared
-        self.expected_mounts = clients * (len(shared) + 1 if multi else 1)
+        self.log_dir = log_dir
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.timeout_s = timeout_s
         self.mount_agent_elapsed_s: tuple[float, ...] = ()
         self.unmount_agent_elapsed_s: tuple[float, ...] = ()
         self._before: dict[int, Path] | None = None
@@ -317,16 +327,18 @@ class Layout:
     def _time(
         self, plans: Sequence[Sequence[list[str]]], action: str
     ) -> tuple[float, tuple[float, ...]]:
-        def run_client(commands: Sequence[list[str]]) -> float:
+        def run_client(index: int, commands: Sequence[list[str]]) -> float:
             started = time.perf_counter()
-            for argv in commands:
-                _run(argv)
+            for step, argv in enumerate(commands):
+                log_path = self.log_dir / f'{action}-agent-{index:04d}-{step:02d}'
+                _run(argv, log_path, self.timeout_s)
             return time.perf_counter() - started
 
         started = time.perf_counter()
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(plans)) as pool:
-                futures = [pool.submit(run_client, plan) for plan in plans]
+                futures = [pool.submit(run_client, index, plan)
+                           for index, plan in enumerate(plans)]
                 elapsed = tuple(future.result() for future in futures)
         except RuntimeError as exc:
             raise RuntimeError(

@@ -129,7 +129,9 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
                 if profile is None:
                     clients = _directory_clients(private, shared, count)
                 else:
-                    layout = Layout(profile, local, private, shared, count)
+                    layout = Layout(profile, local, private, shared, count,
+                                    log_dir=diagnostics / 'lifecycle',
+                                    timeout_s=args.command_timeout_s)
                     clients = layout.clients
                 # Directory/fixture construction and sentinel work are outside
                 # lifecycle command timers; steady-state always has warm reads.

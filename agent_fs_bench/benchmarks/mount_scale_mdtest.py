@@ -115,15 +115,14 @@ class Mdtest:
         self._binary = _executable(binary)
         self._sha256 = _sha256(self._binary)
         self._launcher_version = self._probe_launcher()
-        self._banner: str | None = None
+        self._version: str | None = None
 
     @property
     def metadata(self) -> dict[str, Any]:
-        if self._banner is None:
+        if self._version is None:
             raise RuntimeError('metadata needs prepare(), warm() or measure() first')
         return {
-            'mdtest': {'binary': str(self._binary), 'sha256': self._sha256,
-                       'version': _VERSION, 'banner': self._banner},
+            'mdtest': {'sha256': self._sha256, 'version': self._version},
             'launcher': {'argv': list(self._launcher),
                          'version': self._launcher_version},
         }
@@ -253,11 +252,9 @@ class Mdtest:
                 f'mdtest run {label} failed with exit code {done.returncode}: '
                 f'{_tail(stderr_path) or _tail(stdout_path)}'
             )
-        banner, items, times, ranks = self._parse(
+        self._version, items, times, ranks = self._parse(
             label, stdout_path.read_text(), csv_path, phases, len(groups)
         )
-        if self._banner is None:
-            self._banner = banner
         return items, times, ranks
 
     @staticmethod
@@ -304,7 +301,7 @@ class Mdtest:
             if (not math.isfinite(elapsed) or elapsed <= 0.0
                     or not all(math.isfinite(v) and v > 0.0 for v in ranks[name])):
                 raise RuntimeError(f'mdtest run {label} reported no time for {name}')
-        return match.group(0).rstrip('\r'), items, times, ranks
+        return version, items, times, ranks
 
     @staticmethod
     def _paths(values: Sequence[Path], what: str) -> list[Path]:
