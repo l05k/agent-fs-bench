@@ -81,8 +81,15 @@ def main(command: str, argv: list[str]) -> int:
     else:
         parser.add_argument('--benchmark', required=True)
         parser.add_argument('--metric', required=True, help='Metric name, including its unit')
-        parser.add_argument('--case')
-        parser.add_argument('--output', type=Path, required=True, help='Output PNG, SVG or PDF')
+        parser.add_argument('--cases', type=lambda text: text.split(','),
+                            help='Comma-separated x-axis order; also selects cases (default: all, sorted)')
+        parser.add_argument('--targets', type=lambda text: text.split(','),
+                            help='Comma-separated legend order; the first is the primary system')
+        parser.add_argument('--ylabel', help='Y-axis label (default: metric name)')
+        parser.add_argument('--size', type=float, nargs=2, default=(3.5, 1.5),
+                            metavar=('WIDTH', 'HEIGHT'), help='Figure size in inches')
+        parser.add_argument('--output', type=Path, required=True,
+                            help='Output stem; writes <stem>.pdf, <stem>.png and self-contained <stem>.py')
     args = parser.parse_args(argv)
     connection = connect(args.inputs, getattr(args, 'database', None))
     try:
@@ -102,28 +109,37 @@ def main(command: str, argv: list[str]) -> int:
 
 
 def plot(connection, args: argparse.Namespace) -> None:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
+    from . import figure
 
-    conditions = ['benchmark = ?', 'metric = ?']
-    values = [args.benchmark, args.metric]
-    if args.case:
-        conditions.append('"case" = ?')
-        values.append(args.case)
     rows = connection.execute('''
         SELECT target, "case", list(value ORDER BY run_id, repeat)
-        FROM metrics WHERE ''' + ' AND '.join(conditions) + '''
+        FROM metrics WHERE benchmark = ? AND metric = ?
         GROUP BY target, "case" ORDER BY "case", target
-    ''', values).fetchall()
+    ''', [args.benchmark, args.metric]).fetchall()
     if not rows:
         raise ValueError('no measurements match the plot selection')
-    labels = [f'{row[0]} / {row[1]}' for row in rows]
-    figure, axes = plt.subplots(figsize=(max(7, len(rows) * 1.4), 5), layout='constrained')
-    axes.boxplot([row[2] for row in rows], tick_labels=labels, showmeans=True)
-    axes.set_title(args.benchmark)
-    axes.set_ylabel(args.metric)
-    axes.tick_params(axis='x', labelrotation=25)
-    axes.grid(axis='y', alpha=0.3)
-    figure.savefig(args.output)
-    plt.close(figure)
+    found_targets = sorted({target for target, _, _ in rows})
+    found_cases = sorted({case for _, case, _ in rows})
+    targets = args.targets or found_targets
+    cases = args.cases or found_cases
+    for kind, wanted, found in (('targets', targets, found_targets), ('cases', cases, found_cases)):
+        missing = [name for name in wanted if name not in found]
+        if missing:
+            raise ValueError(f'no measurements for {kind}: {", ".join(missing)}')
+    samples = {target: {} for target in targets}
+    for target, case, group in rows:
+        if target in samples and case in cases:
+            samples[target][case] = group
+    data = {
+        'cases': cases, 'targets': targets, 'samples': samples,
+        'ylabel': args.ylabel or args.metric, 'size': list(args.size),
+    }
+    stem = args.output
+    stem.parent.mkdir(parents=True, exist_ok=True)
+    script = stem.with_name(stem.name + '.py')
+    script.write_text(
+        Path(figure.__file__).read_text(encoding='utf-8')
+        + f'\n\nDATA = {data!r}\n\nif __name__ == "__main__":\n'
+        + '    render(DATA, Path(__file__).with_suffix(""))\n',
+        encoding='utf-8')
+    figure.render(data, stem)
