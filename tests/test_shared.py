@@ -77,10 +77,14 @@ class CloneTargetSelectionTests(unittest.TestCase):
         self.assertFalse(self.results.exists())
 
     def test_selected_native_copier_accepts_valid_unselected_alias(self):
-        with mock.patch.dict(clone.CONFIG, {
-            'target_copiers': {'LakeBase': ['test-native'], 'NFS': ['uninstalled']},
-            'commands': {'test-native': 'cp -r {src} {dst}'},
-        }), contextlib.redirect_stdout(io.StringIO()):
+        with (
+            mock.patch.dict(clone.CONFIG, {
+                'target_copiers': {'LakeBase': ['test-native'], 'NFS': ['uninstalled']},
+                'commands': {'test-native': 'cp -r {src} {dst}'},
+            }),
+            mock.patch.object(clone, 'fstype', return_value='tmpfs'),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
             status = run_benchmark(['clone', '--target', 'LakeBase', '--', '--smoke'])
         self.assertEqual(status, 0)
         jsonl = next(self.results.rglob('results.jsonl'))
