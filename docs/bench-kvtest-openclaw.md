@@ -146,8 +146,8 @@ Deliberate workload gaps:
 
 - **No secondary indexes.** OpenClaw maintains 12 indexes across 7 tables in
   the write path; `kv` has one primary key.
-- **No FTS5.** OpenClaw writes an FTS5 projection inside the same transaction.
-  The `openclaw-session` workload includes FTS by default; `kvtest` writes none.
+- **No FTS5.** OpenClaw writes an FTS5 projection inside the same transaction;
+  `kvtest` writes none.
 - **Uniform payloads.** OpenClaw payloads are 90% 1–4 KiB, 9% 256 KiB, 1% 1 MiB
   JSON text; `kvtest` writes fixed-size BLOBs varied only by
   `CONFIG["variance"]`.

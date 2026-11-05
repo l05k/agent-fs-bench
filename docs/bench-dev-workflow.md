@@ -5,6 +5,13 @@ checkout. `mini-dev-workflow` replays the same search/read/edit/build/commit
 shape against a tiny C project using a real Git worktree. Both are Python
 standard-library workloads in `agent_fs_bench/benchmarks/`.
 
+The project being edited is independent of the filesystem being measured. Mini
+edits a tiny C program; kernel edits five historical patches under Linux's
+`fs/overlayfs/`. `CONFIG_OVERLAY_FS=y` includes those source files in the build;
+it does not mount OverlayFS. Neither workload installs or boots the built kernel,
+requires an OverlayFS target, or performs checkpoints or snapshots. Put the
+checkout/worktree on whichever externally prepared filesystem you want to measure.
+
 ## Run
 
 Mount filesystems externally before running; the benchmark never mounts or
@@ -159,7 +166,7 @@ resolved to a full commit ID before measurement.
 6. **Cleanup:** `git reset --hard <base>` and `git clean -fdx`, separately timed.
 
 The shipped fixture has five commits, 15 search + 10 read + 41 edit commands,
-53 zero-cost checkpoint markers, one full build and five incremental builds.
+one full build and five incremental builds.
 Build parallelism is `CONFIG["jobs"]` (default eight).
 
 ### Mini
@@ -176,7 +183,7 @@ are not compared.
 
 Mini defaults to two build jobs via `CONFIG["jobs"]` and never exceeds two; a
 value of one is supported. The shipped fixture builds one C translation unit. A
-complete run records 35 step entries, including eight zero-cost checkpoints. Its
+complete run records 27 timed step entries. Its
 source repository remains after cleanup. `tools/gen_mini_source_repo.py` is
 fixture maintenance only, not a runtime helper; it rebuilds
 `data/mini-dev-workflow/source-repo`, rewrites `series.json`, and exports the
@@ -226,7 +233,7 @@ Numeric metrics are:
 - `elapsed_ms`: total measured workflow interval, excluding setup/preparation
   and cleanup;
 - `preparation_ms` and `cleanup_ms`: separately measured lifecycle phases;
-- `unattributed_ms`: `max(0, elapsed_ms - sum(non-checkpoint step ms))`;
+- `unattributed_ms`: `max(0, elapsed_ms - sum(step ms))`;
 - mini only: `source_setup_ms` for the bundle clone.
 
 `details` retains only the complete ordered `steps` array (`step`, `ms`) and
@@ -244,8 +251,8 @@ No cache is dropped, so reads are warm. These are throughput/efficiency
 measurements, **not crash-durability measurements**. No cgroup controls are
 introduced.
 
-Checkpoint markers are boundaries only, not backend snapshots; results are
-not comparable to backend-checkpoint timings. Fixture commands run under
+Unlike upstream's backend-managed transitions, these workflows perform no
+checkpoints or snapshots and emit no placeholder checkpoint steps. Fixture commands run under
 `bash --noprofile --norc -c` with `LC_ALL=C`, without `pipefail`. Hooks are
 disabled and commits use a fixed benchmark identity. Process-group
 cancellation and out-of-band cleanup remain in place.
