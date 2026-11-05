@@ -1,9 +1,10 @@
 # Transactional SQLite writes via official `kvtest`
 
 Runs SQLite's own [`test/kvtest.c`](https://github.com/sqlite/sqlite/blob/version-3.54.1/test/kvtest.c)
-with `--update --random --multitrans`: overwrite existing BLOB rows, one
-autocommit transaction per write. This is a controlled filesystem microbenchmark,
-not an OpenClaw session replay or a prediction of application latency.
+with `--update --random`: overwrite existing BLOB rows. The default
+`CONFIG["multitrans"] = True` adds `--multitrans`, one autocommit transaction per
+write; False batches all writes in one transaction. This is a single-writer
+filesystem microbenchmark, not an OpenClaw replay or application-latency estimate.
 
 OpenClaw motivates this workload because its per-agent database stores session
 and transcript state. The research question is: **under the same declared SQLite
@@ -27,33 +28,38 @@ must be observed at the actual writer, not inferred from this benchmark.
 uv run python -m agent_fs_bench run kvtest --dirs /mnt/fs-a
 ```
 
-There are no workload flags. Payload size/variance, writes, cache size, journal
-mode, mmap, repeats, build directory and forced refresh are the deliberate
-`CONFIG` mapping at the top of `agent_fs_bench/benchmarks/kvtest.py`. The
-experiment inputs — size, variance, count, cache size, journal mode, mmap and
-repeats — are recorded in `parameters` as requests; `build_dir` and
-`force_download` are run management and are not recorded. Change that code for
-an ablation; do not commit private settings. Defaults: `count=2000`,
-`size=2048`, `variance=1024`, `cache_size=1000` KiB, `jmode=wal`, `repeats=1`,
-`mmap=0`, `nosync=false` (SQLite's default synchronization, normally FULL;
-kvtest does not print a readback).
+There are no workload flags. Experiment settings are the `CONFIG` mapping at the
+top of `agent_fs_bench/benchmarks/kvtest.py`. Change that code for an ablation;
+do not commit private settings. Defaults: `count=2000`, `size=2048`, `variance=0`,
+`cache_size=1000` KiB, `jmode=delete`, `multitrans=True`, `repeats=5`, `mmap=0`,
+`nosync=False`. FULL synchronization is pinned at build time; kvtest does not
+print a connection-level readback. `nosync=True` explicitly requests OFF and is
+not part of the NAS baseline. `build_dir` and `force_download` manage the build
+cache and are not experiment parameters.
+
+For transaction-granularity sensitivity, run fixed sizes such as 1024, 4096 and
+16384 bytes with `variance=0`, separately for `multitrans=True` and False. The
+case includes journal/sync mode, size, variance, count, cache, mmap and transaction
+mode, so these settings do not collapse into the same summary group. This is
+still one connection (`C1`), not a same-database concurrency benchmark.
 
 The first run downloads the SQLite 3.54.1 amalgamation and `kvtest.c` into
 `build/kvtest/` at the repository root (git-ignored) and compiles `kvtest` with
-`-O2` using the compiler named by `CC`, or `cc` then `gcc` when `CC` is unset.
-The compiler path, exact compile argv, compiler `--version` line, source hashes
-and binary hash are saved beside it in `build/kvtest/kvtest-build.json`.
+`-O2` using `CC`, or `cc` then `gcc` when unset. Both SQLite workloads use
+`sqlite_tools.py`: `SQLITE_THREADSAFE=1`, loadable extensions omitted, and default
+rollback/WAL synchronization fixed to FULL (`2`). The compiler version, source
+and binary hashes, exact compile argv and flags are saved in `kvtest-build.json`.
 
 Later runs reuse the binary only when it is newer than `kvtest.c`, `sqlite3.c`
-and `sqlite3.h`, and its metadata matches both the binary hash and the current
-source hashes. Reuse does not resolve or run any compiler, so a host that only
+and `sqlite3.h`, and its metadata matches the binary hash, current source hashes
+and compile flags. Reuse does not resolve or run any compiler, so a host that only
 consumes an existing cache does not need one; rows record the cached compiler's
 `--version` line and the source/binary hashes, not the current `CC`. If an
 up-to-date binary has missing or incomplete metadata, or metadata that does not
 match the binary hash, the run fails and asks for exactly one explicit rebuild
 (`CONFIG["force_download"] = True`, or delete the binary and metadata); it never
-guesses provenance or treats an unproven binary as current. Changing a source or
-header rebuilds, as does setting force. A failed compile or version probe leaves
+guesses provenance or treats an unproven binary as current. Changing a source,
+header or compile flags rebuilds, as does setting force. A failed compile or version probe leaves
 the previous binary and metadata untouched. Set `CC` to choose a compiler and
 `CONFIG["build_dir"]` to move the download/compile cache. Paths and the exact
 compile argv stay in `build/kvtest/kvtest-build.json`; they are not copied into
@@ -64,6 +70,15 @@ JSONL.
 lowercase. The mode kvtest's own connection reports is in
 `details.observed.journal_mode` and may differ for nonpersistent modes. An
 invalid request fails the run before any download, build or database work.
+
+The generic NAS baseline is DELETE + FULL on every target. SQLite warns that
+network-filesystem locking and synchronization vary; WAL is not a generic
+network-filesystem baseline, including when all connections run on one client.
+See [SQLite over a network](https://sqlite.org/useovernet.html) and
+[WAL restrictions](https://sqlite.org/wal.html). A successful run or integrity
+check does not establish crash durability or safe multi-client access. FULL in
+rollback mode is not an unconditional power-loss durability guarantee; see
+[synchronous](https://sqlite.org/pragma.html#pragma_synchronous).
 
 ## Deployment / 部署
 
@@ -99,7 +114,7 @@ each repeat is a separate JSONL measurement, not an averaged result.
 Each JSONL row separates requests from observations and measured timings:
 
 - `parameters` holds the experiment inputs (`size`, `variance`, `count`,
-  `cache_size_kib`, `jmode`, `nosync`, `mmap_bytes`, `repeats`), plus
+  `cache_size_kib`, `jmode`, `nosync`, `mmap_bytes`, `multitrans`, `repeats`), plus
   `tool_versions` (`sqlite` parsed from kvtest's own stdout, `compiler` from the
   build cache), `source_sha256` for the build inputs and `binary_sha256`.
 - `details.observed` holds the values kvtest read back from SQLite:
@@ -121,6 +136,16 @@ inspection connection). After all timed repeats finish, the harness runs
 `kvtest stat <db>` once with the same binary, outside any timing; any
 `Integrity-check` result other than `ok` is a hard error before a row is
 emitted.
+
+The official SQL update loop does not reliably reject failed commits under lock
+contention. Do not point other readers/writers at this invocation's database and
+do not launch concurrent kvtest processes against it. A held reader lock can
+produce exit status 0, claimed writes and `Integrity-check: ok` with unchanged
+database contents. Integrity checks validate structure, not successful commits.
+
+Each JSONL sample is a complete invocation's amortized result. Repeating it
+measures run-to-run variation, not a per-transaction latency distribution. Do not
+derive p95/p99 transaction latency from these rows. Caches are not evicted.
 
 ## Versioned OpenClaw evidence and limits
 
@@ -153,7 +178,7 @@ These are version-specific source facts, not measurements of deployed sessions:
 | Dimension | Reference application | Current kvtest workload |
 | --- | --- | --- |
 | Data operations | Transcript/state writes and derived projections | Random overwrite of existing BLOBs in one table |
-| Transaction granularity | Must be captured at the writer | One update per autocommit transaction |
+| Transaction granularity | Must be captured at the writer | Autocommit per update (default), or one batch transaction |
 | Payload sizes and operation frequencies | No empirical distribution collected here | Deliberately synthetic `CONFIG` inputs |
 | Schema/content work | Metadata, indexes, FTS and optional compression | Primary key only; no FTS or transcript compression |
 | Journal mode | Path-dependent policy | Explicit `jmode`; actual mode printed in results |
@@ -162,19 +187,21 @@ These are version-specific source facts, not measurements of deployed sessions:
 
 The retired synthetic session workload is not evidence for OpenClaw's message
 size distribution, events per turn, or FTS cost share. No such empirical claims
-are made here. Current defaults (`size=2048`, `variance=1024`, `count=2000`)
+are made here. Current defaults (`size=2048`, `variance=0`, `count=2000`)
 are experiment controls, not fitted application statistics. In SQLite 3.54.1,
-kvtest initializes lengths using `size + random() % (variance + 1)`; with these
-defaults lengths can range from 2048 to 3072 bytes. This is not a replay of a
-measured size sequence, and the generated database is not byte-identical per run.
-The size expression is from the [pinned kvtest initialization](https://github.com/sqlite/sqlite/blob/version-3.54.1/test/kvtest.c#L362-L376).
+kvtest initializes lengths using `size + random() % (variance + 1)`. SQLite
+`random()` and its remainder are signed: a nonzero variance spans
+`size - variance` through `size + variance`, not only sizes above the requested
+size. The default therefore uses exactly 2048-byte BLOBs. For example,
+`size=2048, variance=1024` permits 1024–3072 bytes. Content is random, not a
+byte-identical application replay. See the [pinned initialization](https://sqlite.org/src/raw/test/kvtest.c?ci=version-3.54.1).
 
 Changing journal mode, synchronization, transaction grouping, schema or checkpoint
 policy changes the workload. FULL versus NORMAL is not a calibrated latency
 upper bound, and fewer tables is not a calibrated lower bound. Keep each setting
 fixed across targets and report the comparison as a SQLite microbenchmark.
-For network targets, WAL use also requires the intended locking/shared-memory
-semantics; a successful single-process run is not a multi-client safety proof.
+For network targets, use the common rollback baseline; a successful single-process
+WAL run is not evidence that WAL is supported safely by that filesystem.
 One transaction does not imply one fsync: under [WAL with NORMAL synchronization](https://www.sqlite.org/pragma.html#pragma_synchronous),
 most transactions do not sync, while checkpointing performs synchronization.
 This is why commit grouping and maintenance policy both matter to the comparison.
@@ -297,8 +324,8 @@ For the current implementation (no empirical calibration yet):
 
 > Motivated by the use of SQLite for agent session and transcript state in the
 > referenced OpenClaw revision, we evaluate a controlled SQLite microbenchmark
-> using the official kvtest workload. Each operation overwrites an existing BLOB
-> in its own transaction. We hold workload and persistence settings fixed across
+> using the official kvtest workload. In the default case, each operation overwrites
+> an existing BLOB in its own transaction. We hold workload and persistence settings fixed across
 > filesystems. Payload sizes are synthetic experimental controls, not a measured
 > OpenClaw distribution; the experiment neither replays OpenClaw nor estimates
 > its end-to-end latency.
@@ -311,8 +338,8 @@ corpus to all OpenClaw usage or call metadata-only calibration a faithful replay
 ## Artifacts
 
 ```text
-<target>/agent-fs-bench/kvtest/<run-id>/kv-openclaw.sqlite
-                             fresh database + WAL/SHM on the target
+<target>/agent-fs-bench/kvtest/<run-id>/kvtest.sqlite
+                             fresh database + rollback journal on the target
 build/kvtest/                sources, compiled binary (git-ignored), and
                              kvtest-build.json build provenance
 results/kvtest/<run-id>/results.jsonl

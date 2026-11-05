@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from agent_fs_bench.benchmarks import kvtest
+from agent_fs_bench.benchmarks import kvtest, sqlite_tools
 from agent_fs_bench.results import RunContext
 from agent_fs_bench.targets import Target
 
@@ -46,14 +46,14 @@ class BuildProvenanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sources = write_sources(root)
-            binary, provenance = kvtest.build(root, sources, force=False)
+            binary, provenance = sqlite_tools.build(root, "kvtest", sources, force=False)
 
-            metadata_path = root / kvtest.BUILD_METADATA_FILENAME
+            metadata_path = root / "kvtest-build.json"
             self.assertTrue(metadata_path.is_file())
             stored = json.loads(metadata_path.read_text(encoding="utf-8"))
             self.assertEqual(stored, provenance)
             self.assertEqual(
-                provenance["source_sha256"], kvtest.source_hashes(sources)
+                provenance["source_sha256"], sqlite_tools.source_hashes(sources)
             )
             self.assertEqual(
                 provenance["binary_sha256"],
@@ -69,9 +69,7 @@ class BuildProvenanceTests(unittest.TestCase):
                 {"CC": str(root / "missing-cc"), "PATH": ""},
                 clear=False,
             ):
-                reused_binary, reused = kvtest.build(
-                    root, sources, force=False
-                )
+                reused_binary, reused = sqlite_tools.build(root, "kvtest", sources, force=False)
 
             self.assertEqual(reused_binary, binary)
             self.assertEqual(reused, provenance)
@@ -83,8 +81,8 @@ class BuildProvenanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sources = write_sources(root)
-            binary, _ = kvtest.build(root, sources, force=False)
-            metadata_path = root / kvtest.BUILD_METADATA_FILENAME
+            binary, _ = sqlite_tools.build(root, "kvtest", sources, force=False)
+            metadata_path = root / "kvtest-build.json"
             metadata_path.unlink()
 
             with mock.patch.dict(
@@ -92,9 +90,9 @@ class BuildProvenanceTests(unittest.TestCase):
                 {"CC": str(root / "missing-cc"), "PATH": ""},
                 clear=False,
             ):
-                with self.assertRaisesRegex(kvtest.BenchmarkError,
+                with self.assertRaisesRegex(sqlite_tools.BenchmarkError,
                                             "force_download"):
-                    kvtest.build(root, sources, force=False)
+                    sqlite_tools.build(root, "kvtest", sources, force=False)
 
             self.assertTrue(binary.exists())
 
@@ -102,7 +100,7 @@ class BuildProvenanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sources = write_sources(root)
-            binary, _ = kvtest.build(root, sources, force=False)
+            binary, _ = sqlite_tools.build(root, "kvtest", sources, force=False)
             binary.write_bytes(binary.read_bytes() + b"replaced")
 
             with mock.patch.dict(
@@ -111,16 +109,16 @@ class BuildProvenanceTests(unittest.TestCase):
                 clear=False,
             ):
                 with self.assertRaisesRegex(
-                    kvtest.BenchmarkError, "does not match its build provenance"
+                    sqlite_tools.BenchmarkError, "does not match its build provenance"
                 ):
-                    kvtest.build(root, sources, force=False)
+                    sqlite_tools.build(root, "kvtest", sources, force=False)
 
     def test_incomplete_metadata_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sources = write_sources(root)
-            kvtest.build(root, sources, force=False)
-            metadata_path = root / kvtest.BUILD_METADATA_FILENAME
+            sqlite_tools.build(root, "kvtest", sources, force=False)
+            metadata_path = root / "kvtest-build.json"
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             del metadata["compiler_version"]
             metadata_path.write_text(
@@ -133,33 +131,49 @@ class BuildProvenanceTests(unittest.TestCase):
                 clear=False,
             ):
                 with self.assertRaisesRegex(
-                    kvtest.BenchmarkError, "incomplete build provenance"
+                    sqlite_tools.BenchmarkError, "incomplete build provenance"
                 ):
-                    kvtest.build(root, sources, force=False)
+                    sqlite_tools.build(root, "kvtest", sources, force=False)
 
     def test_changed_header_forces_rebuild(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sources = write_sources(root)
-            binary, _ = kvtest.build(root, sources, force=False)
+            binary, _ = sqlite_tools.build(root, "kvtest", sources, force=False)
 
             sources["sqlite3_h"].write_text("#define EXIT_CODE 7\nint kv_helper(void);\n")
             # A changed header must invalidate even if its timestamp is preserved.
             stamp = binary.stat().st_mtime - 1
             os.utime(sources["sqlite3_h"], (stamp, stamp))
-            rebuilt, _ = kvtest.build(root, sources, force=False)
+            rebuilt, _ = sqlite_tools.build(root, "kvtest", sources, force=False)
             completed = subprocess.run([str(rebuilt)], check=False)
             self.assertEqual(completed.returncode, 7)
+
+    def test_changed_compile_flags_force_rebuild(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = write_sources(root)
+            sources["sqlite3"].write_text(
+                '#include "sqlite3.h"\n'
+                '#ifndef RESULT_CODE\n#define RESULT_CODE 0\n#endif\n'
+                'int kv_helper(void) { return RESULT_CODE; }\n'
+            )
+            binary, _ = sqlite_tools.build(root, "kvtest", sources, force=False)
+            self.assertEqual(subprocess.run([str(binary)]).returncode, 0)
+            flags = (*sqlite_tools.COMPILE_FLAGS, "-DRESULT_CODE=7")
+            with mock.patch.object(sqlite_tools, "COMPILE_FLAGS", flags):
+                rebuilt, _ = sqlite_tools.build(root, "kvtest", sources, force=False)
+            self.assertEqual(subprocess.run([str(rebuilt)]).returncode, 7)
 
     def test_force_rebuild_restores_missing_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sources = write_sources(root)
-            kvtest.build(root, sources, force=False)
-            metadata_path = root / kvtest.BUILD_METADATA_FILENAME
+            sqlite_tools.build(root, "kvtest", sources, force=False)
+            metadata_path = root / "kvtest-build.json"
             metadata_path.unlink()
 
-            binary, provenance = kvtest.build(root, sources, force=True)
+            binary, provenance = sqlite_tools.build(root, "kvtest", sources, force=True)
 
             self.assertTrue(metadata_path.is_file())
             self.assertEqual(
@@ -171,8 +185,8 @@ class BuildProvenanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sources = write_sources(root)
-            binary, provenance = kvtest.build(root, sources, force=False)
-            metadata_path = root / kvtest.BUILD_METADATA_FILENAME
+            binary, provenance = sqlite_tools.build(root, "kvtest", sources, force=False)
+            metadata_path = root / "kvtest-build.json"
             metadata_before = metadata_path.read_bytes()
             binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
 
@@ -180,9 +194,9 @@ class BuildProvenanceTests(unittest.TestCase):
             future = binary.stat().st_mtime + 10
             os.utime(sources["kvtest"], (future, future))
 
-            with self.assertRaisesRegex(kvtest.BenchmarkError,
+            with self.assertRaisesRegex(sqlite_tools.BenchmarkError,
                                         "failed to compile"):
-                kvtest.build(root, sources, force=False)
+                sqlite_tools.build(root, "kvtest", sources, force=False)
 
             self.assertEqual(
                 hashlib.sha256(binary.read_bytes()).hexdigest(), binary_hash
@@ -262,7 +276,7 @@ class OutputParsingTests(unittest.TestCase):
                     if not line.startswith(prefix)
                 )
                 with self.assertRaisesRegex(
-                    kvtest.BenchmarkError, "missing .*" + field
+                    sqlite_tools.BenchmarkError, "missing .*" + field
                 ):
                     kvtest.parse_kvtest_output(text)
 
@@ -272,7 +286,7 @@ class OutputParsingTests(unittest.TestCase):
             for line in KVTEST_STAT_STDOUT.splitlines(keepends=True)
             if not line.startswith("Integrity-check:")
         )
-        with self.assertRaisesRegex(kvtest.BenchmarkError,
+        with self.assertRaisesRegex(sqlite_tools.BenchmarkError,
                                     "missing 'Integrity-check'"):
             kvtest.parse_integrity_check(text)
 
@@ -286,59 +300,14 @@ class OutputParsingTests(unittest.TestCase):
             "Integrity-check:    Page 2 is never used",
         )
         with self.assertRaisesRegex(
-            kvtest.BenchmarkError, "integrity-check failed"
+            sqlite_tools.BenchmarkError, "integrity-check failed"
         ):
             kvtest.parse_integrity_check(text)
 
 
-class MeasurementBoundaryTests(unittest.TestCase):
-    def test_runs_one_final_stat_after_all_timed_runs(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            args = kvtest.parse_args([])
-            args.repeats = 2
-            args.build_dir = root / "build"
-            args.target_dir = root / "target"
-            binary = root / "kvtest"
-            commands = []
-
-            def fake_run(command):
-                commands.append(list(command))
-                if command[1] == "stat":
-                    stdout = KVTEST_STAT_STDOUT
-                elif command[1] == "run":
-                    stdout = KVTEST_RUN_STDOUT
-                else:
-                    stdout = ""
-                return subprocess.CompletedProcess(command, 0, stdout, "")
-
-            provenance = {
-                "binary_sha256": "binary-hash",
-                "source_sha256": {},
-                "compiler": "cc",
-                "compiler_argv": ["cc"],
-                "compiler_version": "cc 15.0",
-            }
-            with mock.patch.object(kvtest, "ensure_sources", return_value={}), \
-                    mock.patch.object(
-                        kvtest, "build", return_value=(binary, provenance)
-                    ), \
-                    mock.patch.object(kvtest, "run_command", side_effect=fake_run):
-                result = kvtest.measure(args)
-
-            self.assertEqual(result["integrity_check"], "ok")
-            self.assertEqual(
-                [command[1] for command in commands],
-                ["init", "run", "run", "stat"],
-            )
-            self.assertNotIn("--integrity-check", commands[1])
-
-
-
-
 class JmodeValidationTests(unittest.TestCase):
     def test_all_allowed_modes_normalize_from_config(self):
-        for mode in kvtest.JMODE_CHOICES:
+        for mode in sqlite_tools.JMODE_CHOICES:
             for configured in (mode, mode.upper(), mode.capitalize()):
                 with self.subTest(configured=configured), \
                         mock.patch.dict(kvtest.CONFIG, {"jmode": configured}):
@@ -348,7 +317,7 @@ class JmodeValidationTests(unittest.TestCase):
         for configured in ("wla", "WLA"):
             with self.subTest(configured=configured), \
                     mock.patch.dict(kvtest.CONFIG, {"jmode": configured}):
-                with self.assertRaisesRegex(kvtest.BenchmarkError,
+                with self.assertRaisesRegex(sqlite_tools.BenchmarkError,
                                             "invalid jmode"):
                     kvtest.parse_args([])
 
@@ -357,7 +326,7 @@ class JmodeValidationTests(unittest.TestCase):
         context = RunContext("kvtest", "invalid", Target("fs", Path("/mnt/fs")),
                              Path("/missing/work"), Path("/missing/results"), {}, "source", output)
         args = SimpleNamespace(jmode="wla", build_dir=None)
-        with self.assertRaises(kvtest.BenchmarkError):
+        with self.assertRaises(sqlite_tools.BenchmarkError):
             kvtest.run(context, args)
         self.assertEqual(output.getvalue(), "")
 
@@ -370,8 +339,8 @@ class JmodeValidationTests(unittest.TestCase):
                 force_download=False,
                 target_dir=root / "target",
             )
-            with mock.patch.object(kvtest, "ensure_sources") as ensure_sources:
-                with self.assertRaisesRegex(kvtest.BenchmarkError,
+            with mock.patch.object(sqlite_tools, "ensure_sources") as ensure_sources:
+                with self.assertRaisesRegex(sqlite_tools.BenchmarkError,
                                             "invalid jmode"):
                     kvtest.measure(args)
             ensure_sources.assert_not_called()

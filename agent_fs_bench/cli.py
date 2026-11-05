@@ -15,6 +15,7 @@ BENCHMARKS = {
     'mini-dev-workflow': 'mini_dev_workflow',
     'npm-install': 'npm_install',
     'kvtest': 'kvtest',
+    'sqlite-speedtest': 'sqlite_speedtest',
     'multi-host': 'multi_host',
 }
 RESULTS_DIR = PROJECT_ROOT / 'results'
