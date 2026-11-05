@@ -33,8 +33,21 @@ def run_benchmark(argv: list[str]) -> int:
     options = parser.parse_args(argv[:split])
     workload_argv = argv[split + 1:] if split < len(argv) else []
     module = importlib.import_module(f'agent_fs_bench.benchmarks.{BENCHMARKS[options.benchmark]}')
-    module.parse_args(workload_argv)
-    targets = load_targets(TARGETS_FILE, options.dirs, options.target)
+    workload_args = module.parse_args(workload_argv)
+    targets = load_targets(TARGETS_FILE, options.dirs)
+    target_names = {target.name for target in targets}
+    if options.benchmark == 'clone':
+        unknown = set(workload_args.target_copiers) - target_names
+        if unknown:
+            raise ValueError(
+                f'unknown target_copiers aliases: {", ".join(sorted(unknown))}; '
+                f'available targets: {", ".join(sorted(target_names))}'
+            )
+    if options.target:
+        unknown = set(options.target) - target_names
+        if unknown:
+            raise ValueError(f'unknown targets: {", ".join(sorted(unknown))}')
+        targets = [target for target in targets if target.name in options.target]
     remote = getattr(module, 'REMOTE', False)
     results_root = RESULTS_DIR
     if not remote:

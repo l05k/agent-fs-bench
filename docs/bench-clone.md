@@ -51,6 +51,12 @@ CONFIG["commands"] = {
 All other targets use `cp-r`. Running both operations on LakeBase separates
 native-clone benefits from ordinary filesystem access performance. Use exact
 registered target names, or the directory basenames when using `--dirs`.
+Before creating a run, every `target_copiers` key is checked against the complete
+registered target catalog (or all `--dirs` basenames), case-sensitively. An
+unknown key is an error, never an implicit switch to `cp-r`. This check precedes
+`--target` filtering: valid overrides for unselected targets are allowed, and
+only selected copiers need installed executables.
+
 A command must return only when the copied tree is complete and available to
 filesystem operations; a command that only submits an asynchronous job is not
 suitable without a wrapper that waits for its completion.

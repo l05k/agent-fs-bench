@@ -21,8 +21,7 @@ def target_path(value: str) -> Path:
     return path
 
 
-def load_targets(config: Path | None, directories: list[str] | None,
-                 selected: list[str] | None = None) -> list[Target]:
+def load_targets(config: Path | None, directories: list[str] | None) -> list[Target]:
     if directories is not None:
         targets = [Target(target_path(value).name, target_path(value))
                    for value in directories]
@@ -42,11 +41,6 @@ def load_targets(config: Path | None, directories: list[str] | None,
             raise ValueError('target must not be the filesystem root')
         names.add(target.name)
         paths.add(target.path)
-    if selected:
-        unknown = set(selected) - names
-        if unknown:
-            raise ValueError(f'unknown targets: {", ".join(sorted(unknown))}')
-        targets = [target for target in targets if target.name in selected]
     if not targets:
         raise ValueError('at least one target directory is required')
     return targets

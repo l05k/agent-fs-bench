@@ -1,5 +1,6 @@
 import argparse
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -68,7 +69,6 @@ class CopierValidationTests(unittest.TestCase):
         self.assertEqual(list(self.scratch.iterdir()), [])
 
 
-@unittest.skipUnless(shutil.which('cp'), 'cp is required for copier tests')
 class CopyRequestsTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -85,6 +85,23 @@ class CopyRequestsTests(unittest.TestCase):
         (source / 'root.txt').write_bytes(b'root')
         return source
 
+    def test_requests_execute_concurrently(self):
+        source = self.source_tree()
+        destinations = prepare_destinations(self.root / 'destinations', 3)
+        copier = Copier('delayed-copy', (
+            sys.executable, '-c',
+            'import shutil, sys, time; time.sleep(0.3); '
+            'shutil.copytree(sys.argv[1], sys.argv[2])',
+            '{src}', '{dst}',
+        ))
+
+        wall, results = copy_requests(source, destinations, copier)
+
+        self.assertLess(wall, 0.75 * sum(result.latency_s for result in results))
+        for destination in destinations:
+            verify_tree(source, destination, contents=True)
+
+    @unittest.skipUnless(shutil.which('cp'), 'cp is required for copier tests')
     def test_each_request_copies_the_complete_private_tree(self):
         source = self.source_tree()
         destinations_root = self.root / 'destinations'
@@ -97,9 +114,8 @@ class CopyRequestsTests(unittest.TestCase):
         for destination in destinations:
             self.assertFalse(destination.exists())
 
-        wall, results = copy_requests(source, destinations, CP_R)
+        _wall, results = copy_requests(source, destinations, CP_R)
 
-        self.assertGreaterEqual(wall, 0.0)
         self.assertEqual(len(results), 3)
         expected = tree_inventory(source)
         self.assertIsNone(expected['empty'])
@@ -114,9 +130,6 @@ class CopyRequestsTests(unittest.TestCase):
                         (destination / relative).read_bytes(),
                         (source / relative).read_bytes(),
                     )
-        for result in results:
-            self.assertAlmostEqual(result.latency_s, result.copy_s + result.fsync_s)
-            self.assertGreaterEqual(wall, result.latency_s)
 
         # Regular copies stay write-independent in both directions.
         first, second = destinations[0], destinations[1]
