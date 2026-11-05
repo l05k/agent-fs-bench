@@ -2,8 +2,8 @@
 
 The source repository is cloned from the committed bundle beside the worktree
 on the target filesystem. Worktree prune/add and the full command/build/commit
-sequence are timed; source setup and worktree removal are separate. Checkpoints
-are zero-cost boundaries. As upstream, commit trees are not compared.
+sequence are timed; source setup and worktree removal are separate. No checkpoints
+run. As upstream, commit trees are not compared.
 """
 
 from __future__ import annotations
@@ -506,8 +506,6 @@ def has_local_commit(repo: Path, revision: str) -> bool:
     return result.stdout.strip() != ""
 
 
-def record_checkpoint(step: int, phase: str, steps: list[dict[str, Any]]) -> None:
-    steps.append({"step": f"checkpoint: {phase}", "ms": 0})
 
 
 def resolve_jobs(args: argparse.Namespace) -> int:
@@ -542,7 +540,6 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
 
     jobs = resolve_jobs(args)
     steps: list[dict[str, Any]] = []
-    checkpoint_step = 0
     cleanup_error: str | None = None
     cleanup_ms: int | None = None
     preparation_ms: int | None = None
@@ -582,8 +579,6 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
             {"step": "worktree: add", "ms": elapsed_ms(add_start)}
         )
 
-        checkpoint_step += 1
-        record_checkpoint(checkpoint_step, "worktree", steps)
 
         initial = run_command(
             ["make", f"-j{jobs}"],
@@ -593,8 +588,6 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
         )
         steps.append({"step": "initial-build: make", "ms": initial.ms})
 
-        checkpoint_step += 1
-        record_checkpoint(checkpoint_step, "initial-build", steps)
 
         for commit in commits:
             commit_id = commit["id"]
@@ -625,11 +618,6 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
                     steps.append(
                         {"step": f"{category}: {commit_id} #{idx}", "ms": result.ms}
                     )
-                    if category == "edit":
-                        checkpoint_step += 1
-                        record_checkpoint(
-                            checkpoint_step, f"{commit_id} #{idx}", steps
-                        )
 
             incremental = run_command(
                 ["make", f"-j{jobs}"],
@@ -641,10 +629,6 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
                 {"step": f"incremental-build: {commit_id}", "ms": incremental.ms}
             )
 
-            checkpoint_step += 1
-            record_checkpoint(
-                checkpoint_step, f"incremental-build {commit_id}", steps
-            )
 
             status = run_git(
                 worktree,
@@ -687,8 +671,6 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
             )
             steps.append({"step": f"git-commit: {commit_id}", "ms": commit_result.ms})
 
-            checkpoint_step += 1
-            record_checkpoint(checkpoint_step, f"git-commit {commit_id}", steps)
 
         success = True
     except WorkflowError as exc:
@@ -732,7 +714,7 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
         error = f"{error}; {cleanup_error}" if error else cleanup_error
 
     unattributed_ms = max(0, (workflow_ms or 0) - sum(
-        step["ms"] for step in steps if not step["step"].startswith("checkpoint: ")
+        step["ms"] for step in steps
     ))
 
     return {

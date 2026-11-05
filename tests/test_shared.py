@@ -2,13 +2,12 @@ import contextlib
 import io
 import csv
 import json
-import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
 
-from agent_fs_bench.benchmarks import clone, openclaw_session
+from agent_fs_bench.benchmarks import clone
 from agent_fs_bench.analysis import SUMMARY_SQL, connect, export_summary
 from agent_fs_bench.cli import run_benchmark
 from agent_fs_bench.results import RunContext
@@ -41,7 +40,7 @@ class TargetTests(unittest.TestCase):
             (target / 'agent-fs-bench').symlink_to(outside, target_is_directory=True)
             with mock.patch('agent_fs_bench.cli.RESULTS_DIR', root / 'results'):
                 with self.assertRaisesRegex(ValueError, 'escapes target'):
-                    run_benchmark(['openclaw-session', '--dirs', str(target)])
+                    run_benchmark(['clone', '--dirs', str(target)])
             self.assertEqual(list(outside.iterdir()), [])
 
 
@@ -174,7 +173,7 @@ class PortableResultsTests(unittest.TestCase):
 
 
 class SummaryRunTests(unittest.TestCase):
-    """Exercise real SQLite measurements and their derived CSV lifecycle."""
+    """Exercise real tree copies and their derived CSV lifecycle."""
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -184,32 +183,26 @@ class SummaryRunTests(unittest.TestCase):
         for target in self.targets:
             target.mkdir()
         self.enterContext(mock.patch('agent_fs_bench.cli.RESULTS_DIR', self.root / 'results'))
-        self.enterContext(mock.patch.dict(openclaw_session.CONFIG, {
-            'duration': 0.03, 'rate': 0, 'sessions': 1,
-            'prefill_events': 0, 'no_fts': True,
+        self.enterContext(mock.patch.dict(clone.CONFIG, {
+            'stage': 'bytes', 'repeats': 1,
+            'byte_totals': (8192, 16384), 'byte_files': 2,
         }))
+        self.enterContext(mock.patch.object(clone, 'fstype', return_value='tmpfs'))
 
     def invoke(self):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            return run_benchmark(['openclaw-session', '--dirs', *map(str, self.targets)])
+            return run_benchmark(['clone', '--dirs', *map(str, self.targets)])
 
     def run_dir(self):
-        return next((self.root / 'results' / 'openclaw-session').iterdir())
+        return next((self.root / 'results' / 'clone').iterdir())
 
     def test_default_summary_contains_all_measured_targets(self):
         self.assertEqual(self.invoke(), 0)
         run_dir = self.run_dir()
         records = [json.loads(line) for line in (run_dir / 'results.jsonl').read_text().splitlines()]
         self.assertEqual({row['target']['name'] for row in records}, {'a', 'b'})
-        for record in records:
-            metrics, details = record['metrics'], record['details']
-            samples = details['turn_samples_ms']
-            self.assertEqual(len(samples), metrics['turns'])
-            self.assertAlmostEqual(sum(samples) / len(samples), metrics['turn_mean_ms'])
-            self.assertEqual(details['rows']['transcript_events'], metrics['new_events'])
-            self.assertEqual(details['rows']['transcript_event_identities'], metrics['new_events'])
-            self.assertEqual(details['rows']['session_transcript_active_events'], metrics['new_events'])
-        expected = {(row['target']['name'], row['case'], metric): value
+        expected = {(f"{row['target']['name']}/{row['details']['copier']}",
+                     row['case'], metric): value
                     for row in records for metric, value in row['metrics'].items()}
         with (run_dir / 'summary.csv').open(newline='') as handle:
             rows = list(csv.DictReader(handle))
@@ -222,40 +215,38 @@ class SummaryRunTests(unittest.TestCase):
             self.assertEqual(row['run_ids'], run_dir.name)
 
     def test_summary_write_failure_preserves_measurements_without_rerunning(self):
-        measure = openclaw_session.run
+        measure = clone.run
 
         def block_csv(ctx, args):
             measure(ctx, args)
             (ctx.result_dir.parent / 'summary.csv').mkdir(exist_ok=True)
 
-        with mock.patch.object(openclaw_session, 'run', block_csv):
+        with mock.patch.object(clone, 'run', block_csv):
             self.assertEqual(self.invoke(), 1)
         records = [json.loads(line) for line in (self.run_dir() / 'results.jsonl').read_text().splitlines()]
-        self.assertEqual([row['target']['name'] for row in records], ['a', 'b'])
-        self.assertTrue(all(row['details']['integrity_check'] == 'ok' for row in records))
+        self.assertEqual([row['target']['name'] for row in records], ['a', 'a', 'b', 'b'])
         self.assertTrue((self.run_dir() / 'summary.csv').is_dir())
 
     def test_failed_workload_does_not_export_summary(self):
-        with mock.patch.dict(openclaw_session.CONFIG, {'pragma': ('unsupported=1',)}):
-            with self.assertRaises(openclaw_session.BenchmarkError):
+        with mock.patch.dict(clone.CONFIG, {'copiers': ['missing']}):
+            with self.assertRaises(clone.BenchmarkError):
                 self.invoke()
         self.assertEqual((self.run_dir() / 'results.jsonl').read_text(), '')
         self.assertFalse((self.run_dir() / 'summary.csv').exists())
 
     def test_later_target_failure_keeps_earlier_rows_without_summary(self):
-        measure = openclaw_session.run
+        measure = clone.run
 
-        def block_second_database(ctx, args):
+        def block_second_scratch(ctx, args):
             if ctx.target.name == 'b':
-                (ctx.work_dir / openclaw_session.DB_FILENAME).mkdir()
+                (ctx.work_dir / 'scratch').write_text('not a directory')
             measure(ctx, args)
 
-        with mock.patch.object(openclaw_session, 'run', block_second_database):
-            with self.assertRaises(sqlite3.OperationalError):
+        with mock.patch.object(clone, 'run', block_second_scratch):
+            with self.assertRaises(OSError):
                 self.invoke()
         records = [json.loads(line) for line in (self.run_dir() / 'results.jsonl').read_text().splitlines()]
-        self.assertEqual([row['target']['name'] for row in records], ['a'])
-        self.assertEqual(records[0]['details']['integrity_check'], 'ok')
+        self.assertEqual([row['target']['name'] for row in records], ['a', 'a'])
         self.assertFalse((self.run_dir() / 'summary.csv').exists())
 
 

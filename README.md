@@ -12,7 +12,7 @@ agent_fs_bench/
   analysis.py             # DuckDB 汇总、查询与绘图
   results.py              # JSONL 运行上下文与复现信息
   targets.py              # 目录列表与别名
-  benchmarks/             # 7 个 workload + 顶部 CONFIG
+  benchmarks/             # 6 个 workload + 顶部 CONFIG
 experiments/              # 不含内部信息的 TOML 示例
 local/                    # 私有目标/SSH 配置，不提交
 results/<bench>/<run-id>/ # results.jsonl、summary.csv 和诊断附件
@@ -84,8 +84,7 @@ uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 | `run mini-dev-workflow` | 固定小型 C 项目的完整 Git worktree 开发流程 | [dev workflow](docs/bench-dev-workflow.md) |
 | `run npm-install` | warm cache、cold `node_modules` 的离线 npm/pnpm 安装；固定 lockfile fixture | [npm install](docs/bench-npm-install.md) |
 | `run clone` | 同文件系统持久化目录克隆；完整目录请求并发、数据量/文件数扫描，支持按目标选择原生命令 | [clone](docs/bench-clone.md) |
-| `run openclaw-session` | 合成 OpenClaw transcript SQLite 写入 | [session](docs/bench-openclaw-session.md) |
-| `run kvtest` | SQLite 官方 kvtest，每次 BLOB 覆写一次提交 | [kvtest](docs/bench-kvtest-openclaw.md) |
+| `run kvtest` | SQLite 官方单表随机 BLOB 覆写，每次写入一个事务；不是 OpenClaw 重放 | [kvtest 与负载校准](docs/bench-kvtest-openclaw.md) |
 | `run multi-host` | 多台 SSH 主机同时在共享文件系统执行私有树操作和目录竞争 | [multi-host](docs/bench-multi-host-nas.md) |
 
 ```sh
@@ -93,7 +92,6 @@ uv run python -m agent_fs_bench run dev-workflow --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run mini-dev-workflow --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run npm-install --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a -- --smoke
-uv run python -m agent_fs_bench run openclaw-session --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run kvtest --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run multi-host --dirs /mnt/fs-a
 ```
@@ -115,7 +113,7 @@ results/
     summary.csv
     fs-a/                 # 可选诊断附件
     fs-b/
-  openclaw-session/<run-id>/
+  kvtest/<run-id>/
     results.jsonl
     summary.csv
 ```
@@ -172,11 +170,11 @@ uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl' \
 uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl' \
   --sql 'SELECT benchmark, "case", metric, value FROM metrics'
 
-# 写出 results/session.pdf、session.png（600 dpi）和内嵌数据的 session.py
+# 写出 results/clone.pdf、clone.png（600 dpi）和内嵌数据的 clone.py
 uv run --group analysis python -m agent_fs_bench plot \
-  'results/openclaw-session/*/results.jsonl' \
-  --benchmark openclaw-session --metric turns_per_s --ylabel 'Throughput (turns/s)' \
-  --cases small,medium,large --targets ours,ext4,nfs --output results/session
+  'results/clone/*/results.jsonl' \
+  --benchmark clone --metric mib_s --ylabel 'Throughput (MiB/s)' \
+  --cases L256M/C1/cp,L1G/C1/cp --targets ours,ext4,nfs --output results/clone
 ```
 
 CSV 是可随时重新生成的派生文件；DuckDB 是派生缓存，不维护数据库版本。默认分类箱线图将所选输入中的跨 run 样本合并到目标 × case；clone 自动按数据量、文件数和两类并发场景生成数值横轴折线图，以 `target/copier` 为系列，延迟直接汇集原始请求样本、显示中位数和 IQR。分析前由人工保证运行环境、参数和目标别名一致；要分析某次运行，直接只传入该 run 的 JSONL，或使用自定义 SQL 按 `run_id` 筛选。clone 的新完整目录请求数据与旧 shard 结果不兼容，须重新测量。
@@ -211,6 +209,6 @@ uv run python tools/gen_mini_source_repo.py --force
 
 `data/pnpm-bench*` 来自 [pnpm/pnpm](https://github.com/pnpm/pnpm) 的 `5bd38b19`（2026-11-03）。npm lockfile 由同一 manifest 执行 `npm install --package-lock-only --legacy-peer-deps --ignore-scripts --cache <tmp>` 生成，不是上游 pnpm lockfile 的转换。npm-install 只使用这两个已提交 fixture。
 
-OpenClaw schema 参考 [openclaw/openclaw](https://github.com/openclaw/openclaw) `5f6f15fed0d6`，未复制其代码。kvtest 使用 SQLite 官方源代码，版本和哈希记录在结果中。
+kvtest 使用 SQLite 官方源代码，版本和哈希记录在结果中。OpenClaw 的 session/transcript SQLite 存储仅作为研究动机；当前负载规模是合成控制参数，没有 OpenClaw 实测消息分布或端到端性能主张。源码依据、最小采样方案和论文表述见 [kvtest 文档](docs/bench-kvtest-openclaw.md#versioned-openclaw-evidence-and-limits)。
 
 上游 YoloFS/perf-eval 当前未提供 LICENSE，公开分发 fixtures 前仍需确认授权；本次整理不改变授权状态。Linux 历史代码为 GPL-2.0。

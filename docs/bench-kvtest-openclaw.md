@@ -1,22 +1,25 @@
-# OpenClaw-shaped SQLite writes via official `kvtest`
+# Transactional SQLite writes via official `kvtest`
 
 Runs SQLite's own [`test/kvtest.c`](https://github.com/sqlite/sqlite/blob/version-3.54.1/test/kvtest.c)
-with `--multitrans` so every BLOB overwrite commits in its own transaction.
-That commit shape is the closest match among SQLite's shipped test programs to
-OpenClaw's per-turn transcript write.
+with `--update --random --multitrans`: overwrite existing BLOB rows, one
+autocommit transaction per write. This is a controlled filesystem microbenchmark,
+not an OpenClaw session replay or a prediction of application latency.
 
-用 SQLite 官方 `kvtest --multitrans` 做「每次写一个事务」的基准，用来近似
-OpenClaw 每个 turn 一次提交的写路径。
+OpenClaw motivates this workload because its per-agent database stores session
+and transcript state. The research question is: **under the same declared SQLite
+workload and persistence settings, how does the underlying filesystem affect
+transactional write cost?** This complements tree-copy and development-workflow
+benchmarks with database pages, journal/WAL writes and synchronization. It does
+not measure model inference, tool execution, or complete agent-turn latency.
 
-## Why not `speedtest1`
+## Why `--multitrans`
 
-`speedtest1` batches roughly 750 statements per `COMMIT` (`--size 10` produced
-21023 INSERTs across 28 commits), so it measures B-tree throughput rather than
-commit cost. Measured on one machine, `speedtest1 --size 100` moved only 16%
-between `journal_mode=DELETE`, `WAL`, and `WAL --nosync`, which shows the
-journal path is barely exercised. `kvtest --multitrans` commits per write and
-does react to the journal: 4096-byte writes cost 12.5 µs/op batched versus
-38.75 µs/op with `--multitrans`.
+Without `--multitrans`, kvtest wraps the operations in one outer transaction;
+with it, each update commits separately. This gives explicit transaction
+granularity without inventing an application schema. It does not establish that
+OpenClaw commits once per user turn: an application turn, transcript append,
+SQL statement and committed transaction are different units. Their relationship
+must be observed at the actual writer, not inferred from this benchmark.
 
 ## Run / 运行
 
@@ -32,7 +35,8 @@ repeats — are recorded in `parameters` as requests; `build_dir` and
 `force_download` are run management and are not recorded. Change that code for
 an ablation; do not commit private settings. Defaults: `count=2000`,
 `size=2048`, `variance=1024`, `cache_size=1000` KiB, `jmode=wal`, `repeats=1`,
-`mmap=0`, `nosync=false` (synchronous FULL).
+`mmap=0`, `nosync=false` (SQLite's default synchronization, normally FULL;
+kvtest does not print a readback).
 
 The first run downloads the SQLite 3.54.1 amalgamation and `kvtest.c` into
 `build/kvtest/` at the repository root (git-ignored) and compiles `kvtest` with
@@ -109,56 +113,6 @@ The SQLite version is the one compiled into the measured binary, not the
 Python `sqlite3` module version. `--mmap` is only echoed by kvtest and
 `synchronous` is never printed, so neither is reported as observed.
 
-## Pragma matching against OpenClaw
-
-Reference: `src/infra/sqlite-wal.ts` and `src/state/openclaw-agent-db.ts` at
-`openclaw@5f6f15fed0d6ba618cf781c9686a8b93f499564b`.
-
-| Parameter | OpenClaw agent DB | Requested here | Read back by kvtest |
-| --- | --- | --- | --- |
-| `journal_mode` | `WAL` | `CONFIG["jmode"] = "wal"` | yes, `details.observed.journal_mode` |
-| `synchronous` | `NORMAL` | `FULL`, or `OFF` with `--nosync` | **no**, never printed |
-| `busy_timeout` | `5000` ms | not set; no kvtest option | no |
-| `foreign_keys` | `ON` | n/a (single table, no foreign keys) | no |
-| `journal_size_limit` | `64 MiB` | not set; no kvtest option | no |
-| `auto_vacuum` | `INCREMENTAL` on fresh db | not set; `kvtest init` cannot set it | no |
-| `wal_autocheckpoint` | `0` (worker-maintained) | not set; SQLite default 1000 | **no** |
-| `cache_size` | default | `CONFIG["cache_size"]`, default 1000 KiB | yes, `details.observed.cache_size` |
-| `mmap_size` | default | `CONFIG["mmap"]`, default 0 | **no**, request is only echoed |
-| `page_size` | default | database default | yes, `details.observed.page_size` |
-| SQLite version | n/a | source pinned to 3.54.1 | yes, `parameters.tool_versions.sqlite` |
-
-`wal_autocheckpoint` is the gap that matters most. OpenClaw sets it to `0`
-because a worker checkpoints on a 10 s tick; this harness has no worker.
-`kvtest` can only force it to `0` via `--nocheckpoint`, which lets the WAL grow
-without bound and pushes one large checkpoint to the end of the run — measured
-at 1.98 GiB of WAL after 6 s on one machine, which is a state OpenClaw never
-occupies. The default of 1000 pages (about 4 MiB at a 4 KiB page size) keeps
-the WAL bounded, so the harness leaves it alone and does not claim a different
-observed value.
-
-`synchronous=FULL` is *stricter* than OpenClaw's `NORMAL`, so these numbers are
-an upper bound on durability work, not a faithful reproduction. It is a request
-only: kvtest never prints the synchronous mode, so it is not recorded as an
-observed setting.
-
-Deliberate workload gaps:
-
-- **No secondary indexes.** OpenClaw maintains 12 indexes across 7 tables in
-  the write path; `kv` has one primary key.
-- **No FTS5.** OpenClaw writes an FTS5 projection inside the same transaction.
-  The `openclaw-session` workload includes FTS by default; `kvtest` writes none.
-- **Uniform payloads.** OpenClaw payloads are 90% 1–4 KiB, 9% 256 KiB, 1% 1 MiB
-  JSON text; `kvtest` writes fixed-size BLOBs varied only by
-  `CONFIG["variance"]`.
-
-`kvtest` is a **single-table random BLOB overwrite comparison benchmark**, with
-one commit per operation, not a strict lower bound on OpenClaw latency: the
-simpler schema and stronger default synchronization pull costs in opposite
-directions. `Microseconds per BLOB write` is total elapsed time divided by the
-operation count, including connection setup and the final close/checkpoint;
-it is not a sampled transaction latency distribution.
-
 The harness passes a negative SQLite `cache_size` so `CONFIG["cache_size"]` is
 in KiB, not pages. `details.observed.cache_size` is the raw PRAGMA value
 kvtest printed, so `-1000` means 1000 KiB. `details.observed.journal_mode` comes
@@ -167,6 +121,192 @@ inspection connection). After all timed repeats finish, the harness runs
 `kvtest stat <db>` once with the same binary, outside any timing; any
 `Integrity-check` result other than `ok` is a hard error before a row is
 emitted.
+
+## Versioned OpenClaw evidence and limits
+
+The application reference is
+[`openclaw@5f6f15fed0d6ba618cf781c9686a8b93f499564b`](https://github.com/openclaw/openclaw/tree/5f6f15fed0d6ba618cf781c9686a8b93f499564b).
+These are version-specific source facts, not measurements of deployed sessions:
+
+- [Database layout](https://github.com/openclaw/openclaw/blob/5f6f15fed0d6ba618cf781c9686a8b93f499564b/docs/reference/database-schemas/layout.md#L12-L16)
+  lists `~/.openclaw/agents/<agentId>/agent/openclaw-agent.sqlite` as the
+  per-agent store for sessions, transcripts and other agent state.
+- [Transcript payload storage](https://github.com/openclaw/openclaw/blob/5f6f15fed0d6ba618cf781c9686a8b93f499564b/docs/reference/database-schemas/layout.md#L56-L66)
+  retains event JSON as TEXT or compressed `event_zstd` BLOBs. An export's JSON
+  byte length is therefore not necessarily its stored SQLite payload size.
+  [Cold archives](https://github.com/openclaw/openclaw/blob/5f6f15fed0d6ba618cf781c9686a8b93f499564b/docs/reference/database-schemas/layout.md#L214-L234)
+  can hold authoritative history outside SQLite; this microbenchmark excludes them.
+- [Agent connection setup](https://github.com/openclaw/openclaw/blob/5f6f15fed0d6ba618cf781c9686a8b93f499564b/src/state/openclaw-agent-db.ts#L465-L476)
+  requests `synchronous=NORMAL`, foreign keys and `autoCheckpointPages=0` for
+  worker maintenance outside foreground commits.
+- The [worker append-message handler](https://github.com/openclaw/openclaw/blob/5f6f15fed0d6ba618cf781c9686a8b93f499564b/src/agents/sessions/session-manager-metadata.worker.ts#L207-L228)
+  calls the [agent write transaction owner](https://github.com/openclaw/openclaw/blob/5f6f15fed0d6ba618cf781c9686a8b93f499564b/src/state/openclaw-agent-db-admission.ts#L181-L229).
+  [Nested calls use savepoints](https://github.com/openclaw/openclaw/blob/5f6f15fed0d6ba618cf781c9686a8b93f499564b/src/infra/sqlite-transaction.ts#L359-L441),
+  and [batch append](https://github.com/openclaw/openclaw/blob/5f6f15fed0d6ba618cf781c9686a8b93f499564b/src/config/sessions/session-accessor.sqlite-transcript-store.ts#L403-L449)
+  can insert several events inside the caller's transaction. Neither a fixed
+  event count nor a fixed commits-per-turn ratio follows from these entry points.
+- [Filesystem policy](https://github.com/openclaw/openclaw/blob/5f6f15fed0d6ba618cf781c9686a8b93f499564b/src/infra/sqlite-wal-filesystem.ts#L10-L24)
+  and [journal setup](https://github.com/openclaw/openclaw/blob/5f6f15fed0d6ba618cf781c9686a8b93f499564b/src/infra/sqlite-wal.ts#L300-L324)
+  choose rollback journaling for some network/cross-VM storage instead of WAL.
+  Do not describe WAL as an unconditional OpenClaw setting on every target.
+
+| Dimension | Reference application | Current kvtest workload |
+| --- | --- | --- |
+| Data operations | Transcript/state writes and derived projections | Random overwrite of existing BLOBs in one table |
+| Transaction granularity | Must be captured at the writer | One update per autocommit transaction |
+| Payload sizes and operation frequencies | No empirical distribution collected here | Deliberately synthetic `CONFIG` inputs |
+| Schema/content work | Metadata, indexes, FTS and optional compression | Primary key only; no FTS or transcript compression |
+| Journal mode | Path-dependent policy | Explicit `jmode`; actual mode printed in results |
+| Synchronization | Agent setup requests NORMAL | SQLite build default (normally FULL), or OFF with `nosync`; not read back |
+| WAL maintenance | Worker-managed; timing must be observed | SQLite default autocheckpoint; no application worker |
+
+The retired synthetic session workload is not evidence for OpenClaw's message
+size distribution, events per turn, or FTS cost share. No such empirical claims
+are made here. Current defaults (`size=2048`, `variance=1024`, `count=2000`)
+are experiment controls, not fitted application statistics. In SQLite 3.54.1,
+kvtest initializes lengths using `size + random() % (variance + 1)`; with these
+defaults lengths can range from 2048 to 3072 bytes. This is not a replay of a
+measured size sequence, and the generated database is not byte-identical per run.
+The size expression is from the [pinned kvtest initialization](https://github.com/sqlite/sqlite/blob/version-3.54.1/test/kvtest.c#L362-L376).
+
+Changing journal mode, synchronization, transaction grouping, schema or checkpoint
+policy changes the workload. FULL versus NORMAL is not a calibrated latency
+upper bound, and fewer tables is not a calibrated lower bound. Keep each setting
+fixed across targets and report the comparison as a SQLite microbenchmark.
+For network targets, WAL use also requires the intended locking/shared-memory
+semantics; a successful single-process run is not a multi-client safety proof.
+One transaction does not imply one fsync: under [WAL with NORMAL synchronization](https://www.sqlite.org/pragma.html#pragma_synchronous),
+most transactions do not sync, while checkpointing performs synchronization.
+This is why commit grouping and maintenance policy both matter to the comparison.
+
+`Microseconds per BLOB write` is total elapsed time divided by the operation
+count, including connection setup and final close/checkpoint. It is not a
+sampled BEGIN-to-COMMIT latency distribution.
+
+## Minimal real-workload calibration plan (not yet performed)
+
+The goal is an **empirically calibrated microbenchmark**, not a full OpenClaw
+performance evaluation. Static analysis supplies candidate paths and settings;
+an instrumented application run supplies transaction and size observations.
+
+1. **Pin a small, explicit workload set.** Start with fixed text-only sessions,
+   coding/tool-use sessions, and a separate bounded large-tool-output case. Use
+   public task inputs, a fixed tool workspace and model configuration; record
+   the actual outputs because model responses need not be deterministic. Begin
+   with three independent sessions per case as a pilot, then increase coverage
+   if transaction/size profiles differ materially. This is a selected workload
+   corpus, not a representative sample of all OpenClaw users. Keep fresh-session
+   setup and continued-session appends separate; label the large-output case as
+   a sensitivity case rather than assigning it an invented production frequency.
+2. **Capture the actual SQLite writer, including worker connections.** After
+   serialization/compression, record scenario/session/turn identifiers, connection
+   and transaction identifiers, ordered SQL templates, parameter types and byte
+   lengths, BEGIN/COMMIT/ROLLBACK outcomes and statement row counts. Count outer
+   committed transactions, not SAVEPOINT release operations or transcript events.
+   Preserve read statements that participate in the write transaction. Record
+   actual connection PRAGMAs, SQLite version, schema identity and initial row/DB
+   sizes. Attribute background maintenance separately from transcript writes.
+   SQL tracing must cover the native writer and its transaction owner, not only
+   RPC submission or UI events. A final DB or JSONL export can help measure
+   retained row sizes, but cannot reconstruct deleted events, write ordering,
+   past transaction boundaries or previous checkpoint work.
+3. **Measure storage work as well as logical messages.** For each transaction,
+   retain event UTF-8 bytes, encoded/stored bytes, statements/rows by operation,
+   compression use, relevant FTS writes, and checkpoint timing/completion. WAL
+   length alone is insufficient because allocated WAL space may be reused.
+   A short optional syscall/VFS trace can validate write/sync/locking behavior,
+   but does not replace SQL/bind/transaction observations. Keep collection output
+   outside the measured storage. Instrumented collection timings are not the
+   filesystem performance results.
+4. **Freeze and validate the resulting workload.** For metadata-only calibration,
+   export transaction grouping and size sequences without private message text.
+   Such metadata cannot support a faithful FTS/compression replay by itself:
+   equal-length random bytes do not preserve tokenization or compressibility.
+   A content-sensitive replay must retain the controlled public corpus (and
+   relational ID consistency), the real schema/indexes, statement order and
+   stored representation. Publish the corpus hash and provenance. Validate
+   completed transactions, resulting rows and DB integrity before timing it.
+5. **Separate calibration from comparison.** Generate/record the corpus once,
+   then use the same initial DB state and frozen operations on every filesystem;
+   do not rerun the model independently on each target. Remove model/tool/network
+   think time for a capacity-oriented storage microbenchmark, preserving SQL
+   transaction boundaries and dependencies. An arrival-paced experiment is a
+   different case and must not be called saturation throughput. Either preserve
+   and measure the application's checkpoint owner, or choose and disclose a
+   controlled policy; do not silently move all checkpoint work out of the result.
+
+For this study, start with one writer and a fixed prefilled DB state; add readers
+only if the captured sessions show relevant overlap. Report completed transactions
+per second, individually sampled transaction latency if the replay provides it,
+and checkpoint/drain cost under an explicit timing boundary. Use whole independent
+runs for uncertainty across targets, not thousands of correlated events as if
+they were independent experimental repetitions.
+
+SQLite WAL checkpointing here means transferring committed WAL pages back into
+the database; it is not a filesystem snapshot or the removed workflow checkpoint
+mechanism. Include the selected SQLite maintenance policy even when filesystem
+snapshots are out of scope.
+
+### Smallest practical collection route
+
+First collect only normal hot transcript appends; treat imports, compaction and
+cold archival as out of scope unless one is explicitly added as a separate case.
+Pin OpenClaw and its Node runtime. Supported recent Node versions expose
+[`sqlite.db.query`](https://nodejs.org/docs/latest-v24.x/api/diagnostics_channel.html#event-sqlitedbquery)
+through `node:diagnostics_channel` (added in 24.22.0 / 26.8.0). OpenClaw's
+[runtime range](https://github.com/openclaw/openclaw/blob/5f6f15fed0d6ba618cf781c9686a8b93f499564b/package.json#L2530-L2532)
+also permits older Node versions without this event, so verify coverage rather
+than treating an empty trace as no database activity.
+
+Subscribe from a preload in every writer process/thread and confirm it observes
+the known append. The event provides the connection, expanded SQL and an internal
+statement-duration estimate; it has no structured bind array, transaction ID,
+start event or turn ID. Expanded SQL contains the bound message text/BLOBs and
+must not be published as harmless metadata. It is useful to discover actual
+statement order and transaction shapes on a controlled public corpus, not to
+measure end-to-end transaction latency or infer exact bind lengths by string
+length. Expansion also makes BLOBs hex text rather than their stored byte count.
+
+For the small calibration run, add a narrow observation at the actual connection
+execution and transaction owner when exact bind lengths, turn attribution or
+commit outcomes are needed. Record string UTF-8 and BLOB byte lengths before
+binding, plus transaction completion; do not build a general tracing platform.
+Observe checkpoint completion outside the SQL callback. Inspect the final DB to
+cross-check retained sizes, but not as a substitute for the runtime write trace.
+
+The resulting extension, if needed, can be a small hot-append microbenchmark:
+reuse the pinned storage path or captured transaction groups and required schema
+with the frozen public payloads, while excluding the model, gateway and tool
+execution from timing. There is no need to replay the entire agent. Preserve or
+explicitly exclude content-dependent FTS/compression work, and state that boundary.
+
+### What can remain in `kvtest`
+
+Keep this official workload as the controlled single-table baseline. Use explicit
+payload-size cases (and a rows/DB working set) to test sensitivity; call them
+synthetic unless fitted from captured storage-side observations. `kvtest` cannot
+express an arbitrary size sequence, transcript append semantics, the real schema,
+NORMAL synchronization or the application checkpoint worker. Matching a median
+message size does not make it an OpenClaw replay. If those dimensions matter,
+evaluate a separate minimal schema/transaction replay instead of adding that
+claim to kvtest. No new replay or collector is implemented by this document.
+
+### Paper wording
+
+For the current implementation (no empirical calibration yet):
+
+> Motivated by the use of SQLite for agent session and transcript state in the
+> referenced OpenClaw revision, we evaluate a controlled SQLite microbenchmark
+> using the official kvtest workload. Each operation overwrites an existing BLOB
+> in its own transaction. We hold workload and persistence settings fixed across
+> filesystems. Payload sizes are synthetic experimental controls, not a measured
+> OpenClaw distribution; the experiment neither replays OpenClaw nor estimates
+> its end-to-end latency.
+
+Only after performing the sampling plan, describe a new workload as calibrated
+from the named sessions and report their revision, scenarios, counts, observed
+transaction/size profiles and archived corpus. Do not generalize that selected
+corpus to all OpenClaw usage or call metadata-only calibration a faithful replay.
 
 ## Artifacts
 

@@ -1,8 +1,8 @@
 """Replay the pinned Linux workflow in a runner-owned checkout.
 
 Configuration, builds, command loading/replay, commits and tree assertions are
-measured. Preparation and reset/clean cleanup are separate. Checkpoints are
-zero-cost boundaries, not backend snapshots; shell pipelines omit pipefail.
+measured. Preparation and reset/clean cleanup are separate. No checkpoints or
+backend snapshots run; shell pipelines omit pipefail.
 """
 
 from __future__ import annotations
@@ -629,8 +629,6 @@ def verify_tree(repo: Path, commit_id: str) -> dict[str, Any]:
     return {"commit": commit_id, "tree": actual, "ok": True}
 
 
-def record_checkpoint(step: int, phase: str, steps: list[dict[str, Any]]) -> None:
-    steps.append({"step": f"checkpoint: {phase}", "ms": 0})
 
 
 def run_workflow(
@@ -674,7 +672,6 @@ def run_workflow(
 
     steps: list[dict[str, Any]] = []
     assertions: list[dict[str, Any]] = []
-    checkpoint_step = 0
     cleanup_error: str | None = None
     cleanup_ms: int | None = None
     preparation_ms: int | None = None
@@ -716,8 +713,6 @@ def run_workflow(
         )
         steps.append({"step": "config: tinyconfig", "ms": elapsed_ms(config_start)})
 
-        checkpoint_step += 1
-        record_checkpoint(checkpoint_step, "config", steps)
 
         initial = run_command(
             ["make", f"-j{jobs}"],
@@ -727,8 +722,6 @@ def run_workflow(
         )
         steps.append({"step": "initial-build: make", "ms": initial.ms})
 
-        checkpoint_step += 1
-        record_checkpoint(checkpoint_step, "initial-build", steps)
 
         for commit in commits:
             commit_id = commit["id"]
@@ -768,11 +761,6 @@ def run_workflow(
                     steps.append(
                         {"step": f"{category}: {commit_id} #{idx}", "ms": result.ms}
                     )
-                    if category == "edit":
-                        checkpoint_step += 1
-                        record_checkpoint(
-                            checkpoint_step, f"{commit_id} #{idx}", steps
-                        )
 
             incremental = run_command(
                 ["make", f"-j{jobs}"],
@@ -784,10 +772,6 @@ def run_workflow(
                 {"step": f"incremental-build: {commit_id}", "ms": incremental.ms}
             )
 
-            checkpoint_step += 1
-            record_checkpoint(
-                checkpoint_step, f"incremental-build {commit_id}", steps
-            )
 
             status = run_git(
                 repo,
@@ -830,8 +814,6 @@ def run_workflow(
             )
             steps.append({"step": f"git-commit: {commit_id}", "ms": commit_result.ms})
 
-            checkpoint_step += 1
-            record_checkpoint(checkpoint_step, f"git-commit {commit_id}", steps)
             verify_start = time.perf_counter_ns()
             assertions.append(verify_tree(repo, commit_id))
             steps.append(
@@ -884,7 +866,7 @@ def run_workflow(
         )
 
     unattributed_ms = max(0, (workflow_ms or 0) - sum(
-        step["ms"] for step in steps if not step["step"].startswith("checkpoint: ")
+        step["ms"] for step in steps
     ))
 
     return {
