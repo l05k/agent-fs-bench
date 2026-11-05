@@ -83,7 +83,7 @@ uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 | `run dev-workflow` | Linux 内核配置、编译、搜索、修改、提交、树验证；固定 x86 配置输入 | [dev workflow](docs/bench-dev-workflow.md) |
 | `run mini-dev-workflow` | 固定小型 C 项目的完整 Git worktree 开发流程 | [dev workflow](docs/bench-dev-workflow.md) |
 | `run npm-install` | warm cache、cold `node_modules` 的离线 npm/pnpm 安装；固定 lockfile fixture | [npm install](docs/bench-npm-install.md) |
-| `run clone` | 同文件系统树复制及并发复制，支持代码配置的外部 copier | [clone](docs/bench-clone.md) |
+| `run clone` | 同文件系统持久化目录克隆；完整目录请求并发、数据量/文件数扫描，支持按目标选择原生命令 | [clone](docs/bench-clone.md) |
 | `run openclaw-session` | 合成 OpenClaw transcript SQLite 写入 | [session](docs/bench-openclaw-session.md) |
 | `run kvtest` | SQLite 官方 kvtest，每次 BLOB 覆写一次提交 | [kvtest](docs/bench-kvtest-openclaw.md) |
 | `run multi-host` | 多台 SSH 主机同时在共享文件系统执行私有树操作和目录竞争 | [multi-host](docs/bench-multi-host-nas.md) |
@@ -149,7 +149,7 @@ uv run python -m agent_fs_bench run clone \
 target,case,metric,samples,mean,median,minimum,maximum,stddev,benchmark,run_ids
 ```
 
-一行是 `benchmark × target.name × case × metric` 的全局统计。多次运行的样本合并；`run_ids` 按字典序列出参与该行统计的去重运行标识，以分号分隔。不同参数、源码、目标路径或机器环境不再自动拆组，实验者必须确保同一目标别名下的输入可比较。导出在计时之外执行；导出失败返回非零并保留 JSONL，不重跑 benchmark。
+一行是 `benchmark × target × case × metric` 的全局统计。clone 的汇总系列为 `target.name/copier`，区分同一文件系统上的原生 clone 与 `cp-r`；其他 benchmark 仍使用 `target.name`。多次运行的样本合并；`run_ids` 按字典序列出参与该行统计的去重运行标识，以分号分隔。不同参数、源码、目标路径或机器环境不再自动拆组，实验者必须确保同一系列下的输入可比较。导出在计时之外执行；导出失败返回非零并保留 JSONL，不重跑 benchmark。
 
 CSV 的用途是快速比较本次各目标、用表格工具检查统计量，以及直接交给只接受扁平表格的绘图或分析工具。它不是原始数据归档的替代品：保留 JSONL，CSV 丢失或需重新汇总时直接重建，不必重跑 benchmark。重新计算逐操作分位数、检查离群值或分析详细步骤时，应读取 JSONL。
 
@@ -179,9 +179,9 @@ uv run --group analysis python -m agent_fs_bench plot \
   --cases small,medium,large --targets ours,ext4,nfs --output results/session
 ```
 
-CSV 是可随时重新生成的派生文件；DuckDB 是派生缓存，不维护数据库版本。箱线图与默认汇总采用相同的全局分组口径，将所选输入中的跨 run 样本合并到目标 × case 的箱子。分析前由人工保证运行环境、参数和目标别名一致；要分析某次运行，直接只传入该 run 的 JSONL，或使用自定义 SQL 按 `run_id` 筛选。
+CSV 是可随时重新生成的派生文件；DuckDB 是派生缓存，不维护数据库版本。默认分类箱线图将所选输入中的跨 run 样本合并到目标 × case；clone 自动按数据量、文件数和两类并发场景生成数值横轴折线图，以 `target/copier` 为系列，延迟直接汇集原始请求样本、显示中位数和 IQR。分析前由人工保证运行环境、参数和目标别名一致；要分析某次运行，直接只传入该 run 的 JSONL，或使用自定义 SQL 按 `run_id` 筛选。clone 的新完整目录请求数据与旧 shard 结果不兼容，须重新测量。
 
-图样式遵循 `.agents/skills/paper-figure-style/SKILL.md`（Arial 9pt、矢量 PDF、图例在上、主系统首位用首色、hatch 区分、四边框、无网格），共享实现在 `agent_fs_bench/figure.py`。`--targets` 决定图例顺序，第一个为主系统；`--cases` 决定 x 轴顺序并筛选 case；两者未给出时取全部并按字母序。图例直接显示 target 别名，别名应取论文中的名称。`--ylabel` 默认为 metric 名。`--size` 按实验设定英寸尺寸，默认单栏 `3.5 1.5`。`<stem>.py` 内含原始样本与绘图代码，`python <stem>.py` 无需 JSONL 即可重新生成 PDF/PNG。图中文字均为英文，缺少 Arial 时直接报错，不替换字体。
+图样式遵循 `.agents/skills/paper-figure-style/SKILL.md`（Arial 9pt、矢量 PDF、图例在上、主系统首位用首色、hatch/marker 区分、四边框、无网格），共享实现在 `agent_fs_bench/figure.py`。`--targets` 决定图例顺序，第一个为主系统；clone 使用 `target/copier` 系列名，其他图直接显示 target 别名。`--cases` 决定分类图的 x 轴顺序并筛选 case，clone 数值扫描只筛选、仍按横轴数值排序。`--ylabel` 默认为 metric 名（clone 常用指标自带易读标签）。`--size` 按实验设定英寸尺寸，默认单栏 `3.5 1.5`。clone 为各扫描输出 `<stem>-bytes`、`<stem>-files`、`<stem>-concurrency-large`、`<stem>-concurrency-small`，只输出输入中存在的组；每组的 Python 脚本内含原始样本与绘图代码，无需 JSONL 即可重新生成 PDF/PNG。图中文字均为英文，缺少 Arial 时直接报错，不替换字体。
 
 ## 可复现性与资源边界
 
