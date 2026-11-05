@@ -1,65 +1,33 @@
 #!/usr/bin/env python3
-"""Run SQLite's official ``kvtest --multitrans`` write benchmark.
+"""Run SQLite's official single-commit BLOB overwrite microbenchmark.
 
-This is a thin harness around SQLite's own ``test/kvtest.c``. It does not
-reimplement the workload: it downloads the official sources, compiles them on
-the test machine, and runs ``kvtest run --update --multitrans`` so every BLOB
-overwrite commits in its own transaction. That commit shape is the closest
-match in SQLite's shipped test programs to OpenClaw's per-turn transcript
-write (4 events + identities + index state + FTS, one commit).
+The harness downloads and compiles SQLite's ``test/kvtest.c`` and runs
+``kvtest run --update --random --multitrans``. Each BLOB overwrite is an
+autocommit transaction. This isolates a controlled SQLite write workload;
+it is not an OpenClaw transcript replay or an application-latency estimate.
 
-Why ``kvtest`` and not ``speedtest1``: ``speedtest1`` batches ~750 statements
-per transaction, so it mostly measures B-tree throughput, not commit cost.
+OpenClaw's per-agent SQLite store motivates studying transactional storage.
+The reference revision is 5f6f15fed0d6ba618cf781c9686a8b93f499564b; see
+``docs/bench-kvtest-openclaw.md`` for source links and a calibration plan.
+Static analysis establishes schema and configured persistence policy, not
+event-size frequencies, statements per transaction, or transactions per turn.
+CONFIG sizes and row counts are synthetic controls, not measured OpenClaw data.
 
-Deliberate gaps against OpenClaw (keep these in mind when reading the numbers):
+Important differences: kvtest overwrites existing rows in one table, omits
+transcript metadata/FTS/compression, and offers SQLite's default synchronization
+(normally FULL) or ``--nosync`` (OFF), not the reference agent store's NORMAL
+setting. Its WAL autocheckpoint is not the application's worker maintenance policy.
+OpenClaw also selects rollback journaling for some storage types; this harness
+does not reproduce that policy. Compare targets under the same declared SQLite
+settings, rather than interpreting their numbers as equivalent application runs.
 
-  * OpenClaw has 12 indexes across 7 tables in the write path; ``kv`` has one
-    primary key and no secondary index.
-  * OpenClaw writes an FTS5 projection in the same transaction (30-40% of the
-    cost in the transcript workload); ``kvtest`` writes no FTS.
-  * OpenClaw payloads are 90% 1-4 KiB, 9% 256 KiB, 1% 1 MiB JSON text;
-    ``kvtest`` writes fixed-size BLOBs varied only by ``--variance``.
+Reported microseconds/write amortize connection setup and final close/checkpoint;
+they are not individually sampled transaction latencies. JSONL records the actual
+journal mode, cache size and page size printed by kvtest. Other settings remain
+requests. A fresh database directory is allocated for each invocation.
 
-Pragma matching against OpenClaw's agent database
-(``src/infra/sqlite-wal.ts`` + ``src/state/openclaw-agent-db.ts`` at
-openclaw@5f6f15f):
-
-  parameter              OpenClaw                     requested here
-  ---------------------  ---------------------------  -----------------------
-  journal_mode           WAL                          yes (--jmode wal; the
-                                                      actual mode is parsed
-                                                      from kvtest output)
-  synchronous            NORMAL                       NO  (kvtest offers only
-                                                      default FULL or --nosync;
-                                                      never read back)
-  busy_timeout           5000                         NO  (not configurable)
-  foreign_keys           ON                           n/a (single table)
-  journal_size_limit     64 MiB                       NO  (not configurable)
-  auto_vacuum            INCREMENTAL (fresh db)       NO  (init cannot set it)
-  wal_autocheckpoint     0 (worker-maintained)        1000 (SQLite default,
-                                                      never read back)
-  cache_size             (default)                    --cache-size, default
-                                                      1000 KiB (the actual
-                                                      PRAGMA value is parsed
-                                                      from kvtest output)
-  mmap_size              (default)                    --mmap, default 0 (only
-                                                      echoed, never read back)
-
-``wal_autocheckpoint`` is the value that matters most and it cannot be pinned
-to OpenClaw's 0 through ``kvtest``'s options: ``--nocheckpoint`` sets it to 0,
-which lets the WAL grow without bound and pushes one huge checkpoint to the
-end of the run. This harness therefore leaves the SQLite default of 1000
-pages (roughly 4 MiB at a 4 KiB page size) and does not claim to have
-observed a different value.
-
-Reported microseconds/write amortize connection setup and the final close /
-checkpoint as well as the writes. This is a single-table comparison workload,
-not a strict OpenClaw latency lower bound (FULL sync is stronger than NORMAL).
-The shared runner allocates a fresh database directory for every invocation.
-
-The workload uses the standard library; the shared runner needs DuckDB for its
-default post-run CSV summary. A C compiler and network access are needed for
-the first run of a given source revision.
+The workload uses the standard library; the runner needs DuckDB for CSV export.
+A C compiler and network access are needed for the first source download/build.
 """
 
 from __future__ import annotations

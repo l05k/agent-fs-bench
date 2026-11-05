@@ -84,7 +84,7 @@ uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 | `run mini-dev-workflow` | 固定小型 C 项目的完整 Git worktree 开发流程 | [dev workflow](docs/bench-dev-workflow.md) |
 | `run npm-install` | warm cache、cold `node_modules` 的离线 npm/pnpm 安装；固定 lockfile fixture | [npm install](docs/bench-npm-install.md) |
 | `run clone` | 同文件系统树复制及并发复制，支持代码配置的外部 copier | [clone](docs/bench-clone.md) |
-| `run kvtest` | SQLite 官方 kvtest，每次 BLOB 覆写一次提交 | [kvtest](docs/bench-kvtest-openclaw.md) |
+| `run kvtest` | SQLite 官方单表随机 BLOB 覆写，每次写入一个事务；不是 OpenClaw 重放 | [kvtest 与负载校准](docs/bench-kvtest-openclaw.md) |
 | `run multi-host` | 多台 SSH 主机同时在共享文件系统执行私有树操作和目录竞争 | [multi-host](docs/bench-multi-host-nas.md) |
 
 ```sh
@@ -209,6 +209,6 @@ uv run python tools/gen_mini_source_repo.py --force
 
 `data/pnpm-bench*` 来自 [pnpm/pnpm](https://github.com/pnpm/pnpm) 的 `5bd38b19`（2026-11-03）。npm lockfile 由同一 manifest 执行 `npm install --package-lock-only --legacy-peer-deps --ignore-scripts --cache <tmp>` 生成，不是上游 pnpm lockfile 的转换。npm-install 只使用这两个已提交 fixture。
 
-kvtest 使用 SQLite 官方源代码，版本和哈希记录在结果中。
+kvtest 使用 SQLite 官方源代码，版本和哈希记录在结果中。OpenClaw 的 session/transcript SQLite 存储仅作为研究动机；当前负载规模是合成控制参数，没有 OpenClaw 实测消息分布或端到端性能主张。源码依据、最小采样方案和论文表述见 [kvtest 文档](docs/bench-kvtest-openclaw.md#versioned-openclaw-evidence-and-limits)。
 
 上游 YoloFS/perf-eval 当前未提供 LICENSE，公开分发 fixtures 前仍需确认授权；本次整理不改变授权状态。Linux 历史代码为 GPL-2.0。
