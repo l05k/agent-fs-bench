@@ -12,7 +12,7 @@ agent_fs_bench/
   analysis.py             # DuckDB 汇总、查询与绘图
   results.py              # JSONL 运行上下文与复现信息
   targets.py              # 目录列表与别名
-  benchmarks/             # 6 个 workload + 顶部 CONFIG
+  benchmarks/             # 7 个 workload + 顶部 CONFIG；SQLite 共用构建机制
 experiments/              # 不含内部信息的 TOML 示例
 local/                    # 私有目标/SSH 配置，不提交
 results/<bench>/<run-id>/ # results.jsonl、summary.csv 和诊断附件
@@ -84,7 +84,8 @@ uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 | `run mini-dev-workflow` | 固定小型 C 项目的完整 Git worktree 开发流程 | [dev workflow](docs/bench-dev-workflow.md) |
 | `run npm-install` | 外部本地盘上预热源、冷 `node_modules` 的离线 npm/pnpm 物化；按外部并发批次计时，固定 lockfile fixture | [npm install](docs/bench-npm-install.md) |
 | `run clone` | 同文件系统持久化目录克隆；完整目录请求并发、数据量/文件数扫描，支持按目标选择原生命令 | [clone](docs/bench-clone.md) |
-| `run kvtest` | SQLite 官方单表随机 BLOB 覆写，每次写入一个事务；不是 OpenClaw 重放 | [kvtest 与负载校准](docs/bench-kvtest-openclaw.md) |
+| `run kvtest` | SQLite 官方单写者随机 BLOB 覆写；逐次提交或整批事务 | [kvtest 与负载校准](docs/bench-kvtest-openclaw.md) |
+| `run sqlite-speedtest` | SQLite 官方 `speedtest1 main`，单连接 SQL 阶段及完整进程计时，无 Agent 假设 | [SQLite SQL microbenchmark](docs/bench-sqlite-speedtest.md) |
 | `run multi-host` | 多台 SSH 主机同时在共享文件系统执行私有树操作和目录竞争 | [multi-host](docs/bench-multi-host-nas.md) |
 
 ```sh
@@ -93,6 +94,7 @@ uv run python -m agent_fs_bench run mini-dev-workflow --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run npm-install --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a -- --smoke
 uv run python -m agent_fs_bench run kvtest --dirs /mnt/fs-a
+uv run python -m agent_fs_bench run sqlite-speedtest --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run multi-host --dirs /mnt/fs-a
 ```
 
@@ -231,6 +233,6 @@ uv run python tools/gen_mini_source_repo.py --force
 
 `data/pnpm-bench*` 来自 [pnpm/pnpm](https://github.com/pnpm/pnpm) 的 `5bd38b19`（2026-11-03）。npm lockfile 由同一 manifest 执行 `npm install --package-lock-only --legacy-peer-deps --ignore-scripts --cache <tmp>` 生成，不是上游 pnpm lockfile 的转换。npm-install 只使用这两个已提交 fixture。
 
-kvtest 使用 SQLite 官方源代码，版本和哈希记录在结果中。OpenClaw 的 session/transcript SQLite 存储仅作为研究动机；当前负载规模是合成控制参数，没有 OpenClaw 实测消息分布或端到端性能主张。源码依据、最小采样方案和论文表述见 [kvtest 文档](docs/bench-kvtest-openclaw.md#versioned-openclaw-evidence-and-limits)。
+两个 SQLite workload 使用固定版本的官方源代码，构建版本与哈希写入结果，NAS 默认统一为 DELETE + FULL、单连接、5 次重复。`sqlite-speedtest` 运行通用 SQL 测试，不含 Agent 假设；`kvtest` 提供固定 BLOB 的事务粒度对照。OpenClaw 仅作研究动机，不声称重放或推算端到端延迟。计时边界、NAS 限制与论文图建议见 [SQLite SQL microbenchmark](docs/bench-sqlite-speedtest.md)，应用依据见 [kvtest 文档](docs/bench-kvtest-openclaw.md#versioned-openclaw-evidence-and-limits)。
 
 上游 YoloFS/perf-eval 当前未提供 LICENSE，公开分发 fixtures 前仍需确认授权；本次整理不改变授权状态。Linux 历史代码为 GPL-2.0。
