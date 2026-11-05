@@ -17,6 +17,7 @@ BENCHMARKS = {
     'kvtest': 'kvtest',
     'sqlite-speedtest': 'sqlite_speedtest',
     'multi-host': 'multi_host',
+    'mount-scale': 'mount_scale',
 }
 RESULTS_DIR = PROJECT_ROOT / 'results'
 TARGETS_FILE = PROJECT_ROOT / 'local' / 'targets.toml'
@@ -24,7 +25,7 @@ TARGETS_FILE = PROJECT_ROOT / 'local' / 'targets.toml'
 
 def run_benchmark(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog='agent-fs-bench run',
-        description='Run one workload sequentially on explicit, pre-mounted directories. '
+        description='Run one workload sequentially on explicit target directories. '
                     'Put workload flags after --; use -- --help for workload help.')
     parser.add_argument('benchmark', choices=BENCHMARKS)
     parser.add_argument('--dirs', nargs='+', metavar='DIRECTORY')
