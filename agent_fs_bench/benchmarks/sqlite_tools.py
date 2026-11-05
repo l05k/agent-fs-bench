@@ -16,6 +16,13 @@ import urllib.request
 SQLITE_VERSION = "3.54.1"
 SQLITE_AMALGAMATION = "sqlite-amalgamation-3540100.zip"
 SQLITE_AMALGAMATION_URL = "https://sqlite.org/2026/" + SQLITE_AMALGAMATION
+# Cross-checked against the SHA3-verified 3.54.1 release archives:
+# https://sqlite.org/download.html and https://sqlite.org/releaselog/3_54_1.html
+DOWNLOAD_SHA256 = {
+    SQLITE_AMALGAMATION: "0a9c8e34352dad46006aa82836d5383bff9dc6bc9ce5a60553c05aa30e6ad1f9",
+    "kvtest.c": "72ed2071ce76ff6033729cde69e0e61c8723748d1a1f35b9f8a865b5f7ab2424",
+    "speedtest1.c": "bcb4a3123b60db648e748837f5c46092e23a3b35d970f7da5e62c42809f18185",
+}
 JMODE_CHOICES = ("delete", "truncate", "persist", "memory", "wal", "off")
 COMPILE_FLAGS = (
     "-O2",
@@ -48,13 +55,15 @@ def ensure_directory(path: Path, what: str) -> None:
         raise BenchmarkError(f"cannot create {what} {path}: {exc}") from exc
 
 
-def download(url: str, destination: Path) -> None:
-    """Download ``url`` to ``destination`` atomically."""
+def download(url: str, destination: Path, expected_sha256: str) -> None:
+    """Verify fixed source content before atomically replacing the cache."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_suffix(destination.suffix + ".part")
     try:
         with urllib.request.urlopen(url, timeout=120) as response:
             partial.write_bytes(response.read())
+        if file_sha256(partial) != expected_sha256:
+            raise BenchmarkError(f"SHA-256 mismatch for {destination.name}")
     except Exception as exc:
         partial.unlink(missing_ok=True)
         raise BenchmarkError(f"failed to download {url}: {exc}") from exc
@@ -66,13 +75,18 @@ def ensure_sources(build_dir: Path, tool: str, force: bool) -> Dict[str, Path]:
     ensure_directory(build_dir, "build directory")
     archive = build_dir / SQLITE_AMALGAMATION
     source = build_dir / f"{tool}.c"
-    if force or not archive.exists():
-        download(SQLITE_AMALGAMATION_URL, archive)
-    if force or not source.exists():
-        download(
-            f"https://sqlite.org/src/raw/test/{tool}.c?ci=version-{SQLITE_VERSION}",
-            source,
-        )
+    for destination, url in (
+        (archive, SQLITE_AMALGAMATION_URL),
+        (source, f"https://sqlite.org/src/raw/test/{tool}.c?ci=version-{SQLITE_VERSION}"),
+    ):
+        expected = DOWNLOAD_SHA256[destination.name]
+        if force or not destination.exists():
+            download(url, destination, expected)
+        elif file_sha256(destination) != expected:
+            raise BenchmarkError(
+                f"SHA-256 mismatch for cached {destination.name}; "
+                "set CONFIG['force_download'] = True to refresh"
+            )
 
     inner = archive.with_suffix("")
     amalgamation = inner / "sqlite3.c"

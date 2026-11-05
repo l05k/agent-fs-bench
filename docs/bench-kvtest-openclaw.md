@@ -50,6 +50,12 @@ The first run downloads the SQLite 3.54.1 amalgamation and `kvtest.c` into
 rollback/WAL synchronization fixed to FULL (`2`). The compiler version, source
 and binary hashes, exact compile argv and flags are saved in `kvtest-build.json`.
 
+Downloads are checked against the fixed SHA-256 values in `sqlite_tools.py`
+before replacing the cache; existing archives and test-source files are checked
+before reuse. Those values were derived from the official 3.54.1 release archives
+after verifying their [published SHA3-256](https://sqlite.org/download.html), and
+the raw test files were matched byte-for-byte to the verified source archive.
+
 Later runs reuse the binary only when it is newer than `kvtest.c`, `sqlite3.c`
 and `sqlite3.h`, and its metadata matches the binary hash, current source hashes
 and compile flags. Reuse does not resolve or run any compiler, so a host that only
@@ -339,12 +345,16 @@ corpus to all OpenClaw usage or call metadata-only calibration a faithful replay
 
 ```text
 <target>/agent-fs-bench/kvtest/<run-id>/kvtest.sqlite
-                             fresh database + rollback journal on the target
+                             database retained on the target
 build/kvtest/                sources, compiled binary (git-ignored), and
                              kvtest-build.json build provenance
 results/kvtest/<run-id>/results.jsonl
                              one complete measurement per repeat
 ```
+
+In DELETE mode the rollback journal may exist during a write transaction and is
+deleted by a successful commit; normal completion leaves `kvtest.sqlite`, not a
+persistent journal file.
 
 Source revision, compiler and workload requests must match when comparing runs;
 each row records the source/binary hashes and the observed SQLite version.

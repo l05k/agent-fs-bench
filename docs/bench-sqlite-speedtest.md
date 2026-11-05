@@ -36,6 +36,10 @@ requested. `--threads` would control sorting workers, not concurrent clients;
 The first run needs a C compiler and network access. Shared `sqlite_tools.py`
 records source/binary hashes, compiler version and compile argv in
 `speedtest1-build.json`; reusable builds must also match current compile flags.
+Downloads must match the fixed SHA-256 values in `sqlite_tools.py` before cache
+replacement; cached archives and test sources are also verified before reuse.
+The expected values were cross-checked against the official 3.54.1 release
+archives and their [published SHA3-256](https://sqlite.org/download.html).
 Both SQLite tools use `-O2`, `SQLITE_THREADSAFE=1`, no loadable extensions, and
 `SQLITE_DEFAULT_SYNCHRONOUS=2` / `SQLITE_DEFAULT_WAL_SYNCHRONOUS=2`. Builds and
 result writes are outside the measured invocation. The official source is not
