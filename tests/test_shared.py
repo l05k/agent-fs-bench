@@ -15,15 +15,15 @@ from agent_fs_bench.targets import Target, load_targets
 
 
 class TargetTests(unittest.TestCase):
-    def test_named_directories_and_explicit_selection(self):
+    def test_named_directories_load_complete_catalog(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / 'targets.toml'
             config.write_text('[[targets]]\nname="a"\npath="fs-a"\n'
                               '[[targets]]\nname="b"\npath="/scratch/fs-b"\n')
-            self.assertEqual(load_targets(config, None, ['a']),
-                             [Target('a', Path('/mnt/fs-a'))])
-            with self.assertRaisesRegex(ValueError, 'unknown targets'):
-                load_targets(config, None, ['missing'])
+            self.assertEqual(load_targets(config, None), [
+                Target('a', Path('/mnt/fs-a')),
+                Target('b', Path('/scratch/fs-b')),
+            ])
 
     def test_ambiguous_and_escaping_directories_rejected(self):
         for directories in (['/mnt/a', '/other/a'], ['/mnt/a', '/mnt/a'],
@@ -42,6 +42,55 @@ class TargetTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'escapes target'):
                     run_benchmark(['clone', '--dirs', str(target)])
             self.assertEqual(list(outside.iterdir()), [])
+
+
+class CloneTargetSelectionTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.target = self.root / 'lakebase'
+        self.target.mkdir()
+        self.config = self.root / 'targets.toml'
+        self.config.write_text(
+            f'[[targets]]\nname="LakeBase"\npath="{self.target}"\n'
+            f'[[targets]]\nname="NFS"\npath="{self.root / "nfs"}"\n'
+        )
+        self.results = self.root / 'results'
+        self.enterContext(mock.patch('agent_fs_bench.cli.TARGETS_FILE', self.config))
+        self.enterContext(mock.patch('agent_fs_bench.cli.RESULTS_DIR', self.results))
+
+    def test_unknown_copier_alias_fails_before_creating_run(self):
+        for target_args, alias in ((['--target', 'LakeBase'], 'Lakebase'), (['--dirs', str(self.target)], 'LakeBase')):
+            with self.subTest(target_args=target_args), mock.patch.dict(
+                clone.CONFIG, {'target_copiers': {alias: ['lakebase']}},
+            ):
+                with self.assertRaises(ValueError):
+                    run_benchmark(['clone', *target_args, '--', '--smoke'])
+                self.assertFalse(self.results.exists())
+                self.assertEqual(list(self.target.iterdir()), [])
+
+    def test_unknown_selected_target_fails_before_creating_run(self):
+        with self.assertRaises(ValueError):
+            run_benchmark(['clone', '--target', 'missing', '--', '--smoke'])
+        self.assertFalse(self.results.exists())
+
+    def test_selected_native_copier_accepts_valid_unselected_alias(self):
+        with (
+            mock.patch.dict(clone.CONFIG, {
+                'target_copiers': {'LakeBase': ['test-native'], 'NFS': ['uninstalled']},
+                'commands': {'test-native': 'cp -r {src} {dst}'},
+            }),
+            mock.patch.object(clone, 'fstype', return_value='tmpfs'),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            status = run_benchmark(['clone', '--target', 'LakeBase', '--', '--smoke'])
+        self.assertEqual(status, 0)
+        jsonl = next(self.results.rglob('results.jsonl'))
+        records = [json.loads(line) for line in jsonl.read_text().splitlines()]
+        self.assertEqual({(row['target']['name'], row['details']['copier']) for row in records},
+                         {('LakeBase', 'test-native')})
+        self.assertFalse((self.root / 'nfs').exists())
 
 
 class PortableResultsTests(unittest.TestCase):
@@ -135,9 +184,10 @@ class SummaryRunTests(unittest.TestCase):
             target.mkdir()
         self.enterContext(mock.patch('agent_fs_bench.cli.RESULTS_DIR', self.root / 'results'))
         self.enterContext(mock.patch.dict(clone.CONFIG, {
-            'stage': 'single', 'repeats': 1, 'small_count': 2,
-            'kinds': ('small',), 'copiers': ['internal'], 'fsync': False,
+            'stage': 'bytes', 'repeats': 1,
+            'byte_totals': (8192, 16384), 'byte_files': 2,
         }))
+        self.enterContext(mock.patch.object(clone, 'fstype', return_value='tmpfs'))
 
     def invoke(self):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
@@ -151,7 +201,8 @@ class SummaryRunTests(unittest.TestCase):
         run_dir = self.run_dir()
         records = [json.loads(line) for line in (run_dir / 'results.jsonl').read_text().splitlines()]
         self.assertEqual({row['target']['name'] for row in records}, {'a', 'b'})
-        expected = {(row['target']['name'], row['case'], metric): value
+        expected = {(f"{row['target']['name']}/{row['details']['copier']}",
+                     row['case'], metric): value
                     for row in records for metric, value in row['metrics'].items()}
         with (run_dir / 'summary.csv').open(newline='') as handle:
             rows = list(csv.DictReader(handle))
@@ -192,7 +243,7 @@ class SummaryRunTests(unittest.TestCase):
             measure(ctx, args)
 
         with mock.patch.object(clone, 'run', block_second_scratch):
-            with self.assertRaises(NotADirectoryError):
+            with self.assertRaises(OSError):
                 self.invoke()
         records = [json.loads(line) for line in (self.run_dir() / 'results.jsonl').read_text().splitlines()]
         self.assertEqual([row['target']['name'] for row in records], ['a', 'a'])
