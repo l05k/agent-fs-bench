@@ -170,8 +170,10 @@ do not combine their case names or statistics with new results.
 ## Paper figures
 
 The existing plot CLI automatically generates numeric-x line figures for
-clone; no extra plot flags. The selected metric produces only groups present
-in its input: `<stem>-bytes`, `<stem>-files`, `<stem>-concurrency-large`,
+clone. `--parameters` and `--source-sha256` keep only rows with that identity,
+and a sweep whose rows mix configurations fails with the identities it found
+instead of drawing them together. The selected metric produces only groups
+present in its input: `<stem>-bytes`, `<stem>-files`, `<stem>-concurrency-large`,
 `<stem>-concurrency-small`, each as vector PDF, 600 dpi PNG and standalone Python
 with the raw samples. Numeric x points are sorted; `--cases` filters workloads
 rather than rearranging a numeric sweep. `--targets` selects/orders exact
@@ -197,8 +199,9 @@ medians and IQR error bars. Phase metrics pool `details.requests`; throughput
 uses one batch value per repeat. Size/count axes are logarithmic; positive
 latency/phase axes are logarithmic. Selected series must cover identical x
 values; incompatible fixed payloads in a sweep fail instead of plotting a
-misleading comparison. Arbitrary mount/cache/provenance differences are not
-automatically validated. Tiny smoke samples do not support tail-latency claims.
+misleading comparison, and so do differing parameter or source identities.
+Other provenance differences, such as mount options, are not automatically
+validated. Tiny smoke samples do not support tail-latency claims.
 
 Style reuses the project Arial 9pt palette, filled markers, boxed axes, top
 legend and no internal grids. Default single-column size is 3.5 × 1.5 inches;

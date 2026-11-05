@@ -192,12 +192,12 @@ uv run --group analysis python -m agent_fs_bench plot \
   --ylabel 'Durable install (s)' --output results/npm-latency
 ```
 
-CSV 是可随时重新生成的派生文件；DuckDB 是派生缓存，不维护数据库版本。默认分类箱线图将所选输入中的跨 run 样本合并到目标 × case，只有 `parameters` 与 `source_sha256` 完全一致的行才会进入同一个箱子；同一 case 内出现多个配置身份时，`plot` 直接报错而不是静默合并，报错会列出找到的身份，并提示用 `--parameters <json>` 和/或 `--source-sha256 <hash>[,<hash>]` 选择。clone 自动按数据量、文件数和两类并发场景生成数值横轴折线图，以 `target/copier` 为系列，延迟直接汇集原始请求样本、显示中位数和 IQR。要分析某次运行，直接只传入该 run 的 JSONL，或使用自定义 SQL 按 `run_id` 筛选。clone 的新完整目录请求数据与旧 shard 结果不兼容，须重新测量。
+CSV 是可随时重新生成的派生文件；DuckDB 是派生缓存，不维护数据库版本。默认分类箱线图将所选输入中的跨 run 样本合并到目标 × case，只有 `parameters` 与 `source_sha256` 完全一致的行才会进入同一个箱子；同一 case 内出现多个配置身份时，`plot` 直接报错而不是静默合并，报错会列出找到的身份，并提示用 `--parameters <json>` 和/或 `--source-sha256 <hash>[,<hash>]` 选择。clone 自动按数据量、文件数和两类并发场景生成数值横轴折线图，以 `target/copier` 为系列，延迟直接汇集原始请求样本、显示中位数和 IQR；每条扫描线同样只允许一个 `(parameters, source_sha256)` 身份，混合时报错并列出找到的身份，不会把不同参数或源码的样本画进同一张图。要分析某次运行，直接只传入该 run 的 JSONL，或使用自定义 SQL 按 `run_id` 筛选。clone 的新完整目录请求数据与旧 shard 结果不兼容，须重新测量。
 
 - `--parameters '<json object>'`：只保留参数规范化后与该对象**完全相等**的行。键顺序与空白无关，但必须是 workload 记录的完整对象（含 `tool_versions`、`seed_input_sha256` 等）；不支持部分匹配。
 - `--source-sha256 <hash>[,<hash>…]`：只保留所列源码指纹的行。
 - 两个选择器都可与 `--targets`/`--cases` 组合；先按选择器过滤，再按 case/target 选择，所以被 `--cases`/`--targets` 排除的行不会触发歧义错误。不同 case 可以携带不同配置（例如不同并发批次大小），这不算歧义。
-- 选择器过滤后没有剩余行时报错 `no measurements match the plot selection`。
+- 选择器过滤后没有剩余行时报错 `no measurements match the plot selection`（clone 为 `no clone measurements match the plot selection`），并附上生效的选择器。
 
 `parameters_canonical` 是 `metrics` 视图中的规范化参数字符串列，持久化的 DuckDB 分析库也保存该列，重新打开时不需要额外函数。
 

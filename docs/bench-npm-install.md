@@ -5,13 +5,14 @@ Measures how fast a prewarmed, offline npm/pnpm source materialises a tree into 
 Linux and Python 3.12+ only; the benchmark never mounts or unmounts targets.
 
 Only `node_modules` is empty — this is not a cold-cache measurement, because each timed install
-reads a cache/store populated earlier on another local filesystem. Workers preread their own
-source, but residency is best effort and nothing verifies it. Registry traffic is excluded from
-the timed section only: reads from the preparation filesystem and traffic to the target (including
-network round trips for a remote target) stay inside the measurement. Lifecycle scripts are off by
-default, so this is package materialisation, not `postinstall` work. npm and pnpm install different
-graphs from the same fixture, so compare a manager with itself. Tree metrics are an inventory, not
-bandwidth: no MB/s is reported and no claim is made about physical write volume.
+reads a cache/store populated earlier on another local filesystem. The parent prereads each worker's
+private source copy before the barrier, but residency is best effort and nothing verifies it.
+Registry traffic is excluded from the timed section only: reads from the preparation filesystem and
+traffic to the target (including network round trips for a remote target) stay inside the
+measurement. Lifecycle scripts are off by default, so this is package materialisation, not
+`postinstall` work. npm and pnpm install different graphs from the same fixture, so compare a
+manager with itself. Tree metrics are an inventory, not bandwidth: no MB/s is reported and no claim
+is made about physical write volume.
 
 ## Layout and results
 
@@ -133,8 +134,8 @@ libuv pool is shared with work such as zlib.
 2. **Per-batch preparation (untimed).** Per worker: copy the whole source into
    `batches/<manager>-c<C>-r<batch>/task-<i>/source`, create the project from the template, create
    private `HOME`, `TMPDIR` and XDG directories, then **fsync the project tree and every new ancestor
-   up to the target root**, so inputs are durable before timing; each worker then reads its own
-   source copy once.
+   up to the target root**, so inputs are durable before timing. The parent then prereads each
+   worker's private source copy once, and only then releases the barrier.
 3. **Timed install.** All workers of one manager and one C are released by a barrier; each times its
    child from spawn to exit (`install_s`). npm runs `npm ci --offline --cache <source>/cache
    --legacy-peer-deps --no-audit --no-fund --no-update-notifier`; pnpm runs `pnpm install --offline

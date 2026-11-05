@@ -19,10 +19,10 @@ class ClonePlotDataTests(unittest.TestCase):
         self.output = io.StringIO()
 
     def emit(self, metrics, details, *, target='ext4', case='bytes/N4_S262144/C1',
-             repeat=1, benchmark='clone'):
+             repeat=1, benchmark='clone', parameters=None, source='source'):
         context = RunContext(benchmark, 'run-a', Target(target, Path('/mnt') / target),
                              Path('/missing/work'), Path('/missing/results'),
-                             {}, 'source', self.output)
+                             parameters or {}, source, self.output)
         context.emit(case, metrics, repeat=repeat, details=details)
 
     def clone_metrics(self, total_bytes, total_files, concurrency, metric, value):
@@ -179,6 +179,47 @@ class ClonePlotDataTests(unittest.TestCase):
                 case=f'concurrency/N4_S1048576/C{concurrency}')
         with self.assertRaisesRegex(ValueError, 'incompatible payload sizes'):
             clone_plot_data(self.connection(), self.clone_args('latency_s'))
+
+    def test_sweep_mixing_parameter_or_source_identity_fails(self):
+        details = {'experiment': 'bytes', 'kind': 'large', 'fstype': 'ext4',
+                   'requests': self.requests('latency_s', [1.0])}
+        self.emit(self.clone_metrics(MIB, 4, 1, 'latency_s', 1.0),
+                  {**details, 'copier': 'cp-r'}, case='bytes/N4_S262144/C1',
+                  parameters={'repeats': 5}, source='source-a')
+        self.emit(self.clone_metrics(4 * MIB, 4, 1, 'latency_s', 2.0),
+                  {**details, 'copier': 'cp-r'}, case='bytes/N4_S1048576/C1',
+                  parameters={'repeats': 10}, source='source-a')
+
+        with self.assertRaisesRegex(ValueError,
+                                    'bytes sweep mixes 2 configurations') as caught:
+            clone_plot_data(self.connection(), self.clone_args('latency_s'))
+        message = str(caught.exception)
+        self.assertIn('--parameters', message)
+        self.assertIn('--source-sha256', message)
+        self.assertIn('"repeats":10', message)
+
+    def test_identity_selectors_choose_one_configuration(self):
+        details = {'experiment': 'bytes', 'kind': 'large', 'fstype': 'ext4',
+                   'requests': self.requests('latency_s', [1.0])}
+        for repeats, total_bytes, source, latency in (
+                (5, MIB, 'source-a', 1.0), (10, 4 * MIB, 'source-b', 2.0)):
+            self.emit(self.clone_metrics(total_bytes, 4, 1, 'latency_s', latency),
+                      {**details, 'copier': 'cp-r'},
+                      case=f'bytes/N4_S{total_bytes // 4}/C1',
+                      parameters={'repeats': repeats}, source=source)
+
+        connection = self.connection()
+        selected = clone_plot_data(connection, self.clone_args(
+            'latency_s', parameters='{"repeats":5}', source_sha256=['source-a']))
+        self.assertEqual(selected,
+                         [('bytes', {'series': ['ext4/cp-r'],
+                                     'points': {'ext4/cp-r': [{'x': 1.0, 'values': [1.0]}]},
+                                     'xlabel': 'Total bytes (MiB)',
+                                     'ylabel': 'Clone latency (s)',
+                                     'logx': True, 'logy': True, 'size': [3.5, 1.5]})])
+        with self.assertRaisesRegex(ValueError, 'no clone measurements match'):
+            clone_plot_data(connection, self.clone_args(
+                'latency_s', parameters='{"repeats":5}', source_sha256=['source-b']))
 
 
 if __name__ == '__main__':

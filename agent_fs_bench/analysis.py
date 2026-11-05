@@ -172,6 +172,35 @@ def main(command: str, argv: list[str]) -> int:
         connection.close()
     return 0
 
+def filter_identities(rows: list, wanted_parameters: str | None,
+                      wanted_sources: list[str] | None, identity) -> list:
+    """Keep rows whose (parameters, source) identity matches the plot selectors."""
+    if wanted_sources is not None and not wanted_sources:
+        raise ValueError('--source-sha256 needs at least one fingerprint')
+    kept = []
+    for row in rows:
+        parameters, source = identity(row)
+        if wanted_parameters is not None and parameters != wanted_parameters:
+            continue
+        if wanted_sources and source not in wanted_sources:
+            continue
+        kept.append(row)
+    return kept
+
+def selection_detail(wanted_parameters: str | None, wanted_sources: list[str] | None) -> str:
+    """Describe the active identity filters for a no-match error."""
+    filters = []
+    if wanted_parameters is not None:
+        filters.append(f'parameters={wanted_parameters}')
+    if wanted_sources:
+        filters.append('source_sha256=' + ','.join(wanted_sources))
+    return f' for {"; ".join(filters)}' if filters else ''
+
+def describe_identities(identities: set[tuple[str, str]]) -> str:
+    """List distinct identities so an ambiguity error names every candidate."""
+    return '; '.join(f'parameters={parameters} source_sha256={source}'
+                     for parameters, source in sorted(identities))
+
 def plot(connection, args: argparse.Namespace) -> None:
     """Render selected measurements, refusing to merge configurations within a case."""
     from . import figure
@@ -189,20 +218,11 @@ def plot(connection, args: argparse.Namespace) -> None:
     ''', [args.benchmark, args.metric]).fetchall()
     wanted_parameters = getattr(args, 'parameters', None)
     wanted_sources = getattr(args, 'source_sha256', None)
-    if wanted_sources is not None and not wanted_sources:
-        raise ValueError('--source-sha256 needs at least one fingerprint')
-    if wanted_parameters is not None:
-        rows = [row for row in rows if row[2] == wanted_parameters]
-    if wanted_sources:
-        rows = [row for row in rows if row[3] in wanted_sources]
+    rows = filter_identities(rows, wanted_parameters, wanted_sources,
+                             lambda row: (row[2], row[3]))
     if not rows:
-        filters = []
-        if wanted_parameters is not None:
-            filters.append(f'parameters={wanted_parameters}')
-        if wanted_sources:
-            filters.append('source_sha256=' + ','.join(wanted_sources))
-        detail = f' for {"; ".join(filters)}' if filters else ''
-        raise ValueError(f'no measurements match the plot selection{detail}')
+        raise ValueError('no measurements match the plot selection'
+                         + selection_detail(wanted_parameters, wanted_sources))
     found_targets = sorted({target for target, _, _, _, _ in rows})
     found_cases = sorted({case for _, case, _, _, _ in rows})
     targets = args.targets or found_targets
@@ -220,10 +240,9 @@ def plot(connection, args: argparse.Namespace) -> None:
     for case in cases:
         found = identities.get(case, set())
         if len(found) > 1:
-            listed = '; '.join(f'parameters={parameters} source_sha256={source}'
-                               for parameters, source in sorted(found))
             raise ValueError(
-                f'case {case!r} mixes {len(found)} configurations: {listed}; '
+                f'case {case!r} mixes {len(found)} configurations: '
+                f'{describe_identities(found)}; '
                 'plot one with --parameters <json> and/or --source-sha256 <hash>[,<hash>]')
     samples = {target: {} for target in targets}
     for target, case, _, _, group in selected:
@@ -267,40 +286,59 @@ def plot_clone(connection, args: argparse.Namespace) -> None:
 def clone_plot_data(connection, args: argparse.Namespace) -> list[tuple[str, dict]]:
     """Build one line-figure dataset per clone sweep present in the selection."""
     rows = connection.execute('''
-        SELECT target->>'name', "case", metrics::VARCHAR, details::VARCHAR
-        FROM measurements WHERE benchmark = 'clone'
+        SELECT target->>'name', "case",
+               parameter_canonical.canonical, source_sha256,
+               metrics::VARCHAR, details::VARCHAR
+        FROM measurements
+        LEFT JOIN parameter_canonical
+               ON CAST(measurements.parameters AS VARCHAR) = parameter_canonical.raw
+        WHERE benchmark = 'clone'
         ORDER BY run_id, repeat, target->>'name', "case"
     ''').fetchall()
     records = []
-    for target, case, metrics_text, details_text in rows:
+    for target, case, parameters, source, metrics_text, details_text in rows:
         metrics = json.loads(metrics_text)
         if args.metric not in metrics:
             continue
         details = json.loads(details_text)
         details['series'] = f"{target}/{details['copier']}"
-        records.append((case, metrics, details))
+        records.append((case, parameters, source, metrics, details))
+    wanted_parameters = getattr(args, 'parameters', None)
+    wanted_sources = getattr(args, 'source_sha256', None)
+    records = filter_identities(records, wanted_parameters, wanted_sources,
+                                lambda record: (record[1], record[2]))
     if not records:
-        raise ValueError('no measurements match the plot selection')
+        raise ValueError('no clone measurements match the plot selection'
+                         + selection_detail(wanted_parameters, wanted_sources))
 
-    found_cases = sorted({case for case, _, _ in records})
-    found_series = sorted({details['series'] for _, _, details in records})
+    found_cases = sorted({case for case, _, _, _, _ in records})
+    found_series = sorted({details['series'] for _, _, _, _, details in records})
     series = args.targets or found_series
     cases = args.cases or found_cases
     for kind, wanted, found in (('targets', series, found_series), ('cases', cases, found_cases)):
         missing = [name for name in wanted if name not in found]
         if missing:
             raise ValueError(f'no measurements for {kind}: {", ".join(missing)}')
-    selected = [(metrics, details) for case, metrics, details in records
-                if case in cases and details['series'] in series]
+    selected = [record for record in records
+                if record[0] in cases and record[4]['series'] in series]
 
     figures = []
     for group in CLONE_GROUPS:
         rows = [record for record in selected
-                if record[1]['experiment'] == group['experiment']
-                and (group['kind'] is None or record[1]['kind'] == group['kind'])]
+                if record[4]['experiment'] == group['experiment']
+                and (group['kind'] is None or record[4]['kind'] == group['kind'])]
         if not rows:
             continue
-        figures.append((group['suffix'], clone_line_data(group, rows, series, args)))
+        # A sweep's x axis must vary only the workload dimension; one figure
+        # never pools different parameters or sources.
+        identities = {(parameters, source) for _, parameters, source, _, _ in rows}
+        if len(identities) > 1:
+            raise ValueError(
+                f'clone {group["suffix"]} sweep mixes {len(identities)} configurations: '
+                f'{describe_identities(identities)}; '
+                'plot one with --parameters <json> and/or --source-sha256 <hash>[,<hash>]')
+        figures.append((group['suffix'], clone_line_data(
+            group, [(metrics, details) for _, _, _, metrics, details in rows], series, args)))
     return figures
 
 
