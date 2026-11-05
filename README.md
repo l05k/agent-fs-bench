@@ -42,7 +42,7 @@ uv sync --locked --group analysis
 | --- | --- | --- |
 | `run` | 在一个或多个已挂载目录上顺序测量，随后生成汇总 CSV | `benchmark`、`--dirs`、`--target` |
 | `analyze` | 对任意 JSONL 执行 DuckDB 查询并输出 CSV/stdout | `inputs`、`--sql`、`--database`、`--output` |
-| `plot` | 从任意 JSONL 绘制全局指标分布图 | `inputs`、`--benchmark`、`--metric`、`--case`、`--output` |
+| `plot` | 从任意 JSONL 按论文图规范绘制分组箱线图，输出 PDF/PNG 及自包含脚本 | `inputs`、`--benchmark`、`--metric`、`--cases`、`--targets`、`--ylabel`、`--size`、`--output` |
 | `tools/gen_mini_source_repo.py` | 确定性重建 mini 的 Git fixture | `--force` |
 
 `run` 的 workload 参数只剩 `clone --smoke`；其余实验设置在各模块顶部 `CONFIG` 中，修改代码属于实验配置变更，不得提交私有值。
@@ -172,13 +172,16 @@ uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl' \
 uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl' \
   --sql 'SELECT benchmark, "case", metric, value FROM metrics'
 
+# 写出 results/session.pdf、session.png（600 dpi）和内嵌数据的 session.py
 uv run --group analysis python -m agent_fs_bench plot \
   'results/openclaw-session/*/results.jsonl' \
-  --benchmark openclaw-session --metric turns_per_s \
-  --output results/session.png
+  --benchmark openclaw-session --metric turns_per_s --ylabel 'Throughput (turns/s)' \
+  --cases small,medium,large --targets ours,ext4,nfs --output results/session
 ```
 
 CSV 是可随时重新生成的派生文件；DuckDB 是派生缓存，不维护数据库版本。箱线图与默认汇总采用相同的全局分组口径，将所选输入中的跨 run 样本合并到目标 × case 的箱子。分析前由人工保证运行环境、参数和目标别名一致；要分析某次运行，直接只传入该 run 的 JSONL，或使用自定义 SQL 按 `run_id` 筛选。
+
+图样式遵循 `.agents/skills/paper-figure-style/SKILL.md`（Arial 9pt、矢量 PDF、图例在上、主系统首位用首色、hatch 区分、四边框、无网格），共享实现在 `agent_fs_bench/figure.py`。`--targets` 决定图例顺序，第一个为主系统；`--cases` 决定 x 轴顺序并筛选 case；两者未给出时取全部并按字母序。图例直接显示 target 别名，别名应取论文中的名称。`--ylabel` 默认为 metric 名。`--size` 按实验设定英寸尺寸，默认单栏 `3.5 1.5`。`<stem>.py` 内含原始样本与绘图代码，`python <stem>.py` 无需 JSONL 即可重新生成 PDF/PNG。图中文字均为英文，缺少 Arial 时直接报错，不替换字体。
 
 ## 可复现性与资源边界
 
