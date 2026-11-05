@@ -1,330 +1,239 @@
 # npm-install FS benchmark
 
-Measures how fast a **warm cache/store** can materialise a **cold
-`node_modules`** tree on the filesystem under test, for both npm and pnpm.
+Measures how fast a prewarmed, offline npm/pnpm source materialises a tree into an **empty
+`node_modules`** on the filesystem under test, at one or more externally concurrent batch sizes.
+Linux and Python 3.12+ only; the benchmark never mounts or unmounts targets.
 
-测量在「缓存/存储已预热」的前提下，向冷 `node_modules` 物化依赖树的速度，
-分别覆盖 npm 与 pnpm。
-
-Two placements share one workload, both selected in `CONFIG`. In
-**same-filesystem** mode (`CONFIG["prep_dir"] is None`, the default) the caches
-sit next to `node_modules`, so the filesystem is free to hardlink or
-server-side clone package contents. In **cross-filesystem** mode
-(`CONFIG["prep_dir"]` set to an existing directory on another filesystem)
-everything the timed install only reads moves there, so every timed write is
-real data written to the filesystem under test.
-
-同盘与跨盘两种准备方式共用同一个脚本，由模块顶部的 `CONFIG` 选择：同盘
-（`prep_dir` 为 `None`，默认）时文件系统可以用硬链接/服务端 clone 省掉真实
-写入；跨盘（把 `prep_dir` 设为另一文件系统上的已存在目录）时被计时的写入全部
-落在被测文件系统上。
+Only `node_modules` is empty — this is not a cold-cache measurement, because each timed install
+reads a cache/store populated earlier on another local filesystem. Workers preread their own
+source, but residency is best effort and nothing verifies it. Registry traffic is excluded from
+the timed section only: reads from the preparation filesystem and traffic to the target (including
+network round trips for a remote target) stay inside the measurement. Lifecycle scripts are off by
+default, so this is package materialisation, not `postinstall` work. npm and pnpm install different
+graphs from the same fixture, so compare a manager with itself. Tree metrics are an inventory, not
+bandwidth: no MB/s is reported and no claim is made about physical write volume.
 
 ## Layout and results
 
-Run on Linux with Python 3.12+, Node, npm and/or pnpm installed. Targets are
-mounted externally; this workload never mounts or unmounts anything.
+Targets are mounted externally; only each worker's project is written to the target, while sources,
+private homes and logs live elsewhere.
 
 | Path | Purpose |
 | --- | --- |
-| `agent_fs_bench/benchmarks/npm_install.py` | stdlib workload module and its `CONFIG` |
-| `data/pnpm-bench/`, `data/pnpm-bench-integrated/` | committed fixture inputs, resolved from repository root |
-| `<target>/agent-fs-bench/npm-install/<run-id>/work/*-run-<n>/node_modules` | timed installation |
-| `<target>/agent-fs-bench/npm-install/<run-id>/{cache,templates,work}` | same-FS preparation |
-| `<prep-dir>/agent-fs-bench/npm-install/<run-id>/<target>/{cache,templates,work}` | cross-FS preparation |
-| `results/npm-install/<run-id>/results.jsonl` | one complete measurement per manager/repeat |
-| `results/npm-install/<run-id>/<target>/logs/` | diagnostic install logs |
+| `agent_fs_bench/benchmarks/npm_install.py` | stdlib workload module and `CONFIG`; `data/pnpm-bench*/` holds the fixture inputs |
+| `<target>/agent-fs-bench/npm-install/<run-id>/<manager>-c<C>-r<batch>/task-<i>/` | one worker's project |
+| `<prep-dir>/agent-fs-bench/npm-install/<run-id>/<target>/` | `sources/`, `seeds/`, `templates/`, `batches/.../task-<i>/{source,home,tmp,xdg,config,data}` |
+| `results/npm-install/<run-id>/{results.jsonl,summary.csv}` | raw rows and derived summary; logs: `results/npm-install/<run-id>/<target>/logs/` |
 
-The fixture's committed manifest and lockfiles are **inputs**, not result
-tables. JSONL `parameters` record the fixture name, tool versions, placement,
-cache policy and the SHA-256 of the seed templates actually installed
-(`package.json`, lockfile, and workspace file when present). Manifest and
-workspace text, preparation paths, device IDs and resolved executable paths are
-not embedded. There are no workload-specific CSV results, text manifests, or
-generated reports. The common runner derives `summary.csv` only after all
-selected targets succeed. If a later target fails, earlier successful
-measurements remain in JSONL, but no automatic CSV is generated; these rows are
-a partial experiment.
+Committed manifests and lockfiles are inputs, not result tables: a missing lockfile is an error,
+and the seed aborts if a manager rewrote its lockfile. Preparation is per run, exclusive and
+removed after success (`seed_only` keeps it, a failure leaves it for diagnosis); project trees are
+removed after the inventory unless `keep_node_modules`, and the benchmark root stays on the target.
 
-## Fixture / fixture
+## Fixture
 
-Only committed fixtures are installed. `CONFIG["fixture"]` names one of the
-trees pnpm's own install benchmark uses, vendored under `data/`; the default is
-`pnpm-bench`:
+`CONFIG["fixture"]` names one of the trees pnpm's own install benchmark uses: `pnpm-bench`
+(`pnpm11/benchmarks/fixture`, 84 deps + 4 devDeps) or `pnpm-bench-integrated`
+(`pnpm/tasks/integrated-benchmark/src/fixtures`, 109 deps, ships a `pnpm-workspace.yaml`). pnpm
+replays the committed `pnpm-lock.yaml` with `--frozen-lockfile`; the fixture workspace file is
+copied into every project (`storeDir` is overridden by `--store-dir`) and pins
+`supportedArchitectures` plus `enableGlobalVirtualStore: false` for the integrated tree.
 
-| Name | Upstream | Shape |
-| --- | --- | --- |
-| `pnpm-bench` | `pnpm11/benchmarks/fixture` | `bench-project`, 84 deps + 4 devDeps |
-| `pnpm-bench-integrated` | `pnpm/tasks/integrated-benchmark/src/fixtures` | `alotta-modules`, 109 deps, ships a `pnpm-workspace.yaml` |
+npm cannot read a pnpm lockfile and these trees have peer ranges its resolver rejects, so each
+fixture carries a `package-lock.json` resolved with `--legacy-peer-deps`; seeding and timed installs
+both run `npm ci` with that flag. Seeding is the only online phase, all timed installs are
+`--offline`, and fixture selection is code-only.
 
-The fixture's own manifest and committed lockfile define the tree; nothing is
-re-resolved.
+## Configuration
 
-- **pnpm** installs with `--frozen-lockfile` from the committed
-  `pnpm-lock.yaml`, so the payload is exactly what pnpm's benchmark measures.
-  The fixture's `pnpm-workspace.yaml` is copied into every run project (its
-  `storeDir` is overridden by the explicit `--store-dir`); for
-  `pnpm-bench-integrated` it also pins `supportedArchitectures` and
-  `enableGlobalVirtualStore: false`.
-- **npm** cannot read a pnpm lockfile, and these trees have peer ranges npm's
-  resolver rejects (e.g. `eslint@9` against `@typescript-eslint/parser@7`), so
-  each fixture carries a `package-lock.json` resolved with
-  `--legacy-peer-deps`. The timed npm install uses the same flag. A missing
-  committed lockfile is an error, never a request to resolve another graph.
-
-Fixtures are installed online exactly once, during the seed phase; the timed
-runs are still `--offline`. To replay the other fixture, set
-`CONFIG["fixture"] = "pnpm-bench-integrated"` before the run; fixture selection
-is code-only.
-
-The two fixtures differ in what they are good for: `pnpm-bench` is the shape
-pnpm's CI tracks (fewer packages), `pnpm-bench-integrated` is larger and adds
-the cross-platform `supportedArchitectures` payload, which roughly doubles the
-installed file count for pnpm. Compare a filesystem against itself, not the two
-fixtures against each other.
-
-只复现 pnpm 官方 benchmark 的两个提交 fixture（默认 `pnpm-bench`）：pnpm 侧用
-提交的 `pnpm-lock.yaml` 加 `--frozen-lockfile`，npm 侧用同一 fixture 内附带的、
-由 `--legacy-peer-deps` 解析出的 `package-lock.json`。fixture 只在 seed 阶段联网
-一次，计时阶段依旧 `--offline`；切换 fixture 只能改 `CONFIG["fixture"]`。
-
-## Configuration / 配置
-
-The public workload CLI has no flags: run it with the common `--dirs`/`--target`
-selection only, and change this mapping in
-`agent_fs_bench/benchmarks/npm_install.py` for a different experiment.
+The public workload CLI has no flags: run with the common `--dirs`/`--target` selection and edit
+this mapping in `agent_fs_bench/benchmarks/npm_install.py`.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `fixture` | `"pnpm-bench"` | Committed fixture tree (`pnpm-bench` or `pnpm-bench-integrated`). |
-| `pm` | `"both"` | Manager selection: `npm`, `pnpm`, or `both`. |
-| `runs` | `5` | Timed runs per selected manager; must be positive. |
-| `concurrency` | `4` | Parallelism pin applied to each manager; `0` keeps tool defaults. |
-| `prep_dir` | `None` | `None` = same-filesystem placement; a `Path` on another filesystem = cross-filesystem placement. |
-| `allow_same_device` | `False` | Permit a configured `prep_dir` on the target's device. |
-| `npm_bin` | `"npm"` | npm executable name or path resolved on `PATH`. |
-| `pnpm_bin` | `"pnpm"` | pnpm executable name or path resolved on `PATH`. |
-| `ignore_scripts` | `True` | Pass `--ignore-scripts` to seeding and timed installs. |
-| `no_prewarm` | `False` | Skip pre-reading cache/store before timed runs. |
-| `warm_once` | `False` | Prewarm only after seeding, not before every timed run. |
-| `keep_node_modules` | `False` | Keep each run's `node_modules` for inspection. |
-| `seed_only` | `False` | Prepare cache/store and lockfiles, then exit without timed runs. |
+| `fixture` | `"pnpm-bench"` | Committed fixture tree. |
+| `pm` | `"both"` | `npm`, `pnpm`, or `both`. |
+| `runs` | `10` | Repeat batches per manager × C. |
+| `concurrency` | `4` | Internal pool width per install. |
+| `concurrent_jobs` | `[1]` | External batch sizes released together. |
+| `prep_dir` | `"/dev/shm"` | External local filesystem for sources and copies. |
+| `npm_bin` / `pnpm_bin` | `"npm"` / `"pnpm"` | Executables resolved on `PATH`. |
+| `tool_versions` | node/npm/pnpm pins | Exact versions the run must observe: `v24.22.2`, `11.19.1`, `12.16.1`. |
+| `ignore_scripts` | `True` | Pass `--ignore-scripts` everywhere. |
+| `keep_node_modules` / `seed_only` | `False` | Keep trees / prepare and exit. |
 
-`CONFIG` is experiment setup, not an incidental switch: changing it changes the
-measured payload or preparation semantics, so keep it fixed across the
-filesystems you compare. By default the caches are warmed once after seeding
-and again before every timed run; `warm_once` keeps only the post-seed warm,
-and `no_prewarm` skips both.
+`tool_versions` is a strict check: the selected managers and `node` must report exactly these
+versions or the run aborts before seeding; update the pins in the commit that changes the runtime.
+`CONFIG` is experiment setup — changing it changes the measured payload, isolation or preparation
+semantics — so keep it fixed across compared filesystems. Preparation is always external and local,
+with no same-filesystem mode and no automatic fallback.
 
-`prep_dir` must be an existing directory; each target/run gets an exclusive
-subdirectory below `<prep_dir>/agent-fs-bench/npm-install/<run-id>/<target>`.
-The placement is verified with `st_dev`: a `prep_dir` on the target's device
-aborts the run unless `allow_same_device` is true. The preparation root itself
-must already exist, and no old templates or caches outside the per-run
-subdirectory are removed. Cache reuse is within repeats of the same invocation,
-not across separate invocations. There is no per-artifact override:
-`prep_dir` moves the npm cache, the pnpm store, the pnpm XDG cache, the
-lockfile templates and the seed projects in one step.
-
-## Run / 运行
-
-Default same-filesystem experiment — `pnpm-bench`, both managers, five timed
-runs each, concurrency 4, lifecycle scripts ignored, per-run prewarm:
+## Run
 
 ```sh
 python -m agent_fs_bench run npm-install --dirs /mnt/fs-a
 ```
 
-Typical configuration changes (edit `CONFIG`, then rerun the same command):
+Default: `pnpm-bench`, both managers, ten batches each at one external install, pool 4. Typical changes:
 
 ```python
-CONFIG["runs"] = 3
-CONFIG["pm"] = "pnpm"
-CONFIG["concurrency"] = 8
-CONFIG["seed_only"] = True
+CONFIG["runs"] = 20                            # more batches
+CONFIG["pm"] = "pnpm"                          # one manager
+CONFIG["concurrent_jobs"] = [1, 2, 4, 8, 16]   # concurrency sweep
 ```
 
-Cross-filesystem placement — cache/store, templates and seed projects on
-another filesystem:
+`CONFIG["runs"] = 1` is a minimal real smoke; it still needs registry access during seeding and a
+valid preparation filesystem. Targets run sequentially within one invocation, in the given order:
+rotate that order across independent invocations (each with a new run ID) so position does not
+become a systematic advantage, and keep CPU count, CPU model, mount options and the preparation
+filesystem fixed across comparisons; the JSONL records `cpu_count` and `prep_fstype`, not the
+machine itself. `runs = 10` is the default, and more independent batches give a steadier mean and
+dispersion — often 10–20 per manager × C, from one run or several aggregated by the summary. That
+range is a convenience, not a minimum: nothing here computes a percentile, and batch-to-batch
+variation is part of the result.
 
-```python
-from pathlib import Path
-CONFIG["prep_dir"] = Path("/var/tmp/npm-prep")
-CONFIG["runs"] = 3
-```
+## Placement
 
-Minimal real smoke (online seed, followed by one offline install per manager):
+`prep_dir` must exist (mount it yourself), and the run aborts unless its filesystem is a recognised
+local type — `tmpfs`, `ext2`, `ext3`, `ext4`, `xfs`, `btrfs`, `zfs` — **and** both its `st_dev` and
+its filesystem type differ from the target's. A different device alone does not exclude cross-mount
+copy offload, since two mounts of the same local type can still serve a clone, so requiring both keeps
+the timed write path from being satisfied by a server-side copy; there is no override or fallback.
 
-```python
-CONFIG["runs"] = 1
-```
+`/dev/shm` (tmpfs) is the default; if the target is itself tmpfs the type rule rejects it, so use a
+local disk filesystem. During a batch the preparation filesystem holds the seeded sources for every
+selected manager, `C` copies of the current manager's source and each worker's `HOME`/`TMPDIR` —
+check free space before a large `concurrent_jobs` entry, and expect concurrent runs on one root to
+compete for its space and I/O.
 
-```sh
-python -m agent_fs_bench run npm-install --dirs /mnt/fs-a
-```
+## Concurrency
 
-This needs registry access during seeding and working npm/pnpm executables.
-Cross-FS coverage additionally needs `prep_dir` on a genuinely different
-device; `allow_same_device` does not test that property. Workspace coverage
-needs a second run with `CONFIG["fixture"] = "pnpm-bench-integrated"`;
-`seed_only` is preparation, not a timed measurement.
+| Knob | Default | Meaning |
+| --- | --- | --- |
+| `concurrency` | `4` | Pool width pinned inside each install; `0` keeps tool defaults. |
+| `concurrent_jobs` | `[1]` | External batch sizes: installs released together, one sample each. |
 
-## Concurrency / 并发
+`concurrent_jobs` is the experiment axis. Each value is a separate case (`npm/c1`, `npm/c2`, …);
+each batch of a case emits one row, so a row never mixes batch sizes. Batches are synchronized but
+independent: the parent prepares one project, one private source copy and one private
+`HOME`/`TMPDIR`/XDG set per worker, fsyncs the inputs, prereads each worker's source, then releases
+all workers through one barrier. Workers are separate Python processes, each timing its own child
+install and flush; none shares a cache, store, home or project.
 
-`CONFIG["concurrency"]` fixes the parallelism of the timed install at `N`; the
-default is **4**, which is also npm's threadpool default and pnpm's macOS copy
-pool default. The two managers have no shared knob, so `N` is applied to the
-ones with a measured effect:
+The pin reaches the pool each manager uses for filesystem work: npm gets `UV_THREADPOOL_SIZE`, pnpm
+gets `RAYON_NUM_THREADS` on Linux. It is not a manager-wide limit, and its effect is not comparable
+across managers: npm has no install-wide limit — Arborist fans packages out to pacote — and its
+libuv pool is shared with work such as zlib.
 
-| Manager | Pinned by `CONFIG["concurrency"] = N` | Tool default | Measured effect |
-| --- | --- | --- | --- |
-| npm | `UV_THREADPOOL_SIZE=N` | 4 | `1` → ~20% slower; `2`/`4` equal; above 4 slower |
-| pnpm (Linux/Windows) | `RAYON_NUM_THREADS=N` | `clamp(2×cpu, 4, 16)` | the pool that copies the store into `node_modules` |
-| pnpm (macOS) | `PNPM_MACOS_LINK_THREADS=N` | 4 | `1` → 1.98s, `4` → 1.11s, `16` → 0.90s |
+## Workload and timing
 
-`concurrency = 0` disables pinning and leaves every tool at its own default.
+1. **Seed (untimed, online).** Each manager's source is built once per run under `sources/<manager>`
+   (npm cache; pnpm store plus XDG cache) from the committed inputs; the seed verifies the lockfile is
+   unchanged and copies manifest plus lockfile into `templates/<manager>`. Nothing touches the target.
+2. **Per-batch preparation (untimed).** Per worker: copy the whole source into
+   `batches/<manager>-c<C>-r<batch>/task-<i>/source`, create the project from the template, create
+   private `HOME`, `TMPDIR` and XDG directories, then **fsync the project tree and every new ancestor
+   up to the target root**, so inputs are durable before timing; each worker then reads its own
+   source copy once.
+3. **Timed install.** All workers of one manager and one C are released by a barrier; each times its
+   child from spawn to exit (`install_s`). npm runs `npm ci --offline --cache <source>/cache
+   --legacy-peer-deps --no-audit --no-fund --no-update-notifier`; pnpm runs `pnpm install --offline
+   --frozen-lockfile --store-dir <source>/store --cache-dir <source>/cache
+   --package-import-method=copy --config.enable-global-virtual-store=false --reporter=append-only`.
+4. **Timed flush.** The worker fsyncs the **whole project**, not just `node_modules`: every regular
+   file, then every directory bottom-up so each is persisted after the entries it gained. Symlinks
+   are not followed; their entries persist through the containing directory. Walk, `open`, `fsync`
+   and `close` are all inside `flush_s`, so a high-latency filesystem pays for directory reads and
+   per-file syscalls here; `durable_s = install_s + flush_s`.
+5. **Inventory and cleanup (untimed).** Once every worker reaches durability, the parent walks each
+   `node_modules` for tree metrics, then removes project trees (unless `keep_node_modules`) and source
+   copies; a global `os.sync()` runs only between batches, never inside a timed section.
 
-**npm has no install-wide concurrency option.** Arborist's
-`[_unpackNewModules]` fans every pending package out to pacote at once, and
-there is no CLI flag or config key to bound it. What *is* boundable is the
-libuv threadpool, because the unpack writes are async `fs.write` calls; that is
-the one pin above. It is a real but weak lever on this workload — the store
-materialisation is dominated by the fan-out, not by the pool width.
+`install_s` is full wall time for the command — spawn, module loading, lockfile resolution,
+extraction — plus reading the external source; it excludes preparation, preread, inventory and
+cleanup. `durable_s` adds the whole-project flush. **The flush is the benchmark's protocol, not the
+tools' native durability semantics:** both may leave data in the page cache, and this workload makes
+the tree durable itself, so do not read `install_s` as what npm/pnpm guarantee or `durable_s` as
+their implementation detail.
 
-**pnpm's timed install is almost entirely its copy phase**, so the copy pool is
-what `N` has to reach. On Linux and Windows that is rayon
-(`RAYON_NUM_THREADS`). On macOS the copy runs on a separate, smaller pool whose
-default is 4, and `RAYON_NUM_THREADS` alone changes nothing there — both are set
-so one `N` means the same thing on either platform.
+## pnpm import method
 
-Deliberately **not** set, because they do not affect a timed offline install:
+pnpm uses `--package-import-method=copy` with the global virtual store off; `hardlink` and `auto`
+would link store contents into `node_modules` and measure the link path. With `copy`, the source is a
+controlled copy on the preparation filesystem, so a cross-source clone or reflink cannot serve the
+install. That prevents offload across sources but does not guarantee a physical write volume — a
+filesystem may still deduplicate or compress blocks — so `allocated_bytes` and `du_kib` describe what
+the tree occupies, not how much was written. npm always unpacks from its cache into new files.
 
-| Knob | Why not |
+## Output
+
+One row per manager × C × batch; `case` is `npm/c1`, `pnpm/c2`, … and `repeat` is the batch index.
+
+| Metric | Meaning |
 | --- | --- |
-| `PNPM_MAX_WORKERS` | the pnpm 11 Node worker pool; pnpm 12's binary never reads it |
-| `--network-concurrency` | bounds downloads; an offline install fetches nothing (measured effect < 1%) |
-| `--child-concurrency` | bounds lifecycle scripts; `ignore_scripts` is the default (measured effect < 1%) |
-| `--maxsockets` | registry sockets only, same reason as `--network-concurrency` |
+| `install_mean_s`, `flush_mean_s`, `durable_mean_s` | Mean `install_s`, `flush_s`, `durable_s` over the batch. |
+| `batch_install_s` / `batch_durable_s` | Wall time to the last exit / durability point: `max(start_offset_s + install_s)` / `max(start_offset_s + durable_s)`. |
+| `installs_per_s` / `durable_installs_per_s` | `C / batch_install_s` / `C / batch_durable_s`. |
+| `user_s`, `sys_s`, `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` | Summed child CPU time and summed tree inventory. |
 
-The seed phase uses the same values, so cache/store population and timed runs
-use the same parallelism. JSONL records the concurrency value, import policy,
-`ignore_scripts`, placement, fixture, tool versions and seed input hashes; the
-exact timed command is fixed by the module and identified by `source_sha256`.
-Keep concurrency and manager/version fixed when comparing runs.
+`start_offset_s` is measured from the parent's last monotonic reading before the barrier releases
+the workers, so `batch_*_s` includes release skew instead of assuming a simultaneous start. Means
+describe one install, batch times describe the batch, and throughput is a batch quantity, never a
+per-install latency.
 
-`CONFIG["concurrency"]` 固定计时安装的并发度，默认 **4**。两个包管理器没有共同的
-开关，N 只会写进实测有效的旋钮：npm 是 `UV_THREADPOOL_SIZE`（它没有安装级并发
-选项，解包扇出本身无上限），pnpm 是 `RAYON_NUM_THREADS` 与 macOS 上独立的
-`PNPM_MACOS_LINK_THREADS`（默认 4）。`PNPM_MAX_WORKERS` 只有 pnpm 11 读，下载/
-脚本类限制对离线安装没有影响，所以都不设置；`concurrency = 0` 表示不固定、沿用
-各自默认。
+`details` keeps raw per-worker samples, unrounded: `details.tasks[].task` (1-based), `install_s`,
+`flush_s`, `durable_s`, `user_s`, `sys_s`, `start_offset_s`; `details.target_fstype` records the
+target's type. `parameters` is experiment identity only: `fixture`, `concurrent_jobs` (this row's
+batch size), `concurrency`, `placement` (`"external-local"`), `prep_fstype`, `ignore_scripts`,
+`pnpm_import_method`, `pnpm_global_virtual_store`, `cache_state`
+(`"warm-source-empty-node_modules"`), `tool_versions` (manager and node), `seed_input_sha256`,
+`cpu_count`. Runs, manager selection, paths, device IDs and resolved executables are not stored, so
+the same experiment repeated in another run ID aggregates; a non-zero exit, missing tree, walk or
+fsync failure, or failed `du` aborts the run and emits no row for that batch.
 
-## Workload / 负载
+## Analysis and plotting
 
-1. **Setup (untimed)** — the fixture's manifest and committed lockfiles are
-   installed once. npm installs it into a seed project (network) to build the
-   npm cache; pnpm seeds its store from the fixture's committed
-   `pnpm-lock.yaml` with `--frozen-lockfile`. In cross-filesystem mode the seed
-   project lives under `prep_dir`, so the network install never writes to the
-   target.
-2. **Prewarm (untimed)** — every cache/store file is read once to fill the page
-   cache (`no_prewarm` / `warm_once` change this).
-3. **Timed install** — a fresh project directory holding only
-   `package.json` + lockfile (+ the fixture's `pnpm-workspace.yaml`):
-   - npm: `npm install --offline --cache <cache> --legacy-peer-deps`
-   - pnpm: `pnpm install --offline --store-dir <store> --frozen-lockfile
-     --package-import-method=copy --config.enable-global-virtual-store=false`
-4. **Timed flush** — every file and directory under `node_modules` is fsynced
-   individually, so the data is on the filesystem before the timer reports.
-   This is recorded separately as `sync_s`.
-5. **Measured afterwards (untimed)** — the `node_modules` tree is walked for
-   file/dir/symlink/hardlink counts, logical bytes, allocated bytes
-   (hardlinked inodes counted once) and `du -sk`.
+`summary.csv` (automatic after a successful run, or from `analyze`) groups by `benchmark × target ×
+case × metric × parameters × source_sha256`, so different configurations are never silently merged:
 
-`node_modules` is deleted after each run unless `keep_node_modules` is true.
+```text
+target,case,metric,samples,mean,median,minimum,maximum,stddev,benchmark,run_ids,parameters,source_sha256
+```
 
-## pnpm import method and cloning / 导入方式与 clone
+`parameters` is the canonical minified JSON of the parameter object (sorted keys, no spaces), so a
+summary row can be pasted into a plot selector; `samples` counts rows, not installs — one batch
+contributes one sample per metric, and `details.tasks` holds the per-worker values. `plot` rejects
+ambiguity: all selected rows of one case must share one `(parameters, source_sha256)` identity,
+otherwise it fails and lists the identities it found. Different cases may differ — a C sweep does, by
+design. `--parameters '<json>'` keeps rows whose parameters canonicalise to exactly that object; key
+order does not matter, but it must be the complete recorded object (including `tool_versions`,
+`seed_input_sha256`, `cpu_count`). `--source-sha256 <hash>[,<hash>…]` keeps the listed fingerprints;
+both combine with `--cases`/`--targets`, which select and order the axes, and filtering happens first
+so an excluded target never triggers ambiguity. `metrics.parameters_canonical` lists identities
+without a plot.
 
-pnpm's import method is pinned to `copy` (`PNPM_IMPORT_METHOD` in the script):
+```sh
+PARAMS='<parameters column of the wanted summary.csv row>'
+uv run --group analysis python -m agent_fs_bench plot \
+  'results/npm-install/*/results.jsonl' \
+  --benchmark npm-install --metric durable_mean_s \
+  --cases npm/c1 --targets fs-a,fs-b \
+  --parameters "$PARAMS" --source-sha256 <hash> \
+  --ylabel 'Durable install (s)' --output results/npm-latency
+```
 
-- `hardlink` and `auto` create links to the store, so `node_modules` on the
-  same filesystem costs almost no write I/O and measures the link path instead
-  of the data path;
-- `copy` forces real file content into `node_modules`. With
-  `CONFIG["prep_dir"]` set, the source is on another filesystem, so the copy
-  cannot become a link, a reflink or a server-side clone.
+**Recommended figures.** The existing grouped box plot suffices; no new plot mode is needed. For
+single-task latency, plot `install_mean_s` per manager at `--cases npm/c1` (then `pnpm/c1`) plus a
+second figure for `durable_mean_s`, keeping command time and durability apart. For concurrency, run
+`concurrent_jobs = [1, 2, 4, 8, 16]` with `concurrency = 4` and enough batches per case, then plot
+`--cases npm/c1,npm/c2,npm/c4,npm/c8,npm/c16` (and `pnpm/*`) with latency and throughput in separate
+figures, since one is per install and the other per batch; do not pass `--parameters` for such a
+sweep, as `concurrent_jobs` is part of the identity. This repository commits no generated plots and
+never invents data to fill one.
 
-npm always unpacks from its cacache into new files, so it has no equivalent
-switch; the `allocated_bytes / logical_bytes` ratio tells you whether anything
-was deduplicated anyway.
+## Notes
 
-pnpm 只允许 `copy`：`hardlink`/`auto` 会链接 store 而不真正写数据；跨盘时
-`copy` 的源在另一块盘上，无法退化成链接、reflink 或服务端 clone。npm 只会从
-cacache 解包，没有对应开关，用 `allocated_bytes / logical_bytes` 比值判断是否被
-去重。
-
-## Output / 输出
-
-Each successful manager/repeat emits numeric metrics: `elapsed_s`, `sync_s`,
-`user_s`, `sys_s`, `files`, `dirs`, `symlinks`, `hardlinks`,
-`logical_bytes`, `allocated_bytes`, `du_kib`, `files_per_s`, `sync_files_per_s`,
-`logical_mib_per_s`, and `allocated_mib_per_s`.
-
-`elapsed_s` includes subprocess execution and opening/closing its diagnostic
-log, but not preparation, preread, tree metrics, or cleanup. `sync_s` sums only
-the individual fsync calls; walking and opening/closing descriptors are outside
-that sum. It follows and is excluded from `elapsed_s`. CPU times are child
-resource-usage deltas. Manager repetitions run serially.
-
-Install failures, missing installed trees, traversal failures, fsync failures,
-and failed metrics commands abort the run. No successful row is emitted for a
-failed case; there is no always-zero error-count metric. Earlier completed JSONL
-lines remain available. Cache prereads fail on unreadable inputs, but still do
-not pin pages in memory. An untimed global sync separates seed work and repeats.
-
-The common envelope is `benchmark`, `run_id`, `target`, `case`, `repeat`,
-`parameters`, `source_sha256`, `metrics`, and `details`. Parameters carry only
-experiment identity: `fixture`, `pm`, `runs`, `concurrency`, `placement`,
-`ignore_scripts`, `pnpm_import_method`, `pnpm_global_virtual_store`,
-`cache_state`, `tool_versions`, and `seed_input_sha256` (hashes of the templates
-actually seeded). `details` stays empty: the timed command, cache-warming flow
-and fsync behaviour are defined by the module and identified by `source_sha256`,
-so they are not repeated per row.
-Diagnostic install logs stay under `results/npm-install/<run-id>/<target>/logs/`
-and are not copied into JSONL. Use common offline analysis/plot commands on
-exported JSONL; `summary.csv` aggregates every row by benchmark, target, case
-and metric across runs, lists the contributing `run_ids`, and does not split by
-parameters, source hash, or host. Logs or a live target directory are not
-required to interpret the measurements.
-
-## Notes / 注意事项
-
-- Same-filesystem mode is the default and keeps the historical behaviour, but
-  the filesystem under test may then answer with hardlinks or server-side
-  clones. Cross-filesystem mode is the one that measures real writes; enable it
-  by assigning `CONFIG["prep_dir"]`.
-  同盘模式仍可能被硬链接/服务端 clone 加速；要测真实写入请设置
-  `CONFIG["prep_dir"]`。
-- Cross-filesystem mode reads the caches over the other filesystem's stack, so
-  a slow or network-backed `prep_dir` becomes visible in `elapsed_s`. Keep it
-  on a fast local filesystem. 跨盘缓存所在文件系统的性能会计入 `elapsed_s`。
-- `prep_dir` state is shared by every target that points at it, and caches are
-  not cleaned up. Give distinct experiments their own prep directory; do not
-  run concurrent preparations in the same directory.
-- `allocated_bytes` is `st_blocks × 512`, de-duplicated per inode;
-  `logical_bytes` counts every directory entry, so hardlink layouts differ from
-  `du_kib` by design.
-- The benchmark root stays on the target filesystem after the run; delete it
-  yourself. 基准根目录会保留在被测文件系统上。
-- Whole-file fsync costs one syscall pair per file and directory. On
-  high-latency filesystems `sync_s` can dominate; it is reported separately for
-  that reason. 逐文件落盘在高延迟文件系统上可能成为主要开销，因此单独计时。
-- The npm and pnpm arms install **different graphs**: pnpm replays the fixture's
-  committed `pnpm-lock.yaml`, npm resolves the same `package.json` under
-  `--legacy-peer-deps` using its committed `package-lock.json`. The file/byte
-  counts therefore differ by design — compare npm-against-npm or
-  pnpm-against-pnpm across filesystems, not npm against pnpm within one run.
-  两个 manager 装的是**不同的依赖图**（pnpm 用提交的 `pnpm-lock.yaml`，npm 用
-  同一个 `package.json` 在 `--legacy-peer-deps` 下的解析结果），文件数/字节数
-  不可跨 manager 直接比较。
-- The npm timed command is therefore `npm install --offline
-  --legacy-peer-deps`; it is fixed in the module rather than stored per row.
+The timed install reads the preparation filesystem every run, so keep it local and quiet. `install_s`
+includes process startup, so increase `runs` rather than shrinking the workload. The benchmark root
+stays on the target; delete it yourself. Changing the timed command, flush protocol or isolation changes
+`source_sha256`; select one source identity rather than pooling old and new measurements.

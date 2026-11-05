@@ -8,6 +8,8 @@ from pathlib import Path
 import sys
 from typing import TextIO
 
+from .results import canonical_json
+
 COLUMNS = {
     'benchmark': 'VARCHAR', 'run_id': 'VARCHAR',
     'target': 'JSON', 'case': 'VARCHAR', 'repeat': 'BIGINT',
@@ -16,13 +18,19 @@ COLUMNS = {
 }
 METRICS_SQL = '''
 SELECT benchmark, run_id, target->>'name' AS target,
-       target->>'path' AS target_path, "case", repeat, parameters, source_sha256,
-       details, item.key AS metric, CAST(item.value AS DOUBLE) AS value
-FROM measurements, json_each(metrics) AS item
+       target->>'path' AS target_path, "case", repeat, parameters,
+       COALESCE(parameter_canonical.canonical, CAST(parameters AS VARCHAR)) AS parameters_canonical,
+       source_sha256, details,
+       item.key AS metric, CAST(item.value AS DOUBLE) AS value
+FROM measurements
+LEFT JOIN parameter_canonical
+       ON CAST(measurements.parameters AS VARCHAR) = parameter_canonical.raw
+CROSS JOIN json_each(measurements.metrics) AS item
 '''
 SUMMARY_SQL = '''
 WITH series AS (
     SELECT benchmark, run_id, "case", metric, value,
+           parameters_canonical, source_sha256,
            CASE WHEN benchmark = 'clone'
                 THEN target || '/' || (details->>'copier')
                 ELSE target END AS target
@@ -31,10 +39,11 @@ WITH series AS (
 SELECT target, "case", metric, count(*) AS samples, avg(value) AS mean,
        median(value) AS median, min(value) AS minimum, max(value) AS maximum,
        stddev_samp(value) AS stddev, benchmark,
-       string_agg(DISTINCT run_id, ';' ORDER BY run_id) AS run_ids
+       string_agg(DISTINCT run_id, ';' ORDER BY run_id) AS run_ids,
+       parameters_canonical AS parameters, source_sha256
 FROM series
-GROUP BY benchmark, target, "case", metric
-ORDER BY benchmark, "case", metric, target
+GROUP BY benchmark, target, "case", metric, parameters_canonical, source_sha256
+ORDER BY benchmark, "case", metric, target, parameters_canonical, source_sha256
 '''
 
 MIB = 1024 * 1024
@@ -60,6 +69,16 @@ CLONE_YLABELS = {
     'wall_s': 'Batch time (s)',
 }
 
+def canonical_parameter_text(value) -> str:
+    """Canonicalize one JSON value so key order never changes the grouping key."""
+    return canonical_json(json.loads(value))
+
+def parameters_argument(text: str) -> str:
+    try:
+        return canonical_parameter_text(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            'expected JSON, for example \'{"fixture": "pnpm-bench", "concurrency": 4}\'') from None
 
 def connect(inputs: list[str], database: Path | None = None):
     import duckdb
@@ -71,14 +90,25 @@ def connect(inputs: list[str], database: Path | None = None):
     connection = duckdb.connect(str(database) if database else ':memory:')
     connection.read_json(files, format='newline_delimited', columns=COLUMNS,
                          maximum_object_size=134217728).create_view('input_records')
+    # DuckDB keeps JSON object key order, so canonicalize distinct parameter
+    # documents in Python once and join them back; this needs no UDF extras.
+    documents = connection.execute(
+        'SELECT DISTINCT CAST(parameters AS VARCHAR) FROM input_records').fetchall()
+    connection.execute('CREATE TEMP TABLE parameter_canonical (raw VARCHAR, canonical VARCHAR)')
+    if documents:
+        connection.executemany(
+            'INSERT INTO parameter_canonical VALUES (?, ?)',
+            [(raw, None if raw is None else canonical_parameter_text(raw))
+             for (raw,) in documents])
     if database:
         connection.execute('CREATE OR REPLACE TABLE measurements AS SELECT * FROM input_records')
         connection.execute('DROP VIEW input_records')
+        connection.execute('DROP TABLE IF EXISTS metrics')
+        connection.execute('CREATE TABLE metrics AS ' + METRICS_SQL)
     else:
         connection.execute('CREATE VIEW measurements AS SELECT * FROM input_records')
-    connection.execute('CREATE OR REPLACE VIEW metrics AS ' + METRICS_SQL)
+        connection.execute('CREATE VIEW metrics AS ' + METRICS_SQL)
     return connection
-
 
 def write_csv(cursor, handle: TextIO) -> int:
     """Write query columns and rows using the same CSV format in every entry point."""
@@ -88,9 +118,8 @@ def write_csv(cursor, handle: TextIO) -> int:
     writer.writerows(rows)
     return len(rows)
 
-
 def export_summary(jsonl: Path, output: Path) -> int:
-    """Write the standard target/case/metric summary; return its row count."""
+    """Write the standard target/case/metric/identity summary; return its row count."""
     connection = connect([str(jsonl)])
     try:
         cursor = connection.execute(SUMMARY_SQL)
@@ -99,7 +128,6 @@ def export_summary(jsonl: Path, output: Path) -> int:
             return write_csv(cursor, handle)
     finally:
         connection.close()
-
 
 def main(command: str, argv: list[str]) -> int:
     parser = argparse.ArgumentParser(prog=f'agent-fs-bench {command}')
@@ -116,6 +144,12 @@ def main(command: str, argv: list[str]) -> int:
                             help='Comma-separated x-axis order; also selects cases (default: all, sorted)')
         parser.add_argument('--targets', type=lambda text: text.split(','),
                             help='Comma-separated legend order; the first is the primary system')
+        parser.add_argument('--parameters', type=parameters_argument,
+                            help='Plot only rows whose parameters canonicalize to exactly this JSON')
+        parser.add_argument('--source-sha256',
+                            type=lambda text: [value.strip() for value in text.split(',')
+                                               if value.strip()],
+                            help='Comma-separated source fingerprints; plot only matching rows')
         parser.add_argument('--ylabel', help='Y-axis label (default: metric name)')
         parser.add_argument('--size', type=float, nargs=2, default=(3.5, 1.5),
                             metavar=('WIDTH', 'HEIGHT'), help='Figure size in inches')
@@ -138,8 +172,8 @@ def main(command: str, argv: list[str]) -> int:
         connection.close()
     return 0
 
-
 def plot(connection, args: argparse.Namespace) -> None:
+    """Render selected measurements, refusing to merge configurations within a case."""
     from . import figure
 
     if args.benchmark == 'clone':
@@ -147,24 +181,53 @@ def plot(connection, args: argparse.Namespace) -> None:
         return
 
     rows = connection.execute('''
-        SELECT target, "case", list(value ORDER BY run_id, repeat)
+        SELECT target, "case", parameters_canonical, source_sha256,
+               list(value ORDER BY run_id, repeat)
         FROM metrics WHERE benchmark = ? AND metric = ?
-        GROUP BY target, "case" ORDER BY "case", target
+        GROUP BY target, "case", parameters_canonical, source_sha256
+        ORDER BY "case", target, source_sha256, parameters_canonical
     ''', [args.benchmark, args.metric]).fetchall()
+    wanted_parameters = getattr(args, 'parameters', None)
+    wanted_sources = getattr(args, 'source_sha256', None)
+    if wanted_sources is not None and not wanted_sources:
+        raise ValueError('--source-sha256 needs at least one fingerprint')
+    if wanted_parameters is not None:
+        rows = [row for row in rows if row[2] == wanted_parameters]
+    if wanted_sources:
+        rows = [row for row in rows if row[3] in wanted_sources]
     if not rows:
-        raise ValueError('no measurements match the plot selection')
-    found_targets = sorted({target for target, _, _ in rows})
-    found_cases = sorted({case for _, case, _ in rows})
+        filters = []
+        if wanted_parameters is not None:
+            filters.append(f'parameters={wanted_parameters}')
+        if wanted_sources:
+            filters.append('source_sha256=' + ','.join(wanted_sources))
+        detail = f' for {"; ".join(filters)}' if filters else ''
+        raise ValueError(f'no measurements match the plot selection{detail}')
+    found_targets = sorted({target for target, _, _, _, _ in rows})
+    found_cases = sorted({case for _, case, _, _, _ in rows})
     targets = args.targets or found_targets
     cases = args.cases or found_cases
     for kind, wanted, found in (('targets', targets, found_targets), ('cases', cases, found_cases)):
         missing = [name for name in wanted if name not in found]
         if missing:
             raise ValueError(f'no measurements for {kind}: {", ".join(missing)}')
+    # Validate the selected cases and targets before checking identity so rows
+    # excluded by --targets/--cases can never trigger an ambiguity error.
+    selected = [row for row in rows if row[0] in targets and row[1] in cases]
+    identities: dict[str, set[tuple[str, str]]] = {}
+    for _, case, parameters, source, _ in selected:
+        identities.setdefault(case, set()).add((parameters, source))
+    for case in cases:
+        found = identities.get(case, set())
+        if len(found) > 1:
+            listed = '; '.join(f'parameters={parameters} source_sha256={source}'
+                               for parameters, source in sorted(found))
+            raise ValueError(
+                f'case {case!r} mixes {len(found)} configurations: {listed}; '
+                'plot one with --parameters <json> and/or --source-sha256 <hash>[,<hash>]')
     samples = {target: {} for target in targets}
-    for target, case, group in rows:
-        if target in samples and case in cases:
-            samples[target][case] = group
+    for target, case, _, _, group in selected:
+        samples[target][case] = group
     data = {
         'cases': cases, 'targets': targets, 'samples': samples,
         'ylabel': args.ylabel or args.metric, 'size': list(args.size),
