@@ -46,26 +46,32 @@ class TargetTests(unittest.TestCase):
 
 
 class PortableResultsTests(unittest.TestCase):
-    def emit(self, output, parameters, repeat=1):
-        context = RunContext('example', 'run', Target('fs-a', Path('/mnt/private')),
+    def emit(self, output, parameters, repeat=1, *, run_id='run-b', value=None,
+             benchmark='example', target='fs-a', case='write', source='source'):
+        context = RunContext(benchmark, run_id, Target(target, Path('/mnt/private')),
                              Path('/missing/work'), Path('/missing/results'),
-                             parameters, {'source_sha256': 'source', 'hostname': 'host'}, output)
-        context.emit('write', {'latency_ms': repeat * 2.0}, repeat=repeat,
+                             parameters, source, output)
+        context.emit(case, {'latency_ms': repeat * 2.0 if value is None else value},
+                     repeat=repeat,
                      details={'samples_ms': [1.0, 3.0], 'nested': {'mode': 'FULL'}})
 
-    def test_portable_nested_data_and_parameter_groups(self):
+    def test_global_summary_retains_runs_and_portable_raw_samples(self):
         # The only transferred artifact is JSONL; no target, log, or source paths exist.
         output = io.StringIO()
         self.emit(output, {'fsync': True, 'size': 4}, 1)
         self.emit(output, {'size': 4, 'fsync': True}, 2)
-        self.emit(output, {'size': 8, 'fsync': True}, 1)
+        self.emit(output, {'size': 8, 'fsync': True}, run_id='run-a', value=6.0,
+                  source='another-source')
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'export.jsonl'
             path.write_text(output.getvalue())
             connection = connect([str(path)])
             self.addCleanup(connection.close)
             groups = connection.execute(SUMMARY_SQL).fetchall()
-            self.assertEqual(sorted((row[3], row[4]) for row in groups), [(1, 2.0), (2, 3.0)])
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0][:9], ('fs-a', 'write', 'latency_ms', 3,
+                                            4.0, 4.0, 2.0, 6.0, 2.0))
+            self.assertEqual(groups[0][9:], ('example', 'run-a;run-b'))
             samples = connection.execute(
                 "SELECT details->'samples_ms' FROM measurements LIMIT 1").fetchone()[0]
             self.assertEqual(json.loads(samples), [1.0, 3.0])
@@ -73,24 +79,46 @@ class PortableResultsTests(unittest.TestCase):
             archived = connect([str(path)], database)
             archived.close()
             summary = Path(directory) / 'summary.csv'
-            self.assertEqual(export_summary(path, summary), 2)
-            header = summary.read_text().splitlines()[0]
-            self.assertEqual(
-                header,
-                'target,case,metric,samples,mean,median,minimum,maximum,stddev,'
-                'parameter_id,benchmark,target_path,source_sha256,hostname',
-            )
+            self.assertEqual(export_summary(path, summary), 1)
+            with summary.open(newline='') as handle:
+                exported = list(csv.DictReader(handle))
+            self.assertEqual(exported[0]['run_ids'], 'run-a;run-b')
+            self.assertEqual(int(exported[0]['samples']), 3)
             path.unlink()
             import duckdb
             with duckdb.connect(str(database)) as reopened:
-                self.assertEqual(reopened.execute('SELECT sum(value) FROM metrics').fetchone()[0], 8.0)
+                self.assertEqual(reopened.execute('SELECT sum(value) FROM metrics').fetchone()[0], 12.0)
+
+    def test_global_summary_keeps_benchmarks_targets_cases_and_metrics_separate(self):
+        output = io.StringIO()
+        self.emit(output, {}, value=2.0)
+        self.emit(output, {}, benchmark='other', value=7.0)
+        self.emit(output, {}, target='fs-b', value=11.0)
+        self.emit(output, {}, case='read', value=13.0)
+        context = RunContext('example', 'run-b', Target('fs-a', Path('/mnt/private')),
+                             Path('/work'), Path('/results'), {}, 'source', output)
+        context.emit('write', {'throughput_mib_s': 17.0})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'data.jsonl'
+            path.write_text(output.getvalue())
+            connection = connect([str(path), str(Path(directory) / '*.jsonl')])
+            self.addCleanup(connection.close)
+            rows = connection.execute(SUMMARY_SQL).fetchall()
+        observed = {(row[9], row[0], row[1], row[2]): (row[3], row[4]) for row in rows}
+        self.assertEqual(observed, {
+            ('example', 'fs-a', 'write', 'latency_ms'): (1, 2.0),
+            ('other', 'fs-a', 'write', 'latency_ms'): (1, 7.0),
+            ('example', 'fs-b', 'write', 'latency_ms'): (1, 11.0),
+            ('example', 'fs-a', 'read', 'latency_ms'): (1, 13.0),
+            ('example', 'fs-a', 'write', 'throughput_mib_s'): (1, 17.0),
+        })
 
     def test_nonfinite_measurement_does_not_corrupt_jsonl(self):
         output = io.StringIO()
         self.emit(output, {'size': 4})
         before = output.getvalue()
         context = RunContext('example', 'run', Target('a', Path('/mnt/a')),
-                             Path('/work'), Path('/results'), {}, {}, output)
+                             Path('/work'), Path('/results'), {}, 'source', output)
         with self.assertRaises(ValueError):
             context.emit('write', {'latency_ms': float('nan')})
         self.assertEqual(output.getvalue(), before)
@@ -124,6 +152,14 @@ class SummaryRunTests(unittest.TestCase):
         run_dir = self.run_dir()
         records = [json.loads(line) for line in (run_dir / 'results.jsonl').read_text().splitlines()]
         self.assertEqual({row['target']['name'] for row in records}, {'a', 'b'})
+        for record in records:
+            metrics, details = record['metrics'], record['details']
+            samples = details['turn_samples_ms']
+            self.assertEqual(len(samples), metrics['turns'])
+            self.assertAlmostEqual(sum(samples) / len(samples), metrics['turn_mean_ms'])
+            self.assertEqual(details['rows']['transcript_events'], metrics['new_events'])
+            self.assertEqual(details['rows']['transcript_event_identities'], metrics['new_events'])
+            self.assertEqual(details['rows']['session_transcript_active_events'], metrics['new_events'])
         expected = {(row['target']['name'], row['case'], metric): value
                     for row in records for metric, value in row['metrics'].items()}
         with (run_dir / 'summary.csv').open(newline='') as handle:
@@ -134,6 +170,7 @@ class SummaryRunTests(unittest.TestCase):
             self.assertEqual(int(row['samples']), 1)
             self.assertEqual(float(row['mean']), expected[key])
             self.assertEqual(float(row['median']), expected[key])
+            self.assertEqual(row['run_ids'], run_dir.name)
 
     def test_summary_write_failure_preserves_measurements_without_rerunning(self):
         measure = openclaw_session.run

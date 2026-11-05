@@ -5,12 +5,10 @@ import argparse
 import hashlib
 import json
 import os
-import platform
 import re
 import shlex
 import shutil
 import signal
-import socket
 import statistics
 import subprocess
 import sys
@@ -277,7 +275,6 @@ def _phase_metric(
         "phase": phase,
         "latencies_ns": list(latencies_ns),
         "ops": ops,
-        "errors": 0,
         "elapsed_s": elapsed_s,
         "ops_per_s": ops / elapsed_s if elapsed_s > 0 else 0.0,
         "bytes": bytes_count,
@@ -696,14 +693,15 @@ def _remote_python(plan: ExperimentPlan, host: Host, source: str, data: Any) -> 
     return json.loads(completed.stdout)
 
 
-def _parallel(plan: ExperimentPlan, function: Any) -> dict[str, Any]:
+def _parallel(plan: ExperimentPlan, function: Any) -> None:
     with ThreadPoolExecutor(max_workers=len(plan.hosts)) as executor:
-        pending = {executor.submit(function, host): host.name for host in plan.hosts}
-        return {pending[future]: future.result() for future in as_completed(pending)}
+        pending = [executor.submit(function, host) for host in plan.hosts]
+        for future in as_completed(pending):
+            future.result()
 
 
-def _preflight_host(plan: ExperimentPlan, host: Host) -> dict[str, Any]:
-    return _remote_python(plan, host, """
+def _preflight_host(plan: ExperimentPlan, host: Host) -> None:
+    _remote_python(plan, host, """
 import json, os, platform, sys
 from pathlib import Path
 data = json.load(sys.stdin)
@@ -714,9 +712,7 @@ if sys.version_info < (3, 12) or platform.system() != 'Linux':
     raise RuntimeError('workers require Linux and Python 3.12+')
 if not target.is_dir() or not os.access(target, os.W_OK | os.X_OK):
     raise RuntimeError(f'target is not an accessible writable directory: {target}')
-print(json.dumps(dict(hostname=platform.node(), platform=platform.platform(),
-                     machine=platform.machine(), kernel=platform.release(), python=platform.python_version(),
-                     python_executable=sys.executable, uid=os.geteuid())))
+print('null')
 """, {"target": str(plan.target), "worker_dir": str(plan.remote_root)})
 
 
@@ -805,11 +801,10 @@ def _validate_job(job: dict[str, Any]) -> tuple[Path, Path, Path]:
 
 
 def _run_worker_job(job: dict[str, Any], paths: tuple[Path, Path, Path]) -> dict[str, Any]:
-    root, host_dir, shared = paths
+    _, host_dir, shared = paths
     workload = WorkloadConfig(**job["workload"])
     host_dir.mkdir()
     payload = _payload(job["host_name"], workload.file_size_bytes)
-    started_at_ns = time.time_ns()
     metrics = []
     for round_number in range(1, workload.rounds + 1):
         print(f"[worker] round {round_number}: private", file=sys.stderr, flush=True)
@@ -817,17 +812,9 @@ def _run_worker_job(job: dict[str, Any], paths: tuple[Path, Path, Path]) -> dict
         metrics.extend(private)
         print(f"[worker] round {round_number}: shared", file=sys.stderr, flush=True)
         metrics.extend(_run_shared_round(round_number, shared, job["host_name"], workload, payload))
-    finished_at_ns = time.time_ns()
-    elapsed_s = (finished_at_ns - started_at_ns) / 1_000_000_000
     if workload.cleanup_private:
         shutil.rmtree(host_dir)
-    return dict(success=True, host_name=job["host_name"], hostname=socket.gethostname(),
-                platform=platform.platform(), machine=platform.machine(), kernel=platform.release(),
-                python=platform.python_version(), pid=os.getpid(),
-                started_at_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started_at_ns / 1e9)),
-                host_dir=str(host_dir), shared_dir=str(shared), cleanup_private=workload.cleanup_private,
-                started_at_ns=started_at_ns, finished_at_ns=finished_at_ns,
-                elapsed_s=elapsed_s, run_root=str(root), metrics=metrics)
+    return dict(success=True, host_name=job["host_name"], metrics=metrics)
 
 
 def worker_main(argv: list[str]) -> int:
@@ -845,13 +832,10 @@ def worker_main(argv: list[str]) -> int:
         signal.setitimer(signal.ITIMER_REAL, job["ready_timeout_s"])
         paths = _validate_job(job)
         print("READY", flush=True)
-        gate_started = time.perf_counter()
         if sys.stdin.readline().strip() != "GO":
             raise WorkerError("start gate closed before GO")
-        gate_wait_s = time.perf_counter() - gate_started
         signal.setitimer(signal.ITIMER_REAL, job["run_timeout_s"])
         result = _run_worker_job(job, paths)
-        result["gate_wait_s"] = gate_wait_s
     except BaseException as exc:
         result = dict(success=False, error=str(exc), error_type=type(exc).__name__,
                       traceback=traceback.format_exc())
@@ -862,19 +846,17 @@ def worker_main(argv: list[str]) -> int:
     return 0 if result["success"] else 1
 
 
-def _send_gate(sessions: Sequence[WorkerSession], message: str) -> float:
-    started = time.perf_counter_ns()
+def _send_gate(sessions: Sequence[WorkerSession], message: str) -> None:
     for session in sessions:
         if session.process.stdin is None:
             raise RemoteError(f"{session.host.name}: worker stdin unavailable")
         session.process.stdin.write(message + "\n")
         session.process.stdin.flush()
-    return (time.perf_counter_ns() - started) / 1_000_000
 
 
-def _drive_workers(plan: ExperimentPlan, sessions: Sequence[WorkerSession]) -> dict[str, Any]:
+def _drive_workers(plan: ExperimentPlan, sessions: Sequence[WorkerSession]) -> None:
     _wait_for_ready(sessions, plan.ready_timeout_s)
-    start_gate_ms = _send_gate(sessions, "GO")
+    _send_gate(sessions, "GO")
     for session in sessions:
         if session.process.stdin:
             session.process.stdin.close()
@@ -896,7 +878,6 @@ def _drive_workers(plan: ExperimentPlan, sessions: Sequence[WorkerSession]) -> d
             raise RemoteError(f"{session.host.name}: {session.protocol_error or session.result or session.stderr()}")
         if session.result["host_name"] != session.host.name:
             raise RemoteError(f"{session.host.name}: wrong worker identity")
-    return dict(start_gate_control_write_ms=start_gate_ms)
 
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
@@ -913,22 +894,12 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
                           worker_dir / ctx.run_id / ctx.target.name, ctx.run_id,
                           os.urandom(24).hex(), args.connect_timeout_s, args.command_timeout_s,
                           args.ready_timeout_s, args.run_timeout_s)
-    # The private hosts-file and staging paths are environment setup, not
-    # experiment identity; actual hosts and worker environments are recorded.
-    ctx.parameters.pop("hosts", None)
-    ctx.parameters.pop("worker_dir", None)
-    # SSH transport settings are environment setup, not experiment identity;
-    # they remain in per-measurement details for local diagnosis.
-    parameter_hosts = [
-        {key: value for key, value in asdict(host).items() if key != "ssh_args"}
-        for host in hosts
-    ]
-    ctx.parameters.update(hosts=parameter_hosts, workload=asdict(workload))
+    ctx.parameters = {key: value for key, value in asdict(workload).items()
+                      if key != "cleanup_private"}
+    ctx.parameters["hosts"] = [host.name for host in hosts]
     if not shutil.which("ssh"):
         raise RemoteError("local ssh command not found")
-    preflight = _parallel(plan, lambda host: _preflight_host(plan, host))
-    # Worker runtime details are already retained per row; they are not part
-    # of the portable experiment identity.
+    _parallel(plan, lambda host: _preflight_host(plan, host))
     sources = {str(path.relative_to(PROJECT_ROOT)): path.read_text(encoding="utf-8")
                for path in sorted((PROJECT_ROOT / "agent_fs_bench").rglob("*.py"))}
     deployments: dict[str, dict[str, str]] = {}
@@ -938,11 +909,9 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         for host in hosts:
             deployments[host.name] = _deploy_host(plan, host, sources)
         _initialize_run_root(plan)
-        workload_started = time.perf_counter()
         for host in hosts:
             sessions.append(_start_worker_session(plan, host, deployments[host.name]))
-        gates = _drive_workers(plan, sessions)
-        workload_wall_s = time.perf_counter() - workload_started
+        _drive_workers(plan, sessions)
     finally:
         _abort_sessions(sessions)
         for session in sessions:
@@ -969,35 +938,17 @@ print('null')
             (ctx.result_dir / "cleanup-errors.log").write_text("\n".join(cleanup_errors) + "\n", encoding="utf-8")
             if sys.exc_info()[0] is None:
                 raise RemoteError("remote cleanup failed: " + "; ".join(cleanup_errors))
-    controller_environment = ctx.environment
     for session in sessions:
         result = session.result
         assert result is not None
-        worker = {key: value for key, value in result.items() if key != "metrics"}
-        # Each row belongs to one worker, not the controller; keep summary
-        # grouping and exported hostnames truthful.
-        ctx.environment = {
-            **controller_environment,
-            "hostname": worker["hostname"],
-            "platform": worker["platform"],
-            "machine": worker["machine"],
-            "kernel": worker["kernel"],
-            "python": worker["python"],
-        }
         for measurement in result["metrics"]:
             numeric = {key: value for key, value in measurement.items()
                        if key not in ("round", "phase", "latencies_ns")}
             ctx.emit(f"{session.host.name}/{measurement['phase']}", numeric,
                      repeat=measurement["round"], details={
-                         "host": asdict(session.host), "worker": worker,
-                         "phase": measurement["phase"], "latencies_ns": measurement["latencies_ns"],
-                         "preflight": preflight[session.host.name], "shared_sentinel_verified": True,
-                         "synchronization": gates, "workload_wall_s": workload_wall_s,
-                         "fsync_mode": "each file and directory in fsync phases" if workload.fsync else "disabled",
-                         "cache_state": "warm: no cache drop; reads may use the host page cache",
-                         "stdout": session.stdout(), "stderr": session.stderr(),
+                         "latencies_ns": measurement["latencies_ns"],
+                         "shared_sentinel_verified": True,
                      })
-    ctx.environment = controller_environment
 
 
 if __name__ == "__main__":

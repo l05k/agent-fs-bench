@@ -24,25 +24,33 @@ Pragma matching against OpenClaw's agent database
 (``src/infra/sqlite-wal.ts`` + ``src/state/openclaw-agent-db.ts`` at
 openclaw@5f6f15f):
 
-  parameter              OpenClaw                     reached here
+  parameter              OpenClaw                     requested here
   ---------------------  ---------------------------  -----------------------
-  journal_mode           WAL                          yes (--jmode wal)
+  journal_mode           WAL                          yes (--jmode wal; the
+                                                      actual mode is parsed
+                                                      from kvtest output)
   synchronous            NORMAL                       NO  (kvtest offers only
-                                                      default FULL or --nosync)
+                                                      default FULL or --nosync;
+                                                      never read back)
   busy_timeout           5000                         NO  (not configurable)
   foreign_keys           ON                           n/a (single table)
   journal_size_limit     64 MiB                       NO  (not configurable)
   auto_vacuum            INCREMENTAL (fresh db)       NO  (init cannot set it)
-  wal_autocheckpoint     0 (worker-maintained)        1000 (SQLite default)
+  wal_autocheckpoint     0 (worker-maintained)        1000 (SQLite default,
+                                                      never read back)
   cache_size             (default)                    --cache-size, default
-                                                      1000 KiB
-  mmap_size              (default)                    --mmap, default 0
+                                                      1000 KiB (the actual
+                                                      PRAGMA value is parsed
+                                                      from kvtest output)
+  mmap_size              (default)                    --mmap, default 0 (only
+                                                      echoed, never read back)
 
 ``wal_autocheckpoint`` is the value that matters most and it cannot be pinned
 to OpenClaw's 0 through ``kvtest``'s options: ``--nocheckpoint`` sets it to 0,
 which lets the WAL grow without bound and pushes one huge checkpoint to the
 end of the run. This harness therefore leaves the SQLite default of 1000
-pages (roughly 4 MiB at a 4 KiB page size) and records it in the result.
+pages (roughly 4 MiB at a 4 KiB page size) and does not claim to have
+observed a different value.
 
 Reported microseconds/write amortize connection setup and the final close /
 checkpoint as well as the writes. This is a single-table comparison workload,
@@ -63,7 +71,6 @@ import os
 import re
 import shlex
 import shutil
-import sqlite3
 import subprocess
 import time
 import urllib.request
@@ -72,7 +79,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
-MIB = 1024 * 1024
 
 SQLITE_VERSION = "3.54.1"
 SQLITE_AMALGAMATION = f"sqlite-amalgamation-3540100.zip"
@@ -88,31 +94,14 @@ DB_FILENAME = "kv-openclaw.sqlite"
 BUILD_METADATA_FILENAME = "kvtest-build.json"
 JMODE_CHOICES = ("delete", "truncate", "persist", "memory", "wal", "off")
 
-# OpenClaw agent database settings this harness cannot reproduce through
-# kvtest's command line. Recorded verbatim so the gap is visible in results.
-OPENCLAW_SETTINGS = {
-    "journal_mode": "WAL",
-    "synchronous": "NORMAL",
-    "busy_timeout": 5000,
-    "foreign_keys": "ON",
-    "journal_size_limit": 64 * MIB,
-    "wal_autocheckpoint": 0,
-}
-
-# What kvtest will actually run with, given the options this harness passes.
-REACHED_SETTINGS = {
-    "journal_mode": "WAL",
-    "synchronous": "FULL",
-    "wal_autocheckpoint": 1000,
-}
-
 DEFAULT_PAYLOAD = 2048
 DEFAULT_VARIANCE = 1024
 DEFAULT_COUNT = 2000
 DEFAULT_CACHE_KIB = 1000
 
-# Deliberate experiment settings. Edit for an ablation; values are recorded in
-# every JSONL row, and private settings must never be committed.
+# Deliberate experiment settings. Edit for an ablation; workload values are
+# recorded in every JSONL row. build_dir and force_download are run management
+# and are not recorded. Private settings must never be committed.
 CONFIG = {
     "size": DEFAULT_PAYLOAD,
     "variance": DEFAULT_VARIANCE,
@@ -399,79 +388,87 @@ def run_command(command: Sequence[str]) -> subprocess.CompletedProcess:
 
 
 PARSE_PATTERNS = {
-    "microseconds_per_write": re.compile(r"Microseconds per BLOB write:\s*([0-9.]+)"),
-    "write_rate_mb_s": re.compile(r"Content write rate:\s*([0-9.]+)"),
-    "total_elapsed_s": re.compile(r"Total elapsed time:\s*([0-9.]+)"),
-    "page_size": re.compile(r"Database page size:\s*(\d+)"),
-    "journal_mode": re.compile(r"--jmode\s+(\w+)"),
+    "sqlite_version": re.compile(
+        r"^SQLite version:[ \t]*(\S+)[ \t]*\r?$", re.MULTILINE
+    ),
+    "cache_size_and_journal_mode": re.compile(
+        r"^--cache-size[ \t]+(-?\d+)[ \t]+--jmode[ \t]+(\w+)[ \t]*\r?$",
+        re.MULTILINE,
+    ),
+    "page_size": re.compile(
+        r"^Database page size:[ \t]*(\d+)[ \t]*\r?$", re.MULTILINE
+    ),
+    "total_elapsed_s": re.compile(
+        r"^Total elapsed time:[ \t]*([0-9]+\.[0-9]+)[ \t]*\r?$",
+        re.MULTILINE,
+    ),
+    "microseconds_per_write": re.compile(
+        r"^Microseconds per BLOB write:[ \t]*([0-9]+\.[0-9]+)[ \t]*\r?$",
+        re.MULTILINE,
+    ),
+    "write_rate_mb_s": re.compile(
+        r"^Content write rate:[ \t]*([0-9]+\.[0-9]+)[ \t]*MB/s[ \t]*\r?$",
+        re.MULTILINE,
+    ),
 }
+INTEGRITY_PATTERN = re.compile(
+    r"^Integrity-check:[ \t]*(\S.*?)[ \t]*\r?$", re.MULTILINE
+)
 
 
 def parse_kvtest_output(text: str) -> Dict[str, Any]:
-    parsed: Dict[str, Any] = {}
+    """Parse ``kvtest run`` output, rejecting any missing measured field.
+
+    Only values kvtest itself prints are returned: library version, the
+    effective journal mode, cache size and page size read back from SQLite,
+    and the timing lines. ``--mmap`` is merely an echo of the request and
+    ``synchronous`` is never printed, so neither can be reported as observed.
+    """
+    matches: Dict[str, re.Match] = {}
+    missing: List[str] = []
     for name, pattern in PARSE_PATTERNS.items():
         match = pattern.search(text)
-        if match:
-            value = match.group(1)
-            if name == "journal_mode":
-                parsed[name] = value.upper()
-            else:
-                parsed[name] = float(value) if "." in value else int(value)
-    if "microseconds_per_write" not in parsed:
+        if match is None:
+            missing.append(name)
+        else:
+            matches[name] = match
+    if missing:
         raise BenchmarkError(
-            "could not parse kvtest output; expected "
-            "'Microseconds per BLOB write'. Full output:\n" + text
+            "could not parse kvtest output; missing "
+            + ", ".join(missing)
+            + ". Full output:\n"
+            + text
         )
-    return parsed
+    return {
+        "sqlite_version": matches["sqlite_version"].group(1),
+        "journal_mode": matches["cache_size_and_journal_mode"].group(2),
+        "cache_size": int(matches["cache_size_and_journal_mode"].group(1)),
+        "page_size": int(matches["page_size"].group(1)),
+        "total_elapsed_s": float(matches["total_elapsed_s"].group(1)),
+        "microseconds_per_write": float(
+            matches["microseconds_per_write"].group(1)
+        ),
+        "write_rate_mb_s": float(matches["write_rate_mb_s"].group(1)),
+    }
 
 
-def file_size(path: Path) -> int:
-    try:
-        return path.stat().st_size
-    except FileNotFoundError:
-        return 0
-
-
-def reached_synchronous(args: argparse.Namespace) -> str:
-    """Return the synchronous mode kvtest will run with."""
-    return "OFF" if args.nosync else "FULL"
-
-
-def database_pragmas(
-    db_path: Path, reached_synchronous: str
-) -> Dict[str, Any]:
-    """Read back the pragmas that were actually in effect.
-
-    ``synchronous``, ``wal_autocheckpoint``, ``cache_size`` and ``mmap_size``
-    are connection-scoped in SQLite, so a fresh inspection connection cannot
-    observe the values the benchmark used. Those are reported from the
-    invocation instead; only the persistent header and page counts are read.
-    """
-    conn = sqlite3.connect(str(db_path))
-    try:
-        values: Dict[str, Any] = {}
-        for name in (
-            "journal_mode",
-            "journal_size_limit",
-            "page_size",
-            "page_count",
-            "freelist_count",
-        ):
-            try:
-                row = conn.execute(f"PRAGMA {name}").fetchone()
-                values[name] = row[0] if row else None
-            except sqlite3.Error as exc:
-                values[name] = f"unavailable: {exc}"
-        try:
-            values["integrity_check"] = conn.execute(
-                "PRAGMA integrity_check"
-            ).fetchone()[0]
-        except sqlite3.Error as exc:
-            values["integrity_check"] = f"unavailable: {exc}"
-        values["synchronous_name"] = reached_synchronous
-        return values
-    finally:
-        conn.close()
+def parse_integrity_check(text: str) -> str:
+    """Parse ``kvtest stat`` output; every printed check must be ``ok``."""
+    values = INTEGRITY_PATTERN.findall(text)
+    if not values:
+        raise BenchmarkError(
+            "could not parse kvtest stat output; missing "
+            "'Integrity-check'. Full output:\n" + text
+        )
+    failed = [value for value in values if value != "ok"]
+    if failed:
+        raise BenchmarkError(
+            "kvtest integrity-check failed: "
+            + "; ".join(failed)
+            + "\nFull output:\n"
+            + text
+        )
+    return "ok"
 
 
 def remove_database(db_path: Path) -> None:
@@ -490,129 +487,73 @@ def measure(args: argparse.Namespace) -> Dict[str, Any]:
     db_path = target_dir / DB_FILENAME
     remove_database(db_path)
 
-    init_command = [
-        str(binary),
-        "init",
-        str(db_path),
-        "--count",
-        str(args.count),
-        "--size",
-        str(args.size),
-        "--variance",
-        str(args.variance),
-    ]
-    setup_started = time.perf_counter()
-    init_proc = run_command(init_command)
-    setup_elapsed = time.perf_counter() - setup_started
+    run_command(
+        [
+            str(binary),
+            "init",
+            str(db_path),
+            "--count",
+            str(args.count),
+            "--size",
+            str(args.size),
+            "--variance",
+            str(args.variance),
+        ]
+    )
 
-    conn = sqlite3.connect(str(db_path))
-    try:
-        db_bytes_after_init = file_size(db_path)
-        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-    finally:
-        conn.close()
-
-    run_command_argv = [
+    run_argv = [
         str(binary),
         "run",
         str(db_path),
         "--count",
         str(args.count),
+        # Every BLOB overwrite commits in its own transaction.
         "--update",
         "--random",
         "--multitrans",
         "--jmode",
         args.jmode,
+        # Negative cache_size means KiB; kvtest reads the value back.
         "--cache-size",
         str(-args.cache_size),
         "--mmap",
         str(args.mmap),
     ]
     if args.nosync:
-        run_command_argv.append("--nosync")
+        run_argv.append("--nosync")
 
     repeats: List[Dict[str, Any]] = []
     for index in range(args.repeats):
-        # kvtest writes the same rows again each time; that is intentional,
-        # so later repeats measure overwrite-with-existing-rows.
-        wal_path = Path(str(db_path) + "-wal")
-        before_wal = file_size(wal_path)
-        proc = run_command(run_command_argv)
-        parsed = parse_kvtest_output(proc.stdout)
+        # kvtest overwrites the same rows again each time; later repeats
+        # therefore measure overwrite-with-existing-rows.
+        proc = run_command(run_argv)
         repeats.append(
             {
-                "index": index + 1,
-                "argv": run_command_argv,
-                "parsed": parsed,
-                "wal_bytes_before": before_wal,
-                "wal_bytes_after": file_size(wal_path),
-                "raw_stdout": proc.stdout,
+                "repeat": index + 1,
+                "parsed": parse_kvtest_output(proc.stdout),
             }
         )
 
-    final_wal_path = Path(str(db_path) + "-wal")
-    final_shm_path = Path(str(db_path) + "-shm")
-    db_pragmas = database_pragmas(db_path, reached_synchronous(args))
-    db_bytes_final = file_size(db_path)
-    wal_bytes_final = file_size(final_wal_path)
-    shm_bytes_final = file_size(final_shm_path)
-
+    # One final validation after all timed runs, using the same binary.
+    integrity_check = parse_integrity_check(
+        run_command([str(binary), "stat", str(db_path)]).stdout
+    )
 
     return {
-        "workload": "sqlite-kvtest-openclaw-multitrans",
-        "status": "ok" if db_pragmas.get("integrity_check") == "ok" else "failed",
-        "sqlite_version": sqlite3.sqlite_version,
-        "sqlite_build_version": SQLITE_VERSION,
-        "kvtest_source": KVTEST_URL,
-        "amalgamation_source": SQLITE_AMALGAMATION_URL,
-        "cc": provenance["compiler"],
-        "compiler_argv": provenance["compiler_argv"],
-        "compiler_version": provenance["compiler_version"],
-        "source_sha256": provenance["source_sha256"],
-        "binary_sha256": provenance["binary_sha256"],
-        "target_dir": str(target_dir),
-        "db_path": str(db_path),
-        "payload_bytes": args.size,
-        "payload_variance": args.variance,
-        "writes": args.count,
-        "jmode": args.jmode,
-        "nosync": args.nosync,
-        "cache_size_kib": args.cache_size,
-        "mmap_bytes": args.mmap,
-        "repeats": args.repeats,
-        "setup_elapsed_s": setup_elapsed,
-        "page_size": db_pragmas.get("page_size") or page_size,
-        "openclaw_settings": OPENCLAW_SETTINGS,
-        "reached_settings": {
-            **REACHED_SETTINGS,
-            "journal_mode": repeats[-1]["parsed"]["journal_mode"],
-            "synchronous": reached_synchronous(args),
-            "cache_size": -args.cache_size,
-            "mmap_size": args.mmap,
+        # Requests only; parsed output carries the values SQLite read back.
+        "requests": {
+            "size": args.size,
+            "variance": args.variance,
+            "count": args.count,
+            "cache_size_kib": args.cache_size,
+            "jmode": args.jmode,
+            "nosync": args.nosync,
+            "mmap_bytes": args.mmap,
+            "repeats": args.repeats,
         },
-        "settings_gap": [
-            "synchronous: OpenClaw NORMAL, kvtest offers only FULL or OFF",
-            "busy_timeout: OpenClaw 5000 ms, kvtest cannot set it",
-            "journal_size_limit: OpenClaw 64 MiB, kvtest cannot set it",
-            (
-                "wal_autocheckpoint: OpenClaw 0, kvtest default 1000"
-                if repeats[-1]["parsed"]["journal_mode"] == "WAL"
-                else "WAL checkpointing: not applicable to the reached journal mode"
-            ),
-            "auto_vacuum: OpenClaw INCREMENTAL on fresh db, kvtest cannot set it",
-            "no secondary indexes, no FTS5, single kv table",
-        ],
-        "results": repeats,
-        "pragmas": db_pragmas,
-        "files": {
-            "db_bytes_after_init": db_bytes_after_init,
-            "db_bytes_final": db_bytes_final,
-            "wal_bytes_final": wal_bytes_final,
-            "shm_bytes_final": shm_bytes_final,
-        },
-        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "init_stdout": init_proc.stdout,
-        "init_argv": init_command,
+        "provenance": provenance,
+        "repeats": repeats,
+        "integrity_check": integrity_check,
     }
 
 
@@ -621,20 +562,43 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     if args.build_dir is not None:
         args.build_dir = args.build_dir.expanduser().resolve()
     result = measure(args)
-    if result["status"] != "ok":
-        raise BenchmarkError(f"integrity_check={result['pragmas']['integrity_check']}")
-    repeats = result.pop("results")
-    ctx.parameters.pop("build_dir", None)
-    ctx.parameters["jmode"] = result["jmode"]
-    ctx.parameters.update({name: result[name] for name in (
-        "sqlite_build_version", "cc", "compiler_argv",
-        "compiler_version", "source_sha256", "binary_sha256"
-    )})
+    provenance = result["provenance"]
+    repeats = result["repeats"]
+    integrity_check = result["integrity_check"]
+    sqlite_version = repeats[0]["parsed"]["sqlite_version"]
+    if any(
+        entry["parsed"]["sqlite_version"] != sqlite_version
+        for entry in repeats
+    ):
+        raise BenchmarkError(
+            "kvtest reported different SQLite versions across repeats"
+        )
+
+    ctx.parameters.clear()
+    ctx.parameters.update(result["requests"])
+    ctx.parameters["tool_versions"] = {
+        "sqlite": sqlite_version,
+        "compiler": provenance["compiler_version"],
+    }
+    ctx.parameters["source_sha256"] = provenance["source_sha256"]
+    ctx.parameters["binary_sha256"] = provenance["binary_sha256"]
+
     for entry in repeats:
         parsed = entry["parsed"]
-        metrics = {name: value for name, value in parsed.items()
-                   if isinstance(value, (int, float)) and not isinstance(value, bool)}
-        details = {**result, **entry,
-                   "fsync_mode": f"SQLite synchronous={reached_synchronous(args)}",
-                   "cache_state": "warm: initialized database; random-key overwrites; no cache drop"}
-        ctx.emit("multitrans-overwrite", metrics, repeat=entry["index"], details=details)
+        ctx.emit(
+            "multitrans-overwrite",
+            {
+                "microseconds_per_write": parsed["microseconds_per_write"],
+                "write_rate_mb_s": parsed["write_rate_mb_s"],
+                "total_elapsed_s": parsed["total_elapsed_s"],
+            },
+            repeat=entry["repeat"],
+            details={
+                "observed": {
+                    "journal_mode": parsed["journal_mode"],
+                    "cache_size": parsed["cache_size"],
+                    "page_size": parsed["page_size"],
+                },
+                "integrity_check": integrity_check,
+            },
+        )

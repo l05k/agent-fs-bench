@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
+from .build_settings import read_compiler_version
 
 DEFAULT_FIXTURE_DIR = PROJECT_ROOT / "data" / "mini-dev-workflow"
 DEFAULT_SERIES = "series.json"
@@ -33,7 +34,7 @@ DEFAULT_BUNDLE = "source-repo.bundle"
 # the filesystem under test, so the source repository sits next to the worktree.
 SOURCE_REPO_SUFFIX = "-source"
 
-# Preserve the fixed upstream parallelism even though this fixture has one C file.
+# Keep this harness's configured parallelism; upstream invokes plain make.
 # Change CONFIG["jobs"] only for a deliberate experiment; it is capped below.
 FIXED_JOBS = 2
 
@@ -48,11 +49,7 @@ CONFIG = {
     "verbose": False,
 }
 
-FSYNC_MODE = "git:core.fsync=committed,core.fsyncMethod=fsync"
-CACHE_STATE = "warm: no cache drop; reads hit page cache dirtied by the run"
-
 CORE_COMMANDS = ("git", "bash", "make", "grep", "sed", "python3")
-BUILD_COMMANDS = (("cc", "gcc", "clang"),)
 
 
 
@@ -338,9 +335,6 @@ def missing_dependencies(*, require_fstype: bool = False) -> list[str]:
     missing = [name for name in CORE_COMMANDS if shutil.which(name) is None]
     if require_fstype and shutil.which("findmnt") is None:
         missing.append("findmnt")
-    for alternatives in BUILD_COMMANDS:
-        if not any(shutil.which(name) for name in alternatives):
-            missing.append(" or ".join(alternatives))
     return missing
 
 
@@ -512,28 +506,14 @@ def has_local_commit(repo: Path, revision: str) -> bool:
     return result.stdout.strip() != ""
 
 
-def loose_object_count(repo: Path) -> int:
-    """Count loose objects so run-to-run history growth stays visible."""
-    objects = repo / ".git" / "objects"
-    if not objects.is_dir():
-        return 0
-    count = 0
-    for entry in objects.iterdir():
-        if len(entry.name) == 2 and entry.is_dir():
-            count += sum(1 for _ in entry.iterdir())
-    return count
-
-
 def record_checkpoint(step: int, phase: str, steps: list[dict[str, Any]]) -> None:
     steps.append({"step": f"checkpoint: {phase}", "ms": 0})
-
-
 
 
 def resolve_jobs(args: argparse.Namespace) -> int:
     """Pin build parallelism.
 
-    Preserve the upstream cap to avoid scheduling noise. CONFIG["jobs"] is
+    Keep this harness's cap to avoid scheduling noise. CONFIG["jobs"] is
     honoured up to that cap; the effective value is recorded in JSONL.
     """
     if type(args.jobs) is not int or args.jobs < 1:
@@ -545,7 +525,6 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
     worktree = ctx.work_dir / "repo"
     fixture_dir = Path(args.fixture_dir).expanduser().absolute()
     source_repo = default_source_repo(worktree)
-    series_path = fixture_dir / DEFAULT_SERIES
 
     series = validate_fixtures(fixture_dir)
     base_commit = series["base_commit"]
@@ -557,11 +536,9 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
     )
     source_repo = resolve_source_repo(source_repo, verbose=args.verbose)
     require_filesystem(source_repo, args.require_fstype, "source repository")
-    filesystem = detect_filesystem(source_repo)
 
     preparation_start = time.perf_counter_ns()
     validate_source_repository(source_repo, base_commit=base_commit, commit_ids=commit_ids)
-    objects_before = loose_object_count(source_repo)
 
     jobs = resolve_jobs(args)
     steps: list[dict[str, Any]] = []
@@ -574,8 +551,6 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
     error: str | None = None
     timed_start: int | None = None
     timed_end: int | None = None
-    repo_action = "worktree-add"
-    source_repo_action = "cloned-bundle"
     worktree_ready = False
 
     try:
@@ -732,6 +707,14 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
             workflow_ms = (timed_end - timed_start) // 1_000_000
         else:
             workflow_ms = 0
+        if success:
+            try:
+                ctx.parameters.setdefault("tool_versions", {})["compiler"] = (
+                    read_compiler_version(worktree)
+                )
+            except (OSError, RuntimeError) as exc:
+                success = False
+                error = str(exc)
         cleanup_start = time.perf_counter_ns()
         if worktree_ready:
             try:
@@ -753,31 +736,14 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
     ))
 
     return {
-        "execution_mode": "git-worktree",
         "success": success,
         "error": error,
-        "repo": str(worktree),
-        "repo_action": repo_action,
-        "source_repo": str(source_repo),
-        "source_repo_action": source_repo_action,
-        "source_setup_ms": source_setup_ms,
-        "git_dir": str(source_repo / ".git"),
-        "preparation_ms": preparation_ms,
-        "fixture_dir": str(fixture_dir),
-        "series": str(series_path),
-        "worktree_removed": not worktree.exists(),
-        "filesystem": filesystem,
-        "required_filesystem": args.require_fstype,
         "base_commit": base_commit,
-        "checkpoint_count": checkpoint_step,
-        "jobs": jobs,
+        "source_setup_ms": source_setup_ms,
+        "preparation_ms": preparation_ms,
         "elapsed_ms": workflow_ms,
         "unattributed_ms": unattributed_ms,
         "cleanup_ms": cleanup_ms,
-        "loose_objects_before": objects_before,
-        "loose_objects_after": loose_object_count(source_repo),
-        "fsync_mode": FSYNC_MODE,
-        "cache_state": CACHE_STATE,
         "steps": steps,
     }
 
@@ -836,28 +802,22 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         with (fixture_dir / name).open("rb") as stream:
             hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
     tools = {}
-    compiler = shlex.split(os.environ.get("CC", "cc"))
-    if not compiler:
-        raise WorkflowError("CC must name a compiler")
-    for name, argv in {"git": ["git"], "make": ["make"], "compiler": compiler}.items():
+    for name in ("git", "make"):
         tools[name] = run_command(
-            [*argv, "--version"], cwd=ctx.work_dir,
+            [name, "--version"], cwd=ctx.work_dir,
             what=f"reading {name} version", capture_stdout=True,
-        ).stdout.strip()
-    ctx.parameters.update(
-        jobs=resolve_jobs(args),
-        fixture={"series": series, "sha256": hashes},
-        tool_versions=tools,
-        build_environment={key: os.environ[key] for key in (
-            "CC", "CFLAGS", "LDFLAGS", "MAKEFLAGS"
-        ) if key in os.environ},
-    )
+        ).stdout.strip().splitlines()[0]
+    ctx.parameters = {
+        "jobs": resolve_jobs(args),
+        "fixture_sha256": hashes,
+        "tool_versions": tools,
+    }
     result = run_workflow(ctx, args)
+    ctx.parameters["base_commit"] = result.pop("base_commit")
     if not result.pop("success"):
         raise WorkflowError(result["error"] or "workflow failed")
     result.pop("error")
     metrics = {key: result.pop(key) for key in (
         "elapsed_ms", "preparation_ms", "cleanup_ms", "unattributed_ms", "source_setup_ms"
     )}
-    ctx.parameters.pop("fixture_dir", None)
     ctx.emit("workflow", metrics, details=result)
