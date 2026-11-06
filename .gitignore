@@ -10,6 +10,9 @@ dist/
 # Never publish experiment hosts, mounts, credentials, or measured results
 /local/
 /results/
+# Recorded model traffic can contain provider credentials and private task data
+*.mitm
+**/cassettes/
 *.duckdb
 *.duckdb.wal
 /thirdparty/

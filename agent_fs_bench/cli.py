@@ -20,6 +20,7 @@ BENCHMARKS = {
     'multi-host': 'multi_host',
     'mount-scale': 'mount_scale',
     'mdtest': 'mdtest',
+    'agent-replay': 'agent_replay',
 }
 RESULTS_DIR = PROJECT_ROOT / 'results'
 TARGETS_FILE = PROJECT_ROOT / 'local' / 'targets.toml'
