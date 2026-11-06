@@ -163,9 +163,12 @@ their implementation detail.
 `run npm-install-nofsync` runs the same module through
 `agent_fs_bench/benchmarks/npm_install_nofsync.py`, which only sets
 `CONFIG["flush"] = False`. It removes every harness-initiated sync: the timed
-whole-project flush, the pre-timing input fsync, and the `os.sync()` after
-seeding and between batches. Steps 2 and 5 drop their sync calls and step 4 does
-not exist, so nothing in the benchmark forces the tree to stable storage.
+whole-project flush, the pre-timing input fsync, and all three `os.sync()`
+calls — after seeding, before each batch, and after each batch. Step 2 keeps its
+project-placement check but drops the fsync, step 4 does not exist, and step 5
+drops its sync calls, so nothing in the benchmark forces the tree to stable
+storage. The check that a project lies inside the measured target is not a sync
+and stays unconditional.
 
 Rows carry only `install_mean_s`, `batch_install_s`, `installs_per_s`, `user_s`,
 `sys_s` and the tree inventory; `flush_*`, `durable_*` and

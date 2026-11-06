@@ -147,11 +147,16 @@ def fsync_tree(path: Path) -> float:
     return time.monotonic() - started
 
 
-def sync_prepared_project(project: Path, target: Path) -> None:
-    """Persist input files and every newly created ancestor before timing."""
+def check_project_placement(project: Path, target: Path) -> None:
+    """Reject a project outside the measured target; independent of sync mode."""
     project, target = project.resolve(), target.resolve()
     if not project.is_relative_to(target):
         die(f"project is outside the measured target: {project}")
+
+def sync_prepared_project(project: Path, target: Path) -> None:
+    """Persist input files and every newly created ancestor before timing."""
+    project, target = project.resolve(), target.resolve()
+    check_project_placement(project, target)
     fsync_tree(project)
     ancestor = project.parent
     while True:
@@ -552,8 +557,9 @@ def run_batch(
         env = manager_env(manager, args.concurrency, sandbox)
         if manager == "pnpm":
             env["XDG_CACHE_HOME"] = str(task_source / "cache")
+        check_project_placement(project, ctx.target.path)
         if args.flush:
-            sync_prepared_project(project, ctx.target.path.resolve())
+            sync_prepared_project(project, ctx.target.path)
         jobs.append({
             "project": project, "env": env,
             "command": install_command(manager, binary, task_source, args.ignore_scripts),
