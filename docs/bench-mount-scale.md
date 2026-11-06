@@ -46,7 +46,7 @@ An intra-cloud cluster needs:
 3. Open MPI startup, barriers and rank communication do not use a benchmark-built SSH tunnel. Opening TCP 22 alone is not enough. Force plain TCP and same-host shared memory; RDMA is not required. Do not mistake the launcher port range for the range of all MPI traffic.
 4. On multi-NIC machines, select mutually reachable MPI data/control interfaces explicitly in `CONFIG['mpi_launcher']`, and archive the experiment configuration. MPI traffic can compete with storage traffic, so report the network layout.
 
-Open MPI starts remote daemons through the inventory-aware SSH agent on the controller with tree spawning disabled; workers do not need each other's private keys. The agent uses the existing hosts/SSH rules in `agent_fs_bench/ssh.py`. Open MPI host tokens must be reachable hostnames or IPv4 addresses; an SSH-only alias cannot stand in for a resolvable MPI address. The controller Python, SSH agent and inventory paths must not contain whitespace or colons (an Open MPI 4 limit on parsing `plm_rsh_agent`).
+Open MPI starts remote daemons through the inventory-aware SSH agent on the controller with tree spawning disabled; workers do not need each other's private keys. The agent uses the existing hosts/SSH rules in `agent_fs_bench/ssh.py`. Open MPI host tokens must be reachable hostnames or IPv4 addresses; an SSH-only alias cannot stand in for a resolvable MPI address. The controller Python, checkout and inventory paths must not contain whitespace or colons; otherwise Open MPI 4 cannot parse `plm_rsh_agent` and fails to start.
 
 ## Configuration and runs
 
@@ -113,7 +113,7 @@ Mount commands must return after the mount is established, and unmount commands 
 
 ```sh
 uv run python -m agent_fs_bench run mount-scale --target nfs
-uv run python -m agent_fs_bench run mount-scale --target fs-a
+uv run python -m agent_fs_bench run mount-scale --target lakebase
 
 # Two local clients, ordinary directories, 32 files, one repeat; reads no hosts/profile and mounts nothing.
 mkdir -p /tmp/mdtest-directory-smoke

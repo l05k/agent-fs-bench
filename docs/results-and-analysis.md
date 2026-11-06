@@ -84,7 +84,8 @@ uv run --group analysis python -m agent_fs_bench plot 'results/clone/*/results.j
   --benchmark clone --metric mib_s --ylabel 'Throughput (MiB/s)' \
   --cases L256M/C1/cp,L1G/C1/cp --targets ours,ext4,nfs --output results/clone
 
-# Select one config identity (copy from the parameters column of summary.csv)
+# Select one config identity
+PARAMS='<parameters column from summary.csv>'
 uv run --group analysis python -m agent_fs_bench plot 'results/npm-install/*/results.jsonl' \
   --benchmark npm-install --metric durable_mean_s --cases npm/c1 --targets fs-a,fs-b \
   --parameters "$PARAMS" --source-sha256 <hash> \

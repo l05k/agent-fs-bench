@@ -54,7 +54,7 @@ Targets run sequentially. Working data goes to
 | `dev-workflow` | Linux kernel configure, build, search, edit, commit, tree check | [dev workflow](docs/bench-dev-workflow.md) |
 | `mini-dev-workflow` | Same Git worktree workflow on a small C project | [dev workflow](docs/bench-dev-workflow.md) |
 | `npm-install` | Offline npm/pnpm install into cold `node_modules`, by concurrency batch | [npm install](docs/bench-npm-install.md) |
-| `npm-install-nofsync` | Same, with no harness fsync; install timing only | [npm install](docs/bench-npm-install.md#no-fsync-variant) |
+| `npm-install-nofsync` | Same, with no harness fsync; install timing, throughput and tree stats, no flush/durable metrics | [npm install](docs/bench-npm-install.md#no-fsync-variant) |
 | `clone` | Durable same-filesystem directory clone; size, file-count and concurrency sweeps | [clone](docs/bench-clone.md) |
 | `kvtest` | SQLite `kvtest` random BLOB overwrites, per-write or batched commits | [kvtest](docs/bench-kvtest-openclaw.md) |
 | `sqlite-speedtest` | SQLite `speedtest1 main` SQL phases | [sqlite-speedtest](docs/bench-sqlite-speedtest.md) |
@@ -103,8 +103,8 @@ Schema, plot kinds and selectors: [results and analysis](docs/results-and-analys
 
 - Archive the checkout, `uv.lock`, `local/` configs and JSONL. The source
   fingerprint covers uncommitted changes but does not replace a source archive.
-- Tool versions, kernel, mount options and host environment must be kept
-  consistent by the experimenter; they are not grouping keys.
+- Kernel, mount options and host environment are not grouping keys; tool
+  versions recorded in `parameters` are. Keep the former consistent yourself.
 - No result is cold-cache. Page cache, FUSE client cache and server cache are
   separate layers, and each workload keeps its own sync and cache semantics.
 - Resource limits (cgroups) for FUSE clients, servers and the benchmark are set
