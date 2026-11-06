@@ -108,6 +108,10 @@ selected manager, `C` copies of the current manager's source and each worker's `
 check free space before a large `concurrent_jobs` entry, and expect concurrent runs on one root to
 compete for its space and I/O.
 
+Placement takes `Path` objects and resolves each filesystem type from Linux `/proc/self/mountinfo`
+by the longest matching mount point. `tests/test_npm_install.py` passes real temporary directories,
+so the device comparison runs against real `st_dev` values; the type lookup itself is stubbed there.
+
 ## Concurrency
 
 | Knob | Default | Meaning |
