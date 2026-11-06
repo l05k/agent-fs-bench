@@ -1,8 +1,10 @@
-# Copy to local/mounts.toml. Commands run locally as the invoking user, without a shell.
-# Profile names must match targets in local/targets.toml. The target path is LOCAL
-# staging storage, NOT the admin filesystem mount. Replace example hosts/meta URL.
-# admin_root is an externally mounted full-volume administrative view, kept mounted
-# throughout all scales, excluded from the per-agent mount count.
+# Copy to local/mounts.toml. The controller distributes this private profile to
+# SSH workers; commands run on each machine as its configured user, without a shell.
+# Profile names match local/targets.toml. Targets are identically named local
+# staging paths on every host, NOT the admin filesystem. Replace hosts/meta URL.
+# admin_root is a pre-mounted full-volume view at the same path on every host,
+# pointing to the same volume. Admin mounts stay mounted and are excluded from
+# measured per-agent mount entries, but may still count toward provider quotas.
 # {source}/{subdir}/{binds} use volume-absolute paths, relative to admin_root.
 
 [profiles.nfs]

@@ -14,7 +14,6 @@ import subprocess
 import sys
 import threading
 import time
-import tomllib
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -22,6 +21,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
+from agent_fs_bench.ssh import Host, load_hosts, ssh_argv
 
 REMOTE = True
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -56,16 +56,6 @@ class RemoteError(RuntimeError):
 
 class WorkerError(RuntimeError):
     """The remote workload failed."""
-
-
-@dataclass(frozen=True)
-class Host:
-    name: str
-    address: str
-    user: str | None = None
-    port: int = 22
-    ssh_args: tuple[str, ...] = ()
-    python: str = "python3"
 
 
 @dataclass(frozen=True)
@@ -123,50 +113,6 @@ def _validate_config(args: argparse.Namespace) -> None:
     for key in _BOOLEAN_CONFIG_KEYS:
         if type(getattr(args, key)) is not bool:
             raise ValueError(f"CONFIG[{key!r}] must be a boolean")
-
-
-def _load_hosts(path: Path) -> tuple[Host, ...]:
-    try:
-        with path.expanduser().open("rb") as handle:
-            document = tomllib.load(handle)
-    except OSError as exc:
-        raise ValueError(
-            f"cannot read hosts file {path}: {exc}; copy "
-            "experiments/hosts.example.toml to local/hosts.toml and edit the "
-            "SSH host entries"
-        ) from exc
-    if set(document) != {"hosts"} or not isinstance(document["hosts"], list) or not document["hosts"]:
-        raise ValueError("hosts TOML must contain a non-empty [[hosts]] list only")
-    hosts = []
-    names: set[str] = set()
-    endpoints: set[tuple[str | None, str, int]] = set()
-    for item in document["hosts"]:
-        if not isinstance(item, dict) or set(item) - {"name", "address", "user", "port", "ssh_args", "python"}:
-            raise ValueError("unknown host configuration keys")
-        name, address = item.get("name"), item.get("address")
-        if not isinstance(name, str) or not NAME_RE.fullmatch(name) or name in names:
-            raise ValueError("host names must be unique safe aliases")
-        if not isinstance(address, str) or not address or address.startswith("-") or any(c.isspace() for c in address):
-            raise ValueError(f"{name}: invalid SSH address")
-        user = item.get("user")
-        if user is not None and (not isinstance(user, str) or not NAME_RE.fullmatch(user)):
-            raise ValueError(f"{name}: invalid SSH user")
-        port = item.get("port", 22)
-        if type(port) is not int or not 1 <= port <= 65535:
-            raise ValueError(f"{name}: port must be in 1..65535")
-        ssh_args = item.get("ssh_args", [])
-        if not isinstance(ssh_args, list) or any(not isinstance(s, str) or not s for s in ssh_args):
-            raise ValueError(f"{name}: ssh_args must be an array of non-empty strings")
-        python = item.get("python", "python3")
-        if not isinstance(python, str) or not python or "\x00" in python:
-            raise ValueError(f"{name}: invalid Python executable")
-        endpoint = (user, address, port)
-        if endpoint in endpoints:
-            raise ValueError(f"{name}: duplicate SSH endpoint")
-        endpoints.add(endpoint)
-        hosts.append(Host(name, address, user, port, tuple(ssh_args), python))
-        names.add(name)
-    return tuple(hosts)
 
 
 def _safe_absolute(path: Path) -> None:
@@ -575,7 +521,7 @@ def _start_worker_session(
         "--job",
         deployment["job_path"],
     ]
-    argv = _ssh_argv(plan, host)
+    argv = ssh_argv(host, plan.connect_timeout_s)
     argv.append(f"cd {shlex.quote(deployment['remote_dir'])} && exec " + shlex.join(remote_argv))
     try:
         process = subprocess.Popen(
@@ -674,16 +620,9 @@ def _abort_sessions(sessions: Iterable[WorkerSession]) -> None:
                 pass
 
 
-def _ssh_argv(plan: ExperimentPlan, host: Host) -> list[str]:
-    destination = f"{host.user}@{host.address}" if host.user else host.address
-    return ["ssh", "-T", "-o", "BatchMode=yes", "-o",
-            f"ConnectTimeout={plan.connect_timeout_s}", "-o", "LogLevel=ERROR",
-            *host.ssh_args, "-p", str(host.port), "--", destination]
-
-
 def _remote_python(plan: ExperimentPlan, host: Host, source: str, data: Any) -> Any:
     completed = subprocess.run(
-        [*_ssh_argv(plan, host), shlex.join([host.python, "-c", source])],
+        [*ssh_argv(host, plan.connect_timeout_s), shlex.join([host.python, "-c", source])],
         input=json.dumps(data), text=True, capture_output=True,
         timeout=plan.command_timeout_s, check=False,
     )
@@ -888,7 +827,9 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     _safe_absolute(worker_dir)
     if worker_dir.is_relative_to(ctx.target.path):
         raise ValueError("worker-dir must be outside the measured target")
-    hosts = _load_hosts(hosts_path)
+    hosts = load_hosts(hosts_path)
+    if not hosts:
+        raise ValueError("hosts TOML must contain a non-empty [[hosts]] list")
     workload = WorkloadConfig(**{key: getattr(args, key) for key in WorkloadConfig.__dataclass_fields__})
     plan = ExperimentPlan(hosts, workload, ctx.target.path, ctx.work_dir,
                           worker_dir / ctx.run_id / ctx.target.name, ctx.run_id,

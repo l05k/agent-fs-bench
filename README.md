@@ -12,6 +12,7 @@ agent_fs_bench/
   analysis.py             # DuckDB 汇总、查询与绘图
   results.py              # JSONL 运行上下文与复现信息
   targets.py              # 目录列表与别名
+  ssh.py                  # 共享 SSH hosts 配置与 Open MPI remote-shell agent
   benchmarks/             # 9 个 workload + 顶部 CONFIG；SQLite 共用构建机制
 experiments/              # 不含内部信息的 TOML 示例
 local/                    # 私有目标、mount 与 SSH 配置，不提交
@@ -63,7 +64,7 @@ path = "/mnt/fs-b"
 
 `name` 是结果和图表标签；简写 `path = "fs-a"` 表示 `/mnt/fs-a`。不会扫描 `/mnt`，不会创建缺失的目标根目录，也不会验证挂载来源；仅有一个本地空目录并不证明挂载成功。
 
-`mount-scale` 例外：target 是本地 staging 根目录；`local/mounts.toml` 指定待测卷的 admin 视图与 mount／umount 命令。每个 agent 独立挂载，详见 [mount scaling](docs/bench-mount-scale.md)。`--directory-smoke` 仅使用普通目录，不执行任何挂载。
+`mount-scale` 例外：target 是各机相同绝对路径的本地 staging 根目录；`local/mounts.toml` 指定待测卷的 admin 视图与 mount／umount 命令。先填满当前 Linux 控制机的可用逻辑核，再按 `local/hosts.toml` 顺序扩展；使用全局 Open MPI/mdtest 作业，详见 [mount scaling](docs/bench-mount-scale.md)。`--directory-smoke` 仅在本机使用普通目录，不读 hosts/profile，不执行挂载。
 
 ```sh
 # 默认读取 local/targets.toml，按顺序测量全部目标
@@ -89,7 +90,7 @@ uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 | `run kvtest` | SQLite 官方单写者随机 BLOB 覆写；逐次提交或整批事务 | [kvtest 与负载校准](docs/bench-kvtest-openclaw.md) |
 | `run sqlite-speedtest` | SQLite 官方 `speedtest1 main`，单连接 SQL 阶段及完整进程计时，无 Agent 假设 | [SQLite SQL microbenchmark](docs/bench-sqlite-speedtest.md) |
 | `run multi-host` | 多台 SSH 主机同时在共享文件系统执行私有树操作和目录竞争 | [multi-host](docs/bench-multi-host-nas.md) |
-| `run mount-scale` | 单机 N 个独立 client，比较 N×X mounts 与 N mounts 的 mdtest 小文件扩展性、lifecycle 与主机资源 | [mount scaling](docs/bench-mount-scale.md) |
+| `run mount-scale` | 本机优先、按逻辑核扩至 SSH hosts 的 N 个独立 client；单点 N、全局 Open MPI/mdtest 小文件吞吐、mount lifecycle 与逐机资源 | [mount scaling](docs/bench-mount-scale.md) |
 | `run mdtest` | 单客户端 POSIX 元数据吞吐；固定总对象数，private/shared 目录与进程数扫描 | [mdtest](docs/bench-mdtest.md) |
 
 ```sh
@@ -108,7 +109,7 @@ uv run python -m agent_fs_bench run mdtest --dirs /mnt/fs-a -- --smoke
 
 `run` 不暴露规模、重复次数、并发、fsync/cache、PRAGMA、fixture/manager、资源路径等调节参数。每个模块顶部有唯一的 `CONFIG` 字典，记录该 workload 的可复现实验设置；具体默认值和计时含义见对应文档。修改 `CONFIG` 并在结果中保留源码指纹，才能说明实验条件。部分 workload 会强制校验实验条件：npm-install 要求 node/npm/pnpm 版本与 `CONFIG["tool_versions"]` 完全一致，并要求外部本地准备盘与 target 不同设备、不同文件系统类型，不满足即中止，不回退。
 
-`multi-host` 固定读取 `local/hosts.toml`，格式见 `experiments/hosts.example.toml`。控制机无需挂载；所有 worker 必须已经以**相同绝对路径访问同一个共享文件系统**。不会尝试修复连接、重试或挂载。`mount-scale` 只在单个 Linux host 内扩展 agent，不使用此 SSH 配置。
+`multi-host` 与 `mount-scale` 复用 `local/hosts.toml` 的 SSH 配置，格式见 `experiments/hosts.example.toml`。前者在每台 SSH host 跑一个共享写 worker，控制机不跑负载；后者先在 Linux 控制机每个可用逻辑核放一个 client，再按 hosts 顺序填远端，一次只测一个 N（默认全体可用逻辑核总数）。两者的同步和计量协议不同，结果不能直接拼接。
 
 ## 结果
 
