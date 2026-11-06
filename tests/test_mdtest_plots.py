@@ -66,6 +66,17 @@ class MdtestPlotTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'same x values'):
             mdtest_plot_data(self.connection(), self.args)
 
+    def test_target_missing_selected_operation_or_layout_is_identified(self):
+        self.emit('ours', 1, 1000)
+        self.emit('nfs', 1, 500, operation='file-stat')
+        self.emit('nfs', 1, 500, layout='shared')
+        self.args.cases = ['file-create/private/N128/P1']
+        with self.assertRaises(ValueError) as error:
+            mdtest_plot_data(self.connection(), self.args)
+        self.assertIn('file-create-private', str(error.exception))
+        self.assertIn('nfs', str(error.exception))
+        self.assertNotIn('same x values', str(error.exception))
+
     def test_total_work_and_tool_version_cannot_be_mixed(self):
         for change in ({'total': 256}, {'version': '4.1.0'}):
             with self.subTest(change=change):

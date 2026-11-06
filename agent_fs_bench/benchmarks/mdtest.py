@@ -129,6 +129,14 @@ def check_banner(text: str, concurrency: int, log_path: Path) -> None:
             f"expected {concurrency} task(s) on 1 node"
         )
 
+def check_workload(text: str, case: Case, total_items: int, log_path: Path) -> None:
+    """Require the reported process count, total work and object type to match."""
+    workload = re.findall(r"^(\d+) tasks, (\d+) (files|directories)$", text, re.MULTILINE)
+    expected = (str(case.concurrency), str(total_items),
+                "files" if case.subset == "file" else "directories")
+    if workload != [expected]:
+        raise BenchmarkError(f"{case.name}: mdtest did not report the expected fixed work; log: {log_path}")
+
 def unexpected_warnings(text: str) -> list[str]:
     """mdtest's own warnings other than the expected zero-byte read notice.
 
@@ -219,11 +227,7 @@ def run_case(ctx: RunContext, args: argparse.Namespace, case: Case) -> None:
             f"{case.name}: mdtest exited with status {completed.returncode}; log: {log_path}"
         )
     check_banner(completed.stdout, case.concurrency, log_path)
-    workload = re.findall(r"^(\d+) tasks, (\d+) (files|directories)$", completed.stdout, re.MULTILINE)
-    expected = (str(case.concurrency), str(args.total_items),
-                "files" if case.subset == "file" else "directories")
-    if workload != [expected]:
-        raise BenchmarkError(f"{case.name}: mdtest did not report the expected fixed work; log: {log_path}")
+    check_workload(completed.stdout, case, args.total_items, log_path)
     warnings = unexpected_warnings(completed.stdout)
     if warnings:
         raise BenchmarkError(

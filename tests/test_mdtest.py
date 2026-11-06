@@ -3,9 +3,10 @@ import unittest
 from pathlib import Path
 
 from agent_fs_bench.benchmarks.mdtest import (
-    PHASES,
     BenchmarkError,
+    Case,
     check_banner,
+    check_workload,
     read_phases,
     unexpected_warnings,
 )
@@ -23,13 +24,13 @@ class CsvTests(unittest.TestCase):
         self.csv = Path(temporary.name) / 'mdtest.csv'
 
     def write(self, aggregate, ops=128):
-        """Write mdtest's real header plus one aggregate and one rank row."""
+        """Write an aggregate row between rank rows with different timings."""
         header = ['rank', 'items']
         for name in PHASE_NAMES:
             header += [f'rate-{name}', f'time-{name}']
 
         def row(rank, values, names):
-            cells = [rank, str(ops)]
+            cells = [rank, str(ops // 2) if rank == 'all' else '']
             for name in names:
                 rate, elapsed = values.get(name, ('', ''))
                 cells += [rate, elapsed]
@@ -43,8 +44,8 @@ class CsvTests(unittest.TestCase):
         # and must never be read.
         rank_values = {name: ('9.9000000000e+01', '9.9000000000e+00')
                        for name in PHASE_NAMES}
-        lines = [header, row('all', values, PHASE_NAMES),
-                 row('0', rank_values, PHASE_NAMES[:9])]
+        lines = [header, row('0', rank_values, PHASE_NAMES[:9]),
+                 row('all', values, PHASE_NAMES), row('1', rank_values, PHASE_NAMES[:9])]
         self.csv.write_text(
             '\n'.join(','.join(cells) for cells in lines) + '\n',
             encoding='utf-8',
@@ -53,17 +54,18 @@ class CsvTests(unittest.TestCase):
     def test_aggregate_row_is_read_instead_of_per_rank_rows(self):
         self.write({'File stat': (f'{128 / 2:.10e}', f'{2:.10e}')})
         phases = read_phases(self.csv, 'file', 128)
-        self.assertEqual([phase[0] for phase in phases],
-                         [operation for operation, _, subset in PHASES if subset == 'file'])
-        stat = phases[1]
-        self.assertEqual(stat[1], 128)
-        self.assertAlmostEqual(stat[2], 2.0)
-        self.assertAlmostEqual(stat[3], 64.0)
+        self.assertEqual(phases, [
+            ('file-create', 128, 0.5, 256.0),
+            ('file-stat', 128, 2.0, 64.0),
+            ('file-open', 128, 0.5, 256.0),
+            ('file-unlink', 128, 0.5, 256.0),
+        ])
 
     def test_missing_aggregate_row_is_rejected(self):
         self.write({})
         rows = self.csv.read_text(encoding='utf-8').splitlines()
-        self.csv.write_text('\n'.join([rows[0], rows[2]]) + '\n', encoding='utf-8')
+        self.csv.write_text('\n'.join(row for row in rows if not row.startswith('all,')) + '\n',
+                            encoding='utf-8')
         with self.assertRaisesRegex(BenchmarkError, "aggregate 'all' row"):
             read_phases(self.csv, 'file', 128)
 
@@ -112,6 +114,9 @@ class BannerTests(unittest.TestCase):
         return (f"mdtest-{version} was launched with {tasks} total task(s) "
                 f"on {nodes} node(s)\n")
 
+    def test_matching_launch_is_accepted(self):
+        check_banner(self.banner(), 4, self.log)
+
 
     def test_singleton_launch_is_rejected(self):
         with self.assertRaisesRegex(BenchmarkError, 'expected 4 task'):
@@ -124,6 +129,25 @@ class BannerTests(unittest.TestCase):
     def test_unpinned_version_is_rejected(self):
         with self.assertRaisesRegex(BenchmarkError, 'reported version 3.5.0'):
             check_banner(self.banner(version='3.5.0'), 4, self.log)
+
+class WorkloadTests(unittest.TestCase):
+    log = Path('/results/mdtest.log')
+
+    def test_matching_file_and_directory_workloads_are_accepted(self):
+        for subset, stdout in (
+            ('file', 'Nodemap: 1111\n4 tasks, 128 files\n\nSUMMARY rate:\n'),
+            ('dir', 'Nodemap: 1111\n4 tasks, 128 directories\n\nSUMMARY rate:\n'),
+        ):
+            with self.subTest(subset=subset):
+                check_workload(stdout, Case(subset, 'private', 4, 1), 128, self.log)
+
+    def test_wrong_process_count_total_or_object_type_is_rejected(self):
+        for report in ('1 tasks, 128 files', '4 tasks, 32 files',
+                       '4 tasks, 128 directories', ''):
+            with self.subTest(report=report):
+                with self.assertRaises(BenchmarkError):
+                    check_workload(report, Case('file', 'private', 4, 1), 128, self.log)
+
 
 if __name__ == '__main__':
     unittest.main()

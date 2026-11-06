@@ -471,8 +471,11 @@ def mdtest_plot_data(connection, args: argparse.Namespace) -> list[tuple[str, di
             for target, _, _, metrics, _ in group:
                 x = metrics['concurrency']
                 points[target].setdefault(x, []).append(metrics['ops_per_s'] / 1000)
+            missing = [target for target in targets if not points[target]]
+            if missing:
+                raise ValueError(f'no mdtest {suffix} measurements for targets: {", ".join(missing)}')
             expected = set(points[targets[0]])
-            if not expected or any(set(points[target]) != expected for target in targets):
+            if any(set(points[target]) != expected for target in targets):
                 raise ValueError(f'mdtest {suffix} targets must cover the same x values')
             figures.append((suffix, {
                 'series': targets,
