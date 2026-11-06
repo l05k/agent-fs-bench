@@ -7,7 +7,7 @@ import sys
 import tempfile
 import unittest
 
-from agent_fs_bench.benchmarks.mount_scale_mdtest import Mdtest
+from agent_fs_bench.benchmarks.mount_scale_mdtest import Mdtest, Rank
 from agent_fs_bench.benchmarks.mount_scale_mounts import Layout, Profile, _run
 
 
@@ -108,11 +108,12 @@ all,32,,,,,,,,,,,4.9618383734e+04,1.2898445129e-03,1.1046726584e+06,5.7935714722
 '''
     BANNER = 'mdtest-4.0.0 was launched with 2 total task(s) on 1 node(s)\n'
 
-    def parse(self, csv):
+    def parse(self, csv, banner=None, nodes=1):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'native.csv'
             path.write_text(csv)
-            return Mdtest._parse('private', self.BANNER, path, ('File creation',), 2)
+            return Mdtest._parse('private', self.BANNER if banner is None else banner,
+                                 path, ('File creation',), 2, nodes)
 
     def test_aggregate_uses_barrier_time_not_average_rank_time(self):
         _, items, times, ranks = self.parse(self.CSV)
@@ -129,6 +130,87 @@ all,32,,,,,,,,,,,4.9618383734e+04,1.2898445129e-03,1.1046726584e+06,5.7935714722
     def test_nonfinite_native_phase_cannot_be_reported(self):
         with self.assertRaisesRegex(RuntimeError, 'no time'):
             self.parse(self.CSV.replace('1.2898445129e-03', 'nan'))
+
+    def test_banner_node_count_must_match_the_rank_hosts(self):
+        # Two ranks on two hosts must not silently accept a one-node banner.
+        multi = self.BANNER.replace('1 node(s)', '2 node(s)')
+        self.assertEqual(self.parse(self.CSV, multi, nodes=2)[1], 32)
+        with self.assertRaisesRegex(RuntimeError, r'expected 2 on 2'):
+            self.parse(self.CSV, nodes=2)
+
+    def test_launcher_output_interleaved_with_the_banner_is_tolerated(self):
+        banner = '[node-a:1234] ' + self.BANNER
+        self.assertEqual(self.parse(self.CSV, banner)[1], 32)
+
+class NativeRankTests(unittest.TestCase):
+    """Placement and application-context invariants; no MPI is executed."""
+
+    def rank(self, host, hostname, cpu, workspace, shared=()):
+        return Rank(host=host, hostname=hostname, cpu=cpu, python='/usr/bin/python3',
+                    package_root=Path('/srv/bench'), binary='/srv/bin/mdtest',
+                    workspace=Path(workspace), shared=tuple(Path(p) for p in shared))
+
+    def test_two_aliases_of_one_machine_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'aliases of the same machine'):
+            Mdtest._ranks([self.rank('localhost', 'node-a', 0, '/mnt/a'),
+                           self.rank('10.0.0.5', 'node-a', 1, '/mnt/b')])
+
+    def test_one_token_cannot_name_two_machines(self):
+        with self.assertRaisesRegex(ValueError, 'names both'):
+            Mdtest._ranks([self.rank('node-a', 'host-one', 0, '/mnt/a'),
+                           self.rank('node-a', 'host-two', 1, '/mnt/b')])
+
+
+    def test_placement_proofs_must_match_the_requested_placement(self):
+        ranks = [self.rank('localhost', 'node-a', 0, '/mnt/a'),
+                 self.rank('10.0.0.5', 'node-b', 4, '/mnt/b')]
+        proofs = ('MDBENCH_PLACEMENT index=0 host=localhost hostname=node-a cpu=0 affinity=0\n'
+                  'MDBENCH_PLACEMENT index=1 host=10.0.0.5 hostname=node-b cpu=4 affinity=4\n')
+        self.assertEqual(Mdtest._proved('private', proofs, ranks),
+                         ({'index': 0, 'hostname': 'node-a', 'cpu': 0},
+                          {'index': 1, 'hostname': 'node-b', 'cpu': 4}))
+        with self.assertRaisesRegex(RuntimeError, 'executed on node-c'):
+            Mdtest._proved('private', proofs.replace('hostname=node-b',
+                                                     'hostname=node-c'), ranks)
+        with self.assertRaisesRegex(RuntimeError, 'executed on CPU 5'):
+            Mdtest._proved('private', proofs.replace('cpu=4 affinity=4',
+                                                     'cpu=5 affinity=5'), ranks)
+        with self.assertRaisesRegex(RuntimeError, 'did not prove placement'):
+            Mdtest._proved('private', proofs.splitlines()[0] + '\n', ranks)
+
+    def test_metadata_carries_no_launcher_argv_or_inventory_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / 'mpiexec'
+            launcher.write_text('#!/bin/sh\n'
+                                'echo "mpiexec (Open MPI) 4.1.5"\n'
+                                'echo "Report bugs to https://www.open-mpi.org"\n')
+            launcher.chmod(0o755)
+            binary = root / 'mdtest'
+            binary.write_text('#!/bin/sh\nexit 0\n')
+            binary.chmod(0o755)
+            engine = Mdtest(str(binary), [str(launcher), '--mca', 'plm_rsh_agent',
+                                          '/private/agent.py --hosts /private/hosts.toml'],
+                            5)
+            self.assertEqual(engine.metadata['launcher'],
+                             {'name': 'mpiexec', 'version': '4.1.5'})
+            self.assertNotIn('hosts.toml', repr(engine.metadata))
+            self.assertNotIn(str(launcher), repr(engine.metadata))
+
+    def test_a_non_open_mpi_launcher_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            launcher = root / 'mpiexec'
+            launcher.write_text('#!/bin/sh\necho "HYDRA build details:"\necho "Version: 3.4"\n')
+            launcher.chmod(0o755)
+            binary = root / 'mdtest'
+            binary.write_text('#!/bin/sh\nexit 0\n')
+            binary.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, 'requires Open MPI'):
+                Mdtest(str(binary), [str(launcher)], 5)
+            launcher.write_text('#!/bin/sh\necho "mpiexec (Open MPI) 5.0.0"\n')
+            with self.assertRaisesRegex(ValueError, r'requires Open MPI 4\.1\.x'):
+                Mdtest(str(binary), [str(launcher)], 5)
 
 
 if __name__ == '__main__':
