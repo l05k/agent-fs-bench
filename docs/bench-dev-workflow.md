@@ -113,7 +113,7 @@ settings; this change does not alter parallelism or workflow timing boundaries.
   `KCONFIG_CONFIG` can select another file, so that run may not use the fixture.
   This is deliberately preserved, not repaired by silently forcing a path.
 - `ARCH` is inherited, not fixed or rejected by a Python architecture allowlist.
-  The supplied fixture describes 32-bit x86; `olddefconfig` can change that
+  The supplied fixture describes 64-bit x86; `olddefconfig` can change that
   selection under a different `ARCH`. Cross-architecture execution is not a
   claim that the same kernel workload was measured.
 
@@ -138,10 +138,40 @@ This is a complete kernel replay, not a reduced smoke. Local clones use
 `--no-local` to avoid sharing source object files across filesystems. Missing
 fixture commits fail immediately; no fallback fetch or alternate workload runs.
 
-**The supplied kernel config is 32-bit x86, not a forced runtime architecture.**
+**The supplied kernel config is 64-bit x86, not a forced runtime architecture.**
 The runner requires Linux but leaves architecture and toolchain compatibility to
 Kbuild, matching upstream environment inheritance. Mini's native ARM64 support
 does not establish equivalence of kernel workloads across architectures.
+
+### Kernel config fixture
+
+`data/dev-workflow/tinyconfig-overlayfs.config` is regenerated in this repository
+at the pinned base commit (`c2c54b5f34f6^`, Linux 6.12.0-rc7), so it is no longer
+byte-identical to perf-eval's file of the same name; the series and command files
+are still taken from upstream. Rebuild it with the workload's own sequence:
+
+```sh
+# at the resolved base commit
+make ARCH=x86 tinyconfig
+printf 'CONFIG_64BIT=y\nCONFIG_OVERLAY_FS=y\n' >> .config
+make ARCH=x86 olddefconfig
+cp .config data/dev-workflow/tinyconfig-overlayfs.config
+```
+
+`ARCH=x86` is required: `CONFIG_64BIT` only exists for `ARCH=x86`, and
+`tinyconfig` (an `allnoconfig` variant) sets every visible boolean to `n`, which
+selects `CONFIG_X86_32=y`. A file generated under `ARCH=i386` has no `64BIT`
+line at all and is silently converted to 64-bit by `olddefconfig` on a 64-bit
+host. Regenerate after any change of pinned base, and check that the result keeps
+`CONFIG_64BIT=y`, `CONFIG_X86_64=y` and `CONFIG_OVERLAY_FS=y`. `olddefconfig`
+is idempotent on the shipped file, so a 32-bit run means the environment
+(`ARCH`, `KCONFIG_CONFIG`) overrode it, not that the fixture changed.
+
+Compiler-probe symbols (`CONFIG_CC_VERSION_TEXT`, `CONFIG_*_VERSION`,
+`CONFIG_CC_HAS_*`, `CONFIG_TOOLS_SUPPORT_RELR`) only record the toolchain that
+generated the file; the measured run's `olddefconfig` recomputes them from the
+toolchain it actually uses. Use one coherent `CC`/`LD`/`NM`/`OBJCOPY` set when
+regenerating, since a mixed set can fail a probe and bake in a wrong default.
 
 ## Workload and timing boundaries
 
