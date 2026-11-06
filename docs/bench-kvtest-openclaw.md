@@ -22,7 +22,7 @@ OpenClaw commits once per user turn: an application turn, transcript append,
 SQL statement and committed transaction are different units. Their relationship
 must be observed at the actual writer, not inferred from this benchmark.
 
-## Run / 运行
+## Run
 
 ```sh
 uv run python -m agent_fs_bench run kvtest --dirs /mnt/fs-a
@@ -86,7 +86,7 @@ check does not establish crash durability or safe multi-client access. FULL in
 rollback mode is not an unconditional power-loss durability guarantee; see
 [synchronous](https://sqlite.org/pragma.html#pragma_synchronous).
 
-## Deployment / 部署
+## Deployment
 
 Deploy the checkout with the shared Python package and use Python 3.12+.
 Install the project's DuckDB dependency with `uv sync --locked`; the shared
