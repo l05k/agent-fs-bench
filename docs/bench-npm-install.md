@@ -102,15 +102,15 @@ its filesystem type differ from the target's. A different device alone does not 
 copy offload, since two mounts of the same local type can still serve a clone, so requiring both keeps
 the timed write path from being satisfied by a server-side copy; there is no override or fallback.
 
-Placement takes `Path` objects and resolves each filesystem type from Linux `/proc/self/mountinfo`
-by the longest matching mount point. `tests/test_npm_install.py` passes real temporary directories,
-so the device comparison runs against real `st_dev` values; the type lookup itself is stubbed there.
-
 `/dev/shm` (tmpfs) is the default; if the target is itself tmpfs the type rule rejects it, so use a
 local disk filesystem. During a batch the preparation filesystem holds the seeded sources for every
 selected manager, `C` copies of the current manager's source and each worker's `HOME`/`TMPDIR` —
 check free space before a large `concurrent_jobs` entry, and expect concurrent runs on one root to
 compete for its space and I/O.
+
+Placement takes `Path` objects and resolves each filesystem type from Linux `/proc/self/mountinfo`
+by the longest matching mount point. `tests/test_npm_install.py` passes real temporary directories,
+so the device comparison runs against real `st_dev` values; the type lookup itself is stubbed there.
 
 ## Concurrency
 
