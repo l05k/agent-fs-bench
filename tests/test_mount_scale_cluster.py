@@ -40,7 +40,10 @@ class SmokeCapacityTests(unittest.TestCase):
     def test_single_affinity_cpu_is_rejected_before_smoke_setup(self):
         args = mount_scale.parse_args(['--directory-smoke'])
         with (mock.patch.object(mount_scale.platform, 'system', return_value='Linux'),
-              mock.patch.object(mount_scale.os, 'sched_getaffinity', return_value={3}),
+              # create=True: os.sched_getaffinity exists only on Linux, while the
+              # test exercises the Linux branch from any controller OS.
+              mock.patch.object(mount_scale.os, 'sched_getaffinity', return_value={3},
+                                create=True),
               self.assertRaises(ValueError)):
             mount_scale._validate(args)
 
