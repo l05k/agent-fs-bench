@@ -86,6 +86,7 @@ uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 | `run dev-workflow` | Linux 内核配置、编译、搜索、修改、提交、树验证；固定 x86 配置输入 | [dev workflow](docs/bench-dev-workflow.md) |
 | `run mini-dev-workflow` | 固定小型 C 项目的完整 Git worktree 开发流程 | [dev workflow](docs/bench-dev-workflow.md) |
 | `run npm-install` | 外部本地盘上预热源、冷 `node_modules` 的离线 npm/pnpm 物化；按外部并发批次计时，固定 lockfile fixture | [npm install](docs/bench-npm-install.md) |
+| `run npm-install-nofsync` | 同一 workload，但 harness 不做任何 fsync/`os.sync()`；只报告 install 计时、吞吐与树统计，无 flush/durable 指标 | [npm install](docs/bench-npm-install.md#no-fsync-variant) |
 | `run clone` | 同文件系统持久化目录克隆；完整目录请求并发、数据量/文件数扫描，支持按目标选择原生命令 | [clone](docs/bench-clone.md) |
 | `run kvtest` | SQLite 官方单写者随机 BLOB 覆写；逐次提交或整批事务 | [kvtest 与负载校准](docs/bench-kvtest-openclaw.md) |
 | `run sqlite-speedtest` | SQLite 官方 `speedtest1 main`，单连接 SQL 阶段及完整进程计时，无 Agent 假设 | [SQLite SQL microbenchmark](docs/bench-sqlite-speedtest.md) |
@@ -97,6 +98,7 @@ uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 uv run python -m agent_fs_bench run dev-workflow --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run mini-dev-workflow --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run npm-install --dirs /mnt/fs-a
+uv run python -m agent_fs_bench run npm-install-nofsync --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a -- --smoke
 uv run python -m agent_fs_bench run kvtest --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run sqlite-speedtest --dirs /mnt/fs-a

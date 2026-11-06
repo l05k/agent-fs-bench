@@ -61,6 +61,7 @@ this mapping in `agent_fs_bench/benchmarks/npm_install.py`.
 | `npm_bin` / `pnpm_bin` | `"npm"` / `"pnpm"` | Executables resolved on `PATH`. |
 | `tool_versions` | node/npm/pnpm pins | Exact versions the run must observe: `v24.22.2`, `11.19.1`, `12.16.1`. |
 | `ignore_scripts` | `True` | Pass `--ignore-scripts` everywhere. |
+| `flush` | `True` | Timed whole-project fsync, pre-timing input fsync and between-batch `os.sync()`; `npm-install-nofsync` sets it `False`. |
 | `keep_node_modules` / `seed_only` | `False` | Keep trees / prepare and exit. |
 
 `tool_versions` is a strict check: the selected managers and `node` must report exactly these
@@ -156,6 +157,28 @@ cleanup. `durable_s` adds the whole-project flush. **The flush is the benchmark'
 tools' native durability semantics:** both may leave data in the page cache, and this workload makes
 the tree durable itself, so do not read `install_s` as what npm/pnpm guarantee or `durable_s` as
 their implementation detail.
+
+## No-fsync variant
+
+`run npm-install-nofsync` runs the same module through
+`agent_fs_bench/benchmarks/npm_install_nofsync.py`, which only sets
+`CONFIG["flush"] = False`. It removes every harness-initiated sync: the timed
+whole-project flush, the pre-timing input fsync, and all three `os.sync()`
+calls — after seeding, before each batch, and after each batch. Step 2 keeps its
+project-placement check but drops the fsync, step 4 does not exist, and step 5
+drops its sync calls, so nothing in the benchmark forces the tree to stable
+storage. The check that a project lies inside the measured target is not a sync
+and stays unconditional.
+
+Rows carry only `install_mean_s`, `batch_install_s`, `installs_per_s`, `user_s`,
+`sys_s` and the tree inventory; `flush_*`, `durable_*` and
+`durable_installs_per_s` are absent, and `details.tasks[]` has no `flush_s` or
+`durable_s`. `parameters` records `flush` (`true` for `npm-install`, `false`
+here), and results live under `results/npm-install-nofsync/`. `install_s` still
+covers the whole command, including whatever the tool itself syncs; it ends at
+process exit, so it describes page-cache completion, not durability. Without the
+between-batch `os.sync()`, writeback from one batch may still be in flight when
+the next batch starts.
 
 ## pnpm import method
 

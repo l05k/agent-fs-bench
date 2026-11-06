@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
+import shutil
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -93,7 +95,7 @@ class InstallBatchTests(unittest.TestCase):
                 jobs.append({
                     'project': project, 'log': root / f'worker-{index}.log',
                     'command': [sys.executable, '-c', program, str(root), str(project), str(index)],
-                    'env': os.environ.copy(),
+                    'env': os.environ.copy(), 'flush': True,
                 })
             tasks = bench.run_workers(jobs)
             for index, task in enumerate(tasks):
@@ -109,7 +111,7 @@ class InstallBatchTests(unittest.TestCase):
             jobs = [{
                 'project': root, 'log': root / 'failure.log',
                 'command': [sys.executable, '-c', 'import sys; sys.exit(23)'],
-                'env': os.environ.copy(),
+                'env': os.environ.copy(), 'flush': True,
             }]
             with self.assertRaisesRegex(bench.BenchError, 'install exited 23'):
                 bench.run_workers(jobs)
@@ -129,6 +131,173 @@ class InstallBatchTests(unittest.TestCase):
         self.assertAlmostEqual(result['installs_per_s'], 2 / 2.3, places=6)
         self.assertAlmostEqual(result['durable_installs_per_s'], 2 / 3.0, places=6)
 
+
+class NoFlushTests(unittest.TestCase):
+    def make_batch(self, root, flush):
+        target = root / 'target'
+        work = target / 'agent-fs-bench' / 'npm-install-nofsync' / 'run'
+        work.mkdir(parents=True)
+        result = root / 'results'
+        (result / 'logs').mkdir(parents=True)
+        source = root / 'source' / 'cache'
+        source.mkdir(parents=True)
+        (source / 'payload').write_bytes(b'cache')
+        template = root / 'template'
+        template.mkdir()
+        (template / 'package.json').write_text('{"name":"fixture"}')
+        (template / 'package-lock.json').write_text('{}')
+        prep = root / 'prep'
+        prep.mkdir()
+        fake = root / 'fake-npm'
+        fake.write_text('#!/bin/sh\nmkdir -p node_modules/pkg\n'
+                        'printf "module.exports = 1;\\n" > node_modules/pkg/index.js\n')
+        fake.chmod(0o755)
+        ctx = SimpleNamespace(
+            work_dir=work, result_dir=result, benchmark='npm-install-nofsync',
+            run_id='run', target=SimpleNamespace(name='t', path=target),
+        )
+        args = SimpleNamespace(
+            concurrency=0, ignore_scripts=True, flush=flush,
+            keep_node_modules=False, runs=1,
+        )
+        return ctx, args, str(fake), source, template, prep
+
+    def test_run_batch_without_flush_never_syncs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ctx, args, fake, source, template, prep = self.make_batch(root, False)
+            with mock.patch.object(bench, 'sync_filesystem') as sync_filesystem, \
+                    mock.patch.object(bench, 'fsync_tree') as fsync_tree, \
+                    mock.patch.object(bench, 'fsync_path') as fsync_path:
+                metrics, tasks = bench.run_batch(
+                    ctx, args, 'npm', fake, source, template, prep, 1, 1)
+            sync_filesystem.assert_not_called()
+            fsync_tree.assert_not_called()
+            fsync_path.assert_not_called()
+            self.assertIn('install_mean_s', metrics)
+            self.assertNotIn('durable_mean_s', metrics)
+            self.assertNotIn('flush_s', tasks[0])
+
+    def test_run_batch_with_flush_syncs_before_and_after(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ctx, args, fake, source, template, prep = self.make_batch(root, True)
+            with mock.patch.object(bench, 'sync_filesystem') as sync_filesystem, \
+                    mock.patch.object(bench, 'fsync_tree') as fsync_tree, \
+                    mock.patch.object(bench, 'fsync_path') as fsync_path:
+                metrics, tasks = bench.run_batch(
+                    ctx, args, 'npm', fake, source, template, prep, 1, 1)
+            self.assertEqual(sync_filesystem.call_count, 2)
+            self.assertEqual(fsync_tree.call_count, 1)
+            self.assertTrue(fsync_path.called)
+            self.assertIn('durable_mean_s', metrics)
+            self.assertIn('flush_s', tasks[0])
+
+    def test_placement_is_enforced_without_flush(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ctx, args, fake, source, template, prep = self.make_batch(root, False)
+            ctx.work_dir = root / 'outside-target'
+            with self.assertRaisesRegex(bench.BenchError, 'outside the measured target'):
+                bench.run_batch(ctx, args, 'npm', fake, source, template, prep, 1, 1)
+
+    def test_seeding_sync_is_skipped_without_flush(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / 'target'
+            target.mkdir()
+            prep_root = root / 'prep'
+            prep_root.mkdir()
+            result = root / 'results'
+            result.mkdir()
+            ctx = SimpleNamespace(
+                benchmark='npm-install-nofsync', run_id='run', result_dir=result,
+                target=SimpleNamespace(name='t', path=target),
+            )
+
+            def seed(binary, cache, seed_dir, template, fixture, ignore, concurrency):
+                (template / 'package.json').write_text('{"name":"fixture"}')
+                (template / 'package-lock.json').write_text('{}')
+
+            actual_is_file = Path.is_file
+
+            def mountinfo_only(path):
+                return True if str(path) == '/proc/self/mountinfo' else actual_is_file(path)
+
+            for flush in (False, True):
+                args = bench.parse_args([], {
+                    **bench.CONFIG, 'pm': 'npm', 'runs': 1, 'flush': flush,
+                    'prep_dir': str(prep_root), 'seed_only': True,
+                })
+                with mock.patch.object(Path, 'is_file', mountinfo_only), \
+                        mock.patch.object(bench, 'check_placement',
+                                          return_value=('ext4', 'tmpfs')), \
+                        mock.patch.object(bench, 'checked_tools',
+                                          return_value=({'npm': '/fake/npm'},
+                                                        {'npm': '1', 'node': '1'})), \
+                        mock.patch.object(bench, 'fixture_dir_for', return_value=root), \
+                        mock.patch.object(bench, 'seed_npm_fixture', side_effect=seed), \
+                        mock.patch.object(bench, 'sync_filesystem') as sync_filesystem:
+                    bench.run(ctx, args)
+                if flush:
+                    self.assertEqual(sync_filesystem.call_count, 1)
+                else:
+                    sync_filesystem.assert_not_called()
+                shutil.rmtree(prep_root / 'agent-fs-bench')
+
+    def test_batch_metrics_omit_flush_and_durable_phases(self):
+        tasks = [
+            {'start_offset_s': 0.0, 'install_s': 2.0, 'user_s': 0.4, 'sys_s': 0.2},
+            {'start_offset_s': 0.5, 'install_s': 1.0, 'user_s': 0.3, 'sys_s': 0.1},
+        ]
+        result = bench.batch_metrics(tasks, [{'files': 1}], flush=False)
+        self.assertEqual(result['batch_install_s'], 2.0)
+        self.assertEqual(result['install_mean_s'], 1.5)
+        self.assertEqual(result['user_s'], 0.7)
+        self.assertEqual(result['sys_s'], 0.3)
+        self.assertAlmostEqual(result['installs_per_s'], 1.0, places=6)
+        for key in ('flush_mean_s', 'durable_mean_s',
+                    'batch_durable_s', 'durable_installs_per_s'):
+            self.assertNotIn(key, result)
+
+    def test_noflush_worker_skips_fsync_and_durable_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            (project / 'payload').write_bytes(b'data')
+            connection = mock.MagicMock()
+            with mock.patch.object(bench, 'fsync_tree') as fsync_tree:
+                bench.install_worker(
+                    [sys.executable, '-c', 'pass'], project,
+                    project / 'worker.log', os.environ.copy(),
+                    mock.MagicMock(), connection, False,
+                )
+            fsync_tree.assert_not_called()
+            sample = connection.send.call_args.args[0]
+            self.assertIn('install_s', sample)
+            self.assertNotIn('flush_s', sample)
+            self.assertNotIn('durable_s', sample)
+
+    def test_nofsync_workload_exposes_flush_off(self):
+        from agent_fs_bench.benchmarks import npm_install_nofsync
+        self.assertFalse(npm_install_nofsync.CONFIG['flush'])
+        self.assertFalse(npm_install_nofsync.parse_args([]).flush)
+        self.assertTrue(bench.parse_args([]).flush)
+
+class PlacementTests(unittest.TestCase):
+    def test_placement_accepts_path_objects_from_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target, prep = root / 'target', root / 'prep'
+            target.mkdir()
+            prep.mkdir()
+
+            def fake_fstype(path):
+                path.resolve()
+                return 'ext4'
+
+            with mock.patch.object(bench, 'fstype', side_effect=fake_fstype):
+                with self.assertRaisesRegex(bench.BenchError, 'different device'):
+                    bench.check_placement(target, prep)
 
 if __name__ == '__main__':
     unittest.main()

@@ -1,8 +1,9 @@
 """Offline npm/pnpm materialization from prewarmed external local sources.
 
 Each batch starts independent projects together. Every worker has a private
-cache/store and measures command execution followed by a full project fsync.
-Source preparation, project creation, inventories and cleanup are untimed.
+cache/store and measures command execution and, when ``CONFIG['flush']`` is
+set, a full project fsync. Source preparation, project creation, inventories
+and cleanup are untimed.
 The internal pool width and external project concurrency are separate inputs;
 neither is a claim about the package manager's total thread count.
 
@@ -51,6 +52,7 @@ CONFIG: dict[str, Any] = {
     "ignore_scripts": True,
     "keep_node_modules": False,
     "seed_only": False,
+    "flush": True,
 }
 
 
@@ -145,11 +147,16 @@ def fsync_tree(path: Path) -> float:
     return time.monotonic() - started
 
 
-def sync_prepared_project(project: Path, target: Path) -> None:
-    """Persist input files and every newly created ancestor before timing."""
+def check_project_placement(project: Path, target: Path) -> None:
+    """Reject a project outside the measured target; independent of sync mode."""
     project, target = project.resolve(), target.resolve()
     if not project.is_relative_to(target):
         die(f"project is outside the measured target: {project}")
+
+def sync_prepared_project(project: Path, target: Path) -> None:
+    """Persist input files and every newly created ancestor before timing."""
+    project, target = project.resolve(), target.resolve()
+    check_project_placement(project, target)
     fsync_tree(project)
     ancestor = project.parent
     while True:
@@ -424,7 +431,7 @@ def install_command(
 
 def install_worker(
     command: list[str], project: Path, log_path: Path, env: dict[str, str],
-    barrier: Any, connection: Any,
+    barrier: Any, connection: Any, flush: bool = True,
 ) -> None:
     """One Python process owns one child and its resource-usage counters."""
     try:
@@ -440,17 +447,20 @@ def install_worker(
             exited = time.monotonic()
             if result.returncode != 0:
                 die(f"install exited {result.returncode}; {log_path}\n{read_tail(log_path)}")
-            fsync_tree(project)
-            durable = time.monotonic()
+            if flush:
+                fsync_tree(project)
+                durable = time.monotonic()
             after = resource.getrusage(resource.RUSAGE_CHILDREN)
-        connection.send({
+        sample = {
             "started": started,
             "install_s": exited - started,
-            "flush_s": durable - exited,
-            "durable_s": durable - started,
             "user_s": after.ru_utime - before.ru_utime,
             "sys_s": after.ru_stime - before.ru_stime,
-        })
+        }
+        if flush:
+            sample["flush_s"] = durable - exited
+            sample["durable_s"] = durable - started
+        connection.send(sample)
     except Exception as exc:
         connection.send({"error": f"{type(exc).__name__}: {exc}"})
     finally:
@@ -468,7 +478,7 @@ def run_workers(jobs: list[dict[str, Any]]) -> list[dict[str, int | float]]:
             receiver, sender = context.Pipe(duplex=False)
             process = context.Process(
                 target=install_worker,
-                args=(job["command"], job["project"], job["log"], job["env"], barrier, sender),
+                args=(job["command"], job["project"], job["log"], job["env"], barrier, sender, job["flush"]),
             )
             process.start()
             sender.close()
@@ -504,22 +514,27 @@ def run_workers(jobs: list[dict[str, Any]]) -> list[dict[str, int | float]]:
 
 def batch_metrics(
     tasks: list[dict[str, int | float]], trees: list[dict[str, int]],
+    flush: bool = True,
 ) -> dict[str, int | float]:
     count = len(tasks)
     install_s = max(task["start_offset_s"] + task["install_s"] for task in tasks)
-    durable_s = max(task["start_offset_s"] + task["durable_s"] for task in tasks)
+    phases = ("install", "flush", "durable") if flush else ("install",)
     metrics = {
         f"{phase}_mean_s": sum(task[f"{phase}_s"] for task in tasks) / count
-        for phase in ("install", "flush", "durable")
+        for phase in phases
     }
     metrics.update({
         "batch_install_s": install_s,
-        "batch_durable_s": durable_s,
         "installs_per_s": count / install_s,
-        "durable_installs_per_s": count / durable_s,
         "user_s": sum(task["user_s"] for task in tasks),
         "sys_s": sum(task["sys_s"] for task in tasks),
     })
+    if flush:
+        durable_s = max(task["start_offset_s"] + task["durable_s"] for task in tasks)
+        metrics.update({
+            "batch_durable_s": durable_s,
+            "durable_installs_per_s": count / durable_s,
+        })
     return {
         **{key: round(value, 6) for key, value in metrics.items()},
         **{key: sum(tree[key] for tree in trees) for key in trees[0]},
@@ -542,32 +557,37 @@ def run_batch(
         env = manager_env(manager, args.concurrency, sandbox)
         if manager == "pnpm":
             env["XDG_CACHE_HOME"] = str(task_source / "cache")
-        sync_prepared_project(project, ctx.target.path.resolve())
+        check_project_placement(project, ctx.target.path)
+        if args.flush:
+            sync_prepared_project(project, ctx.target.path)
         jobs.append({
             "project": project, "env": env,
             "command": install_command(manager, binary, task_source, args.ignore_scripts),
             "log": ctx.result_dir / "logs" / f"{name}-task-{task_number}.log",
+            "flush": args.flush,
         })
     # No source writes, metrics or deletions overlap timed workers.
-    sync_filesystem()
+    if args.flush:
+        sync_filesystem()
     for task_number in range(1, count + 1):
         warm_tree(source_batch / f"task-{task_number}" / "source")
     log(f"{manager}: {count} projects, batch {repeat}/{args.runs}")
     tasks = run_workers(jobs)
     trees = [tree_metrics(job["project"] / "node_modules") for job in jobs]
-    metrics = batch_metrics(tasks, trees)
+    metrics = batch_metrics(tasks, trees, flush=args.flush)
     if not args.keep_node_modules:
         remove_tree(project_batch)
     remove_tree(source_batch)
-    sync_filesystem()
+    if args.flush:
+        sync_filesystem()
     return metrics, tasks
 
 
-def parse_args(argv: list[str]) -> argparse.Namespace:
+def parse_args(argv: list[str], config: dict[str, Any] = CONFIG) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Offline installation batches; edit CONFIG for experiment settings."
     )
-    namespace = argparse.Namespace(**CONFIG, **vars(parser.parse_args(argv)))
+    namespace = argparse.Namespace(**config, **vars(parser.parse_args(argv)))
     if namespace.fixture not in FIXTURES:
         die(f"unknown fixture {namespace.fixture!r}; choose from: {', '.join(FIXTURES)}")
     if namespace.pm not in ("npm", "pnpm", "both"):
@@ -585,7 +605,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def check_placement(target: Path, prep: Path) -> tuple[str, str]:
     """Different device IDs alone do not exclude cross-mount copy offload."""
-    target_type, prep_type = fstype(str(target)), fstype(str(prep))
+    target_type, prep_type = fstype(target), fstype(prep)
     if prep_type not in LOCAL_PREP_FILESYSTEMS:
         die(f"prep_dir must use a local filesystem, not {prep_type}: {prep}")
     if target.stat().st_dev == prep.stat().st_dev or target_type == prep_type:
@@ -614,7 +634,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     target_type, prep_type = check_placement(target, prep_root)
     managers = [manager for manager in ("npm", "pnpm") if args.pm in (manager, "both")]
     binaries, versions = checked_tools(args, managers)
-    prep = prep_root / "agent-fs-bench" / "npm-install" / ctx.run_id / ctx.target.name
+    prep = prep_root / "agent-fs-bench" / ctx.benchmark / ctx.run_id / ctx.target.name
     prep.mkdir(parents=True, exist_ok=False)
     ensure_dir(ctx.result_dir / "logs")
     fixture = fixture_dir_for(args.fixture)
@@ -640,7 +660,8 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
             if (template / name).is_file()
         }
         sources[manager], templates[manager] = source, template
-    sync_filesystem()
+    if args.flush:
+        sync_filesystem()
     if args.seed_only:
         log(f"seed complete; sources retained at {prep}")
         return
@@ -653,6 +674,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
                 "placement": "external-local",
                 "prep_fstype": prep_type,
                 "ignore_scripts": args.ignore_scripts,
+                "flush": args.flush,
                 "pnpm_import_method": PNPM_IMPORT_METHOD,
                 "pnpm_global_virtual_store": False,
                 "cache_state": "warm-source-empty-node_modules",
