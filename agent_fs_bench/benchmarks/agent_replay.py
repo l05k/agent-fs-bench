@@ -116,7 +116,7 @@ def fingerprint(root: Path, paths: list[Path] | None = None) -> str:
 
 
 def restore(source: Path, destination: Path) -> None:
-    # GNU cp preserves hidden files, modes, timestamps, symlinks and hard links.
+    # Request metadata preservation; run() checks the restored input before replay.
     # A new destination per measurement prevents reuse of a mutated task tree.
     process = subprocess.run(
         ["cp", "-a", "--reflink=never", "--", str(source), str(destination)],
@@ -136,7 +136,8 @@ def check_storage(case: ReplayCase, target: Path) -> None:
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
     if sys.platform != "linux":
         raise RuntimeError("agent-replay measurements require Linux and a local Docker daemon")
-    cases = load_cases(Path(args.cases_file))
+    cases_file = Path(args.cases_file).expanduser().resolve()
+    cases = load_cases(cases_file)
     executable = REPLAY_ROOT / ".venv" / "bin" / "agent-mitm-replay"
     if not executable.is_file():
         raise RuntimeError("initialize the submodule, then run uv sync --locked "
@@ -162,15 +163,17 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         if environment.exists():
             cassette_paths += [environment, *environment.rglob("*")]
         manifest = json.loads((case.cassette / "manifest.json").read_text())
+        expected = {mount.container: fingerprint(mount.source) for mount in case.mounts}
         ctx.parameters.clear()
         ctx.parameters.update({
+            "cases_file": str(cases_file),
             "repeats": args.repeats,
             "model": manifest["model"],
             "tool_versions": tool_versions,
             "replay_source_sha256": replay_digest,
             "task_sha256": fingerprint(case.task),
             "cassette_sha256": fingerprint(case.cassette, cassette_paths),
-            "mounts": [{"container": mount.container, "initial_sha256": fingerprint(mount.source)}
+            "mounts": [{"container": mount.container, "initial_sha256": expected[mount.container]}
                        for mount in case.mounts],
         })
         work = ctx.work_dir / case.name
@@ -186,6 +189,8 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
             for index, mount in enumerate(case.mounts):
                 destination = directory / f"mount-{index}"
                 restore(mount.source, destination)
+                if fingerprint(destination) != expected[mount.container]:
+                    raise RuntimeError(f"restored task data differs from source: {destination}")
                 command += ["--mount", f"{destination}:{mount.container}"]
             log = results / f"repeat-{repeat}.log"
             with log.open("x") as handle:

@@ -124,6 +124,8 @@ uv run python -m agent_fs_bench run agent-replay --dirs /mnt/fs-a
 
 子项目 [agent-mitm-replay](https://github.com/l05k/agent-mitm-replay) 固定在 `33c73261c8b656bf11a1915a75e56a253dee6bf0`，保留独立 `uv.lock`，不向主项目引入 Harbor/mitmproxy 依赖。主 benchmark 仍支持 Python 3.12+；子项目使用 Python 3.13.x、Harbor 0.24.0、mitmproxy 12.2.3。正式测量在 Linux 上运行，需要 Docker 和 Compose v2；Docker daemon 必须位于同一主机并能访问目标挂载。macOS 本地验证可在 `colima ssh` 内运行整个 benchmark，不能仅把 Docker 指向 VM 而使用宿主机独有路径。
 
+Submodule 使用 HTTPS URL，不要求 GitHub SSH key。但上游仓库当前仍为 private，匿名 HTTPS 拉取失败；公开复现前需将上游设为 public。已获得访问权限的用户可使用 GitHub HTTPS 凭据。这一限制不能仅通过修改 URL 消除。
+
 **实验边界：固定模型响应序列，不是 syscall replay，也不是在线自适应 Agent 性能。** 每个任务先 `record`，恢复初始数据后 `validate` 一次，再将同一 accepted cassette 用于所有文件系统和重复。验收检查任务成功、响应完整消费和命令轨迹相同；正式 `replay` 仍实际运行 Agent、终端命令、verifier 和产物收集，但不再检查 reward、命令轨迹或剩余响应。不要将录制/验收时间与回放时间比较。
 
 #### 准备任务与 cassette
@@ -160,7 +162,7 @@ cp experiments/agent-replay.example.toml local/agent-replay.toml
 uv run python -m agent_fs_bench run agent-replay --dirs /mnt/fs-a /mnt/fs-b
 ```
 
-`agent_fs_bench/benchmarks/agent_replay.py` 顶部 `CONFIG` 默认 `cases_file = local/agent-replay.toml`、`repeats = 5`；没有规模、重试或录制 CLI 参数。每个 target 顺序执行所有 case，每个 case 顺序完成 5 次回放。每次通过 GNU `cp -a --reflink=never` 将所有初始输入恢复至全新 `<target>/agent-fs-bench/agent-replay/<run-id>/<case>/repeat-N/mount-I`，保留隐藏文件、权限、时间戳、符号链接和硬链接；上次任务修改不复用，不清空目标根目录。准备/哈希不计时，不驱逐缓存；输入恢复会预热缓存，不能将结果称为 cold-cache。
+`agent_fs_bench/benchmarks/agent_replay.py` 顶部 `CONFIG` 默认 `cases_file = local/agent-replay.toml`、`repeats = 5`；没有规模、重试或录制 CLI 参数。每个 target 顺序执行所有 case，每个 case 顺序完成 5 次回放。每次通过 GNU `cp -a --reflink=never` 将所有初始输入恢复至全新 `<target>/agent-fs-bench/agent-replay/<run-id>/<case>/repeat-N/mount-I`。每个 case 在重复循环前计算各源目录指纹，写入 `initial_sha256`；每次复制后，对所有目标副本计算指纹并比较。内容、权限、符号链接或硬链接关系不一致时立即停止，不启动回放，不输出该次成功测量。上次任务修改不复用，不清空目标根目录。复制请求保留时间戳和其他元数据，但指纹不检查时间戳、owner、xattr 或 ACL。准备、哈希和复制后校验均不计时，不驱逐缓存；恢复和校验会预热缓存，不能将结果称为 cold-cache。
 
 #### 计时与结果
 
@@ -172,9 +174,9 @@ uv run python -m agent_fs_bench run agent-replay --dirs /mnt/fs-a /mnt/fs-b
 
 输入恢复、输入指纹、代理启停、runner 后处理和 benchmark JSONL/CSV 写出都不在 `elapsed_s` 内。**verifier 会做真实 I/O，且计入时间，即使 reward 为零；正式测量不重新验收。** 模型调用无真实推理延迟；记录命令中的固定等待仍存在。终端输出变化、shell 分支、后台任务和慢文件系统可改变真实 I/O，不能据此声称每次执行相同 syscall 或每个目标均通过任务正确性验证。
 
-每条 JSONL 是 `target × case × repeat`；`parameters` 保存 Python/Harbor/mitmproxy 版本、模型名、submodule 实际源码与 lockfile、任务、cassette 和各挂载初始数据的 SHA-256。目录指纹包含内容、模式、符号链接与硬链接关系，不含机器绝对路径或时间戳。cassette 指纹只覆盖回放输入和验收标记，不含历史 run 日志；不会将敏感响应正文写进 JSONL。与其他 workload 一样自动导出 `summary.csv`，可直接使用通用 `analyze`/`plot`。每次上游原始诊断位于 `results/agent-replay/<run-id>/<target>/<case>/repeat-N/`，失败保留日志、不输出该次成功测量、不自动重试。
+每条 JSONL 是 `target × case × repeat`；`parameters` 保存实际使用的配置文件绝对路径 `cases_file`、Python/Harbor/mitmproxy 版本、模型名、submodule 实际源码与 lockfile、任务、cassette 和各挂载初始数据的 SHA-256。目录指纹包含内容、模式、符号链接与硬链接关系，不含机器绝对路径或时间戳，也不覆盖 owner、xattr 或 ACL。cassette 指纹只覆盖回放输入和验收标记，不含历史 run 日志；不会将敏感响应正文写进 JSONL。与其他 workload 一样自动导出 `summary.csv`，可直接使用通用 `analyze`/`plot`。每次上游原始诊断位于 `results/agent-replay/<run-id>/<target>/<case>/repeat-N/`，失败保留已有诊断、不输出该次成功测量、不自动重试。
 
-**数据保密：** cassette 的 `flows.mitm` 可能包含 provider API key、完整请求头、任务文件和模型输出；task、cassette、配置全部留在被忽略的 `local/`，`.mitm` 也全局忽略。不要提交真实录制数据或凭据；公开 artifact 前需单独审查/脱敏。离线回放不需要 API key，也不会回退到真实 provider。
+**数据保密：** cassette 的 `flows.mitm` 可能包含 provider API key、完整请求头、任务文件和模型输出；task、cassette、配置全部留在被忽略的 `local/`。`.mitm` 和任意层级的 `cassettes/` 目录均被忽略，后者同时排除 manifest、录制命令、验收标记和 Compose 配置；Git ignore 不会移除已经跟踪的文件。不要提交真实录制数据或凭据；公开 artifact 前需单独审查/脱敏。离线回放不需要 API key，也不会回退到真实 provider。
 
 #### 无 token smoke
 
