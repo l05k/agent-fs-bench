@@ -1,0 +1,3 @@
+[submodule "agent-mitm-replay"]
+	path = third_party/agent-mitm-replay
+	url = git@github.com:l05k/agent-mitm-replay.git

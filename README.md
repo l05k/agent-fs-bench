@@ -13,11 +13,12 @@ agent_fs_bench/
   results.py              # JSONL 运行上下文与复现信息
   targets.py              # 目录列表与别名
   ssh.py                  # 共享 SSH hosts 配置与 Open MPI remote-shell agent
-  benchmarks/             # 9 个 workload + 顶部 CONFIG；SQLite 共用构建机制
+  benchmarks/             # 10 个 workload + 顶部 CONFIG；SQLite 共用构建机制
 experiments/              # 不含内部信息的 TOML 示例
 local/                    # 私有目标、mount 与 SSH 配置，不提交
 results/<bench>/<run-id>/ # results.jsonl、summary.csv 和诊断附件
 data/                     # 固定输入、lockfile、Git bundle
+third_party/agent-mitm-replay/ # 固定提交的 Git submodule，独立 Python 3.13 环境
 docs/                     # 各 workload 的 CONFIG 默认值和计时边界
 tools/                    # fixture 维护工具
 tests/                    # 共享行为边界测试
@@ -30,6 +31,10 @@ tests/                    # 共享行为边界测试
 ```sh
 uv sync --locked
 uv run python -m agent_fs_bench --help
+
+# agent-replay 另需初始化子项目；在实际测量的 Linux 主机上安装
+git submodule update --init --recursive
+uv sync --locked --project third_party/agent-mitm-replay
 
 # 绘图才需要额外安装 Matplotlib；DuckDB 已包含在基础依赖中
 uv sync --locked --group analysis
@@ -93,6 +98,7 @@ uv run python -m agent_fs_bench run clone --dirs /mnt/fs-a /mnt/fs-b -- --smoke
 | `run multi-host` | 多台 SSH 主机同时在共享文件系统执行私有树操作和目录竞争 | [multi-host](docs/bench-multi-host-nas.md) |
 | `run mount-scale` | 本机优先、按逻辑核扩至 SSH hosts 的 N 个独立 client；单点 N、全局 Open MPI/mdtest 小文件吞吐、mount lifecycle 与逐机资源 | [mount scaling](docs/bench-mount-scale.md) |
 | `run mdtest` | 单客户端 POSIX 元数据吞吐；固定总对象数，private/shared 目录与进程数扫描 | [mdtest](docs/bench-mdtest.md) |
+| `run agent-replay` | 已验收模型响应序列驱动的真实 Harbor/Docker 任务；仅任务数据挂入目标文件系统 | [agent replay](#agent-replay) |
 
 ```sh
 uv run python -m agent_fs_bench run dev-workflow --dirs /mnt/fs-a
@@ -105,6 +111,7 @@ uv run python -m agent_fs_bench run sqlite-speedtest --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run multi-host --dirs /mnt/fs-a
 uv run python -m agent_fs_bench run mount-scale --target lakebase
 uv run python -m agent_fs_bench run mdtest --dirs /mnt/fs-a -- --smoke
+uv run python -m agent_fs_bench run agent-replay --dirs /mnt/fs-a
 ```
 
 ### 运行默认值
@@ -112,6 +119,71 @@ uv run python -m agent_fs_bench run mdtest --dirs /mnt/fs-a -- --smoke
 `run` 不暴露规模、重复次数、并发、fsync/cache、PRAGMA、fixture/manager、资源路径等调节参数。每个模块顶部有唯一的 `CONFIG` 字典，记录该 workload 的可复现实验设置；具体默认值和计时含义见对应文档。修改 `CONFIG` 并在结果中保留源码指纹，才能说明实验条件。部分 workload 会强制校验实验条件：npm-install 要求 node/npm/pnpm 版本与 `CONFIG["tool_versions"]` 完全一致，并要求外部本地准备盘与 target 不同设备、不同文件系统类型，不满足即中止，不回退。
 
 `multi-host` 与 `mount-scale` 复用 `local/hosts.toml` 的 SSH 配置，格式见 `experiments/hosts.example.toml`。前者在每台 SSH host 跑一个共享写 worker，控制机不跑负载；后者先在 Linux 控制机每个可用逻辑核放一个 client，再按 hosts 顺序填远端，一次只测一个 N（默认全体可用逻辑核总数）。两者的同步和计量协议不同，结果不能直接拼接。
+
+### Agent replay
+
+子项目 [agent-mitm-replay](https://github.com/l05k/agent-mitm-replay) 固定在 `33c73261c8b656bf11a1915a75e56a253dee6bf0`，保留独立 `uv.lock`，不向主项目引入 Harbor/mitmproxy 依赖。主 benchmark 仍支持 Python 3.12+；子项目使用 Python 3.13.x、Harbor 0.24.0、mitmproxy 12.2.3。正式测量在 Linux 上运行，需要 Docker 和 Compose v2；Docker daemon 必须位于同一主机并能访问目标挂载。macOS 本地验证可在 `colima ssh` 内运行整个 benchmark，不能仅把 Docker 指向 VM 而使用宿主机独有路径。
+
+**实验边界：固定模型响应序列，不是 syscall replay，也不是在线自适应 Agent 性能。** 每个任务先 `record`，恢复初始数据后 `validate` 一次，再将同一 accepted cassette 用于所有文件系统和重复。验收检查任务成功、响应完整消费和命令轨迹相同；正式 `replay` 仍实际运行 Agent、终端命令、verifier 和产物收集，但不再检查 reward、命令轨迹或剩余响应。不要将录制/验收时间与回放时间比较。
+
+#### 准备任务与 cassette
+
+正式 workload 不内置任务集或模型凭据；研究者提供单步 Harbor task、固定容器镜像、初始任务数据和 accepted cassette。工具/依赖应预先放入镜像并完成构建，固定镜像 digest；不要把首次拉取、构建和在线依赖下载混入正式样本。task 源码哈希不包含镜像内容，镜像和主机环境需另行归档。
+
+```sh
+# 相对路径均在仓库根目录；初始数据由实验者事先准备，不能指向已修改的工作树
+mkdir -p local/replay/reference
+cp -a local/replay/initial/task-a local/replay/reference/task-a-record
+
+# OPENAI_API_KEY 只用于 record，通过环境设置，不写入配置
+uv run --project third_party/agent-mitm-replay agent-mitm-replay record \
+  --task "$PWD/local/replay/task-a" \
+  --cassette "$PWD/local/replay/cassettes/task-a" \
+  --model openai/gpt-4o-mini --upstream https://api.openai.com \
+  --mount "$PWD/local/replay/reference/task-a-record:/app"
+
+# 新副本恢复相同初始状态；验收本身不是性能样本
+cp -a local/replay/initial/task-a local/replay/reference/task-a-validation
+uv run --project third_party/agent-mitm-replay agent-mitm-replay validate \
+  --task "$PWD/local/replay/task-a" \
+  --cassette "$PWD/local/replay/cassettes/task-a" \
+  --mount "$PWD/local/replay/reference/task-a-validation:/app"
+
+cp experiments/agent-replay.example.toml local/agent-replay.toml
+```
+
+修改 `local/agent-replay.toml`，每个 `[[cases]]` 指定 `name`、`task`、`cassette`，每个 `[[cases.mounts]]` 指定初始数据 `source` 和绝对容器目录 `container`。路径相对于该 TOML 文件，也可使用绝对路径；可配置多个 case、多个互不嵌套的任务数据挂载。容器路径必须与录制/验收相同，初始数据必须包含被 bind mount 遮住的镜像内输入，包括 `.git`、隐藏文件和链接。使用独立、完整的输入快照，避免链接或 Git alternates 指向测试目录外的数据。
+
+任务、cassette、初始数据、子项目运行环境、Docker 镜像和 Harbor 日志均放本地控制盘，只有恢复后的任务数据目录位于目标文件系统。实际运行：
+
+```sh
+uv run python -m agent_fs_bench run agent-replay --dirs /mnt/fs-a /mnt/fs-b
+```
+
+`agent_fs_bench/benchmarks/agent_replay.py` 顶部 `CONFIG` 默认 `cases_file = local/agent-replay.toml`、`repeats = 5`；没有规模、重试或录制 CLI 参数。每个 target 顺序执行所有 case，每个 case 顺序完成 5 次回放。每次通过 GNU `cp -a --reflink=never` 将所有初始输入恢复至全新 `<target>/agent-fs-bench/agent-replay/<run-id>/<case>/repeat-N/mount-I`，保留隐藏文件、权限、时间戳、符号链接和硬链接；上次任务修改不复用，不清空目标根目录。准备/哈希不计时，不驱逐缓存；输入恢复会预热缓存，不能将结果称为 cold-cache。
+
+#### 计时与结果
+
+| 指标 | 边界 |
+| --- | --- |
+| `elapsed_s` | 上游 `elapsed_sec`：Harbor 子进程启动至退出，含环境 setup/cleanup、Agent、verifier、产物和 Harbor 自身输出工作 |
+| `environment_setup_s`, `agent_setup_s`, `agent_execution_s`, `verifier_s` | Harbor 实际报告的阶段时间；缺失阶段不填零 |
+| `model_requests` | 本次回放实际收到的模型请求数；诊断值，不是轨迹等价性证明 |
+
+输入恢复、输入指纹、代理启停、runner 后处理和 benchmark JSONL/CSV 写出都不在 `elapsed_s` 内。**verifier 会做真实 I/O，且计入时间，即使 reward 为零；正式测量不重新验收。** 模型调用无真实推理延迟；记录命令中的固定等待仍存在。终端输出变化、shell 分支、后台任务和慢文件系统可改变真实 I/O，不能据此声称每次执行相同 syscall 或每个目标均通过任务正确性验证。
+
+每条 JSONL 是 `target × case × repeat`；`parameters` 保存 Python/Harbor/mitmproxy 版本、模型名、submodule 实际源码与 lockfile、任务、cassette 和各挂载初始数据的 SHA-256。目录指纹包含内容、模式、符号链接与硬链接关系，不含机器绝对路径或时间戳。cassette 指纹只覆盖回放输入和验收标记，不含历史 run 日志；不会将敏感响应正文写进 JSONL。与其他 workload 一样自动导出 `summary.csv`，可直接使用通用 `analyze`/`plot`。每次上游原始诊断位于 `results/agent-replay/<run-id>/<target>/<case>/repeat-N/`，失败保留日志、不输出该次成功测量、不自动重试。
+
+**数据保密：** cassette 的 `flows.mitm` 可能包含 provider API key、完整请求头、任务文件和模型输出；task、cassette、配置全部留在被忽略的 `local/`，`.mitm` 也全局忽略。不要提交真实录制数据或凭据；公开 artifact 前需单独审查/脱敏。离线回放不需要 API key，也不会回退到真实 provider。
+
+#### 无 token smoke
+
+```sh
+uv run --project third_party/agent-mitm-replay agent-mitm-replay smoke \
+  --output "$PWD/local/replay-smoke"
+```
+
+上游 smoke 使用本地脚本模型，完成真实 Docker 的 record → validate → replay，检查 20 字节产物、未验收拒绝回放、provider 停止后离线运行，以及 verifier reward 为零时仍可测量。输出目录必须不存在。要进一步验证主 benchmark，可将 `local/agent-replay.toml` 的 task/cassette 指向该输出中的 `task`/`cassette`，以空目录作 `/app` 初始数据，再运行上述 `run agent-replay`；不得将该极小任务当作论文工作负载。首次 smoke 需要镜像仓库和 apt 网络访问。
 
 ## 结果
 
