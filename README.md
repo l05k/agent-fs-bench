@@ -243,6 +243,8 @@ uv run python -m unittest discover -s tests
 
 `data/dev-workflow/` 与 `data/mini-dev-workflow/` 来自 [YoloFS/perf-eval](https://github.com/YoloFS/perf-eval) 的 `bc32d08`（2026-08-28）；对应最后变更为 `de6f95f` 和 `afe112a`。内核 patchset 是 Amir Goldstein 的 overlayfs `ovl_file` 重构，已合入 Linux v6.13。
 
+例外是 `data/dev-workflow/tinyconfig-overlayfs.config`：它在固定 base commit（`c2c54b5f34f6^`，Linux 6.12.0-rc7）上按 `make ARCH=x86 tinyconfig` + `CONFIG_64BIT=y` + `CONFIG_OVERLAY_FS=y` + `make ARCH=x86 olddefconfig` 重新生成，是 64-bit x86 配置，与上游同名文件不再字节一致。series 与命令文件仍取自上游。
+
 两个开发流程按上游继承构建环境，不强制 `ARCH`、不将环境 `CC` 提升为 make 命令行参数。只记录必要 workload 参数、工具版本和输入指纹，不再采集完整内核配置或 make 环境字典。固定配置文件输入不等于强制相同的最终内核配置，实验条件由人工保证，详见开发流程文档。
 
 mini 的 source repository 从提交的命令确定性重建；bundle 与 `series.json` 必须一起更新，不能只复制最终工作树：

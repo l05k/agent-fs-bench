@@ -11,7 +11,7 @@ from unittest import mock
 
 from agent_fs_bench.benchmarks import dev_workflow, mini_dev_workflow
 from agent_fs_bench.benchmarks.build_settings import read_compiler_version
-from agent_fs_bench.results import RunContext
+from agent_fs_bench.results import PROJECT_ROOT, RunContext
 from agent_fs_bench.targets import Target
 
 BUILD_VARIABLES = (
@@ -22,6 +22,20 @@ BUILD_VARIABLES = (
     'KCFLAGS', 'KAFLAGS', 'KCONFIG_CONFIG', 'KBUILD_OUTPUT',
     'BUILD_OBSERVATIONS',
 )
+
+
+class KernelConfigFixtureTests(unittest.TestCase):
+    def test_shipped_config_selects_64_bit_x86_with_overlayfs(self):
+        # tinyconfig is an allnoconfig variant: every visible boolean defaults to
+        # n, which selects CONFIG_X86_32=y. CONFIG_64BIT must therefore be
+        # written explicitly, and the fixture must not carry the 32-bit choice.
+        path = PROJECT_ROOT / 'data' / 'dev-workflow' / dev_workflow.DEFAULT_CONFIG
+        lines = {line.strip() for line in path.read_text(encoding='utf-8').splitlines()}
+        self.assertIn('CONFIG_64BIT=y', lines)
+        self.assertIn('CONFIG_X86_64=y', lines)
+        self.assertIn('CONFIG_OVERLAY_FS=y', lines)
+        self.assertNotIn('# CONFIG_64BIT is not set', lines)
+        self.assertNotIn('CONFIG_X86_32=y', lines)
 
 
 class WorkflowRecordingTests(unittest.TestCase):
