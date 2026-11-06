@@ -187,6 +187,11 @@ def render_line(data: dict, stem: Path) -> None:
         axes.set_ylim(low - pad, high + pad)
     axes.set_xlabel(data['xlabel'])
     axes.set_ylabel(data['ylabel'])
+    if data.get('title'):
+        bottom, top = axes.get_ylim()
+        axes.set_ylim(max(0, bottom), top + (top - bottom) * 0.3)
+        axes.text(0.02, 0.98, data['title'], transform=axes.transAxes,
+                  ha='left', va='top')
 
     legend = figure.legend(
         handles=handles, labels=series, loc='lower center', ncols=min(len(series), 2),

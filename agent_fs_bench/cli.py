@@ -18,6 +18,7 @@ BENCHMARKS = {
     'sqlite-speedtest': 'sqlite_speedtest',
     'multi-host': 'multi_host',
     'mount-scale': 'mount_scale',
+    'mdtest': 'mdtest',
 }
 RESULTS_DIR = PROJECT_ROOT / 'results'
 TARGETS_FILE = PROJECT_ROOT / 'local' / 'targets.toml'
