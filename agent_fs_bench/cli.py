@@ -14,6 +14,7 @@ BENCHMARKS = {
     'dev-workflow': 'dev_workflow',
     'mini-dev-workflow': 'mini_dev_workflow',
     'npm-install': 'npm_install',
+    'npm-install-nofsync': 'npm_install_nofsync',
     'kvtest': 'kvtest',
     'sqlite-speedtest': 'sqlite_speedtest',
     'multi-host': 'multi_host',
