@@ -124,7 +124,7 @@ uv run python -m agent_fs_bench run agent-replay --dirs /mnt/fs-a
 
 子项目 [agent-mitm-replay](https://github.com/l05k/agent-mitm-replay) 固定在 `33c73261c8b656bf11a1915a75e56a253dee6bf0`，保留独立 `uv.lock`，不向主项目引入 Harbor/mitmproxy 依赖。主 benchmark 仍支持 Python 3.12+；子项目使用 Python 3.13.x、Harbor 0.24.0、mitmproxy 12.2.3。正式测量在 Linux 上运行，需要 Docker 和 Compose v2；Docker daemon 必须位于同一主机并能访问目标挂载。macOS 本地验证可在 `colima ssh` 内运行整个 benchmark，不能仅把 Docker 指向 VM 而使用宿主机独有路径。
 
-Submodule 使用 HTTPS URL，不要求 GitHub SSH key。但上游仓库当前仍为 private，匿名 HTTPS 拉取失败；公开复现前需将上游设为 public。已获得访问权限的用户可使用 GitHub HTTPS 凭据。这一限制不能仅通过修改 URL 消除。
+Submodule 使用公开的 HTTPS URL，不需要 GitHub SSH key 或凭据；`git submodule update --init --recursive` 可匿名拉取上述固定提交。
 
 **实验边界：固定模型响应序列，不是 syscall replay，也不是在线自适应 Agent 性能。** 每个任务先 `record`，恢复初始数据后 `validate` 一次，再将同一 accepted cassette 用于所有文件系统和重复。验收检查任务成功、响应完整消费和命令轨迹相同；正式 `replay` 仍实际运行 Agent、终端命令、verifier 和产物收集，但不再检查 reward、命令轨迹或剩余响应。不要将录制/验收时间与回放时间比较。
 
