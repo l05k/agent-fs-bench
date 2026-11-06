@@ -158,11 +158,14 @@ make ARCH=x86 olddefconfig
 cp .config data/dev-workflow/tinyconfig-overlayfs.config
 ```
 
-`ARCH=x86` is required: `CONFIG_64BIT` only exists for `ARCH=x86`, and
+`ARCH=x86` is required because `CONFIG_64BIT` only exists for that `ARCH`, and
 `tinyconfig` (an `allnoconfig` variant) sets every visible boolean to `n`, which
-selects `CONFIG_X86_32=y`. A file generated under `ARCH=i386` has no `64BIT`
-line at all and is silently converted to 64-bit by `olddefconfig` on a 64-bit
-host. Regenerate after any change of pinned base, and check that the result keeps
+selects `CONFIG_X86_32=y`; the `64BIT` line is therefore written explicitly
+instead of being left to the default. The previous file came from perf-eval's
+7.0.0-rc5 tree and pinned the 32-bit selection that `tinyconfig` produces, while
+this workload builds `c2c54b5f34f6^` (Linux 6.12.0-rc7); regenerating at the
+pinned base removes that version drift and the stale 32-bit pin together.
+Regenerate after any change of pinned base, and check that the result keeps
 `CONFIG_64BIT=y`, `CONFIG_X86_64=y` and `CONFIG_OVERLAY_FS=y`. `olddefconfig`
 is idempotent on the shipped file, so a 32-bit run means the environment
 (`ARCH`, `KCONFIG_CONFIG`) overrode it, not that the fixture changed.

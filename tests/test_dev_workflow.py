@@ -26,9 +26,9 @@ BUILD_VARIABLES = (
 
 class KernelConfigFixtureTests(unittest.TestCase):
     def test_shipped_config_selects_64_bit_x86_with_overlayfs(self):
-        # tinyconfig is an allnoconfig variant, so CONFIG_64BIT must be written
-        # explicitly; a file generated under ARCH=i386 lacks the symbol and
-        # olddefconfig would silently select a 64-bit kernel instead.
+        # tinyconfig is an allnoconfig variant: every visible boolean defaults to
+        # n, which selects CONFIG_X86_32=y. CONFIG_64BIT must therefore be
+        # written explicitly, and the fixture must not carry the 32-bit choice.
         path = PROJECT_ROOT / 'data' / 'dev-workflow' / dev_workflow.DEFAULT_CONFIG
         lines = {line.strip() for line in path.read_text(encoding='utf-8').splitlines()}
         self.assertIn('CONFIG_64BIT=y', lines)
