@@ -173,8 +173,6 @@ class Mdtest:
         self._sha256 = _sha256(self._binary)
         self._launcher_name, self._launcher_version = self._probe_launcher()
         self._version: str | None = None
-        # Verified actual placements of the most recent job, from rank proofs.
-        self.placements: tuple[dict[str, Any], ...] = ()
 
     @property
     def metadata(self) -> dict[str, Any]:
@@ -197,7 +195,7 @@ class Mdtest:
         # exercises the same wrapper placement proof as the measured ranks.
         cpu = min(os.sched_getaffinity(0))
         for index, path in enumerate(paths, 1):
-            items, _, _ = self._job(
+            items, _, _, _ = self._job(
                 f'prepare-{index}',
                 [Rank(host='localhost', hostname=platform.node(), cpu=cpu,
                       python=sys.executable, package_root=root,
@@ -215,7 +213,7 @@ class Mdtest:
             log_dir, [path for rank in values for path in (rank.workspace, *rank.shared)]
         )
         for resource in range(len(values[0].shared)):
-            items, _, _ = self._job(
+            items, _, _, _ = self._job(
                 f'warm-shared-{resource + 1}', values,
                 [self._shared(rank.shared[resource], files, size) for rank in values],
                 ('File stat', 'File read'), directory,
@@ -224,26 +222,28 @@ class Mdtest:
                 raise RuntimeError(f'mdtest warmed {items} items, expected {files}')
 
     def measure(self, ranks: Sequence[Rank], files: int, size: int,
-                log_dir: Path) -> list[Phase]:
-        """Measure private and shared file phases and return upstream timings."""
+                log_dir: Path
+                ) -> tuple[list[Phase], dict[str, tuple[dict[str, Any], ...]]]:
+        """Return native phases and verified placements for every measured job."""
         values = self._ranks(ranks)
         directory = self._log_dir(
             log_dir, [path for rank in values for path in (rank.workspace, *rank.shared)]
         )
-        items, times, per_rank = self._job(
+        items, times, per_rank, private_placement = self._job(
             'private', values,
             [self._private(rank.workspace, files, size) for rank in values],
             _FILE_PHASES, directory, private=True,
         )
         if items != files:
             raise RuntimeError(f'mdtest reported {items} items per task, expected {files}')
+        placements = {'private': private_placement}
         phases = [
             Phase(f'private/{label}', len(values) * files, times[name], per_rank[name])
             for name, label in zip(_FILE_PHASES, ('create', 'stat', 'read', 'remove'))
         ]
         # One resource at a time; every client alias is one rank of the same job.
         for resource in range(len(values[0].shared)):
-            items, times, per_rank = self._job(
+            items, times, per_rank, shared_placement = self._job(
                 f'shared-{resource + 1}', values,
                 [self._shared(rank.shared[resource], files, size) for rank in values],
                 ('File stat', 'File read'), directory,
@@ -252,12 +252,13 @@ class Mdtest:
                 raise RuntimeError(
                     f'mdtest shared-{resource + 1} reported an unexpected item count'
                 )
+            placements[f'shared-{resource + 1}'] = shared_placement
             phases += [
                 Phase(f'shared-{resource + 1}/{label}', len(values) * files,
                       times[name], per_rank[name])
                 for name, label in (('File stat', 'stat'), ('File read', 'read'))
             ]
-        return phases
+        return phases, placements
 
     def _probe_launcher(self) -> tuple[str, str]:
         try:
@@ -299,7 +300,8 @@ class Mdtest:
     def _job(self, label: str, ranks: Sequence[Rank],
              groups: Sequence[Sequence[str]], phases: Sequence[str],
              log_dir: Path, *, private: bool = False
-             ) -> tuple[int, dict[str, float], dict[str, list[float]]]:
+             ) -> tuple[int, dict[str, float], dict[str, list[float]],
+                        tuple[dict[str, Any], ...]]:
         """Run one global MPMD job and validate its placement and timings."""
         if len(ranks) != len(groups):
             raise ValueError('every rank needs exactly one mdtest argument group')
@@ -321,11 +323,11 @@ class Mdtest:
                 f'{_tail(stderr_path) or _tail(stdout_path)}'
             )
         stdout = stdout_path.read_text()
-        self.placements = self._proved(label, stdout, ranks)
+        placement = self._proved(label, stdout, ranks)
         self._version, items, times, per_rank = self._parse(
             label, stdout, csv_path, phases, len(ranks), self._nodes(ranks)
         )
-        return items, times, per_rank
+        return items, times, per_rank, placement
 
     @staticmethod
     def _contexts(ranks: Sequence[Rank], groups: Sequence[Sequence[str]],
@@ -371,7 +373,7 @@ class Mdtest:
     def _proved(label: str, stdout: str, ranks: Sequence[Rank]
                 ) -> tuple[dict[str, Any], ...]:
         """Validate the wrapper's actual placement proofs against the request."""
-        proofs: dict[int, tuple[str, str, int]] = {}
+        proofs: dict[int, tuple[str, str, int, str]] = {}
         for line in stdout.splitlines():
             position = line.find(_PLACEMENT)
             if position < 0:
@@ -383,7 +385,8 @@ class Mdtest:
                     fields[key] = value
             try:
                 index = int(fields['index'])
-                proof = (fields['host'], fields['hostname'], int(fields['cpu']))
+                proof = (fields['host'], fields['hostname'], int(fields['cpu']),
+                         fields['affinity'])
             except (KeyError, ValueError) as error:
                 raise RuntimeError(
                     f'mdtest run {label} printed an unparsable placement proof: {line.strip()}'
@@ -401,7 +404,7 @@ class Mdtest:
             raise RuntimeError(f'mdtest run {label} proved unknown rank(s) {extra}')
         placements = []
         for index, rank in enumerate(ranks):
-            host, hostname, cpu = proofs[index]
+            host, hostname, cpu, affinity = proofs[index]
             if host != rank.host or hostname != rank.hostname:
                 raise RuntimeError(
                     f'mdtest run {label} rank {index} executed on {hostname} ({host}), '
@@ -412,7 +415,14 @@ class Mdtest:
                     f'mdtest run {label} rank {index} executed on CPU {cpu}, '
                     f'requested {rank.cpu}'
                 )
-            placements.append({'index': index, 'hostname': hostname, 'cpu': cpu})
+            if affinity != str(rank.cpu):
+                raise RuntimeError(
+                    f'mdtest run {label} rank {index} has CPU affinity {affinity!r}, '
+                    f'requested only CPU {rank.cpu}'
+                )
+            observed_cpu = int(affinity)
+            placements.append({'index': index, 'hostname': hostname,
+                               'cpu': observed_cpu, 'affinity': [observed_cpu]})
         return tuple(placements)
 
     @staticmethod

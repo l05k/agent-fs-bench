@@ -121,6 +121,8 @@ uv run python -m agent_fs_bench run mount-scale \
   --dirs /tmp/mdtest-directory-smoke -- --directory-smoke
 ```
 
+`--directory-smoke` 要求当前 affinity 集合至少有两个可用逻辑 CPU；不足时在启动 worker/MPI 前明确报错，不自动缩为 N=1。这里检查的是 `sched_getaffinity`，不是容器 CPU 时间配额。
+
 ## 执行与计时边界
 
 1. 在参与机器启动 persistent lifecycle workers，探测 affinity CPU IDs、内核、架构、Python、mdtest SHA256、MPI 版本；生成本机优先的单点 N 放置。
@@ -128,7 +130,7 @@ uv run python -m agent_fs_bench run mount-scale \
 3. 控制机并发通知各 host mount；每 host 并发启动本机 clients，每 client 顺序挂私有、共享目录。各 host 验证新增 mount entries 恰好符合计划、sentinel 别名正确。mounted-idle 在共享预热之前采样。
 4. 对每个共享资源启动一个**全局 MPI 作业**做 stat/read 预热，丢弃该轮性能值。
 5. 启动各机资源采样，然后启动全局私有 mdtest 作业 `create → stat → read → remove`；随后每共享资源各一个作业 `stat → read`。所有 ranks 在同一个 `MPI_COMM_WORLD` 中使用 mdtest 原有 phase barriers；不是每机独立跑完后相加吞吐。私有/共享、各共享资源仍分阶段，不是交错混合负载。
-6. 每个 rank 通过 Open MPI appfile 明确指定 host，wrapper 验证 global rank、实际 hostname、单 CPU affinity，再 exec 上游 mdtest。私有 `test-dir.0-0` 在所属 host 上预建，排除在计时外；只由 rank 0 把全局 native CSV 写到控制机结果目录，远端不要求共享结果盘。
+6. 每个 rank 通过 Open MPI appfile 明确指定 host，wrapper 验证 global rank、实际 hostname、单 CPU affinity，再 exec 上游 mdtest。控制机另外核对 proof 的实测 `affinity` 必须恰好等于请求的单 CPU，不只比较回显的 `cpu`。私有 `test-dir.0-0` 在所属 host 上预建，排除在计时外；只由 rank 0 把全局 native CSV 写到控制机结果目录，远端不要求共享结果盘。
 7. 停止资源采样，各 host 并发逆序 unmount，校验无残留，采样 released-idle。成功后输出整次 repeat 的结果、删除已卸载私有数据；全部成功后收集 lifecycle 日志并删除本次共享 fixture 和远端部署。
 
 采用 warm shared-data 协议，不 drop cache；预读不保证后续始终驻留 cache。私有 read 在本轮 create 后，没有 fsync/sync，不证明持久化延迟。mdtest wrapper/循环/barrier 在 upstream 阶段计时内；Python wrapper、MPI 启动、部署、fixture、预热、结果输出不在其中。
@@ -153,7 +155,7 @@ uv run python -m agent_fs_bench run mount-scale \
 
 不再输出 `scaling_efficiency`：单点运行没有同轮 N=1 基线。论文若需要效率，在独立 runs 中选定可比基线再计算，不隐式增加实验点。
 
-JSONL 保留解析后的 N、requested_clients、K、工作量、cache/fsync 协议、rank→逻辑 host→CPU、各机可用/分配 CPU、hostname/内核/架构/工具版本、mdtest 与 profile SHA256，以及公共 source SHA256。SSH transport 配置和 mount 凭据不写入 JSONL；实验者私下归档 inventory/profile。每次 job 的实际 placement proof、mdtest stdout/stderr、原始 CSV/appfile 作为诊断附件；分析阶段不依赖原机器。
+JSONL 保留解析后的 N、requested_clients、K、工作量、cache/fsync 协议、各机可用/分配 CPU、hostname/内核/架构/工具版本、mdtest 与 profile SHA256，以及公共 source SHA256。`parameters.planned_rank_placement` 是计划的 rank→逻辑 host→CPU 映射；`parameters.rank_placement` 按 `private`、`shared-1` 等测量作业分别保存通过校验的实测 rank、逻辑 host、hostname、CPU 和 affinity 列表。每轮重新汇总全部测量作业的 proofs，不能用最后一个作业覆盖前面的记录；K=1 仅有 `private`。这些值来自 wrapper 在 exec mdtest 前的观测，不代表整个阶段持续采样的 affinity。SSH transport 配置和 mount 凭据不写入 JSONL；实验者私下归档 inventory/profile。原始 placement proof、mdtest stdout/stderr、CSV/appfile 仍作为诊断附件，分析实际放置无需依赖这些附件或原机器。
 
 资源来自**逐 host 全机计数**：CPU busy、MemTotal−MemAvailable、cache、dirty、slab 等。baseline/mounted-idle/released-idle 的 used/slab/unreclaimable/mount_entries 记录相对 baseline 的 delta；workload 记录观察到的峰值。包含 Python、MPI、daemon、内核及其他进程，不做 filesystem CPU/RSS 归因。采样窗口包含 MPI 启停及阶段间隙，各机开始/停止的控制时间有偏差；不把各机峰值相加声称同时全局峰值。mount entries 属于 worker 当前 namespace，daemon 必须在同一 namespace 建 mount。
 
@@ -172,12 +174,14 @@ Colima 非 root、Linux aarch64、Python 3.12.3、Open MPI 4.1.6、官方 IOR 4.
 | 场景 | 已观测结果 |
 | --- | --- |
 | `--directory-smoke`，N=2、K=3、32 文件 | 12 条 JSONL 测量，生成 summary.csv |
+| placement 修正后的 K=3 / K=1 directory runs | K=3 的 JSONL 包含 private/shared-1/shared-2 各自的 hostname、CPU、单核 affinity；K=1 连续两轮仅包含 private，无共享 proofs 残留 |
+| `taskset` 仅允许单个逻辑 CPU 的 `--directory-smoke` | 明确报错需要至少 2 个可用逻辑 CPU，不启动 MPI，不隐式缩容 |
 | 默认 N、本机 6 个可用逻辑 CPU、K=3 | ranks 实际绑定 CPU 0–5；18 个专属 Linux bind mounts 建立、mdtest 完成、卸载后残留 0 |
 | 显式 N=2、hosts 文件不存在 | 只用本机，6 mounts 的完整负载/lifecycle 成功 |
 | K=1、N=2、两次重复 | 私有 create/stat/read/remove 与两轮 mount/unmount 成功 |
 | `taskset -c 1,3`、默认 N | 仅两个 ranks，实际 affinity 分别为 CPU 1、3；指定 N=3 则因容量不足拒绝，不超订阅 |
 | macOS→Colima 的实际 SSH worker | 分发包/profile、preflight、6 mounts、采样、日志回收、卸载零残留、部署删除成功；inventory-aware MPI SSH agent 的真实 SSH 命令执行成功 |
-| 仓库 unittest suite | 91 项通过 |
+| 仓库 unittest suite（本轮修正后） | `python -m unittest discover -s tests -v`：112 项通过，含本轮新增的 affinity 不符/缺失拒绝与单核 smoke 前置检查两项回归 |
 
 Linux bind mounts **只验证 harness/lifecycle**，不代表独立 NAS 客户端或存储性能。这些临时 smoke 结果不作为论文数据。尚未运行两台独立 Linux 主机组成的全局 MPI 作业、真实 NFS/LakeBase profile 或千 client 实验，不能据此声称它们已通过性能/容量验证。
 

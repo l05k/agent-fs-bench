@@ -3,7 +3,9 @@
 import tempfile
 from pathlib import Path
 import unittest
+from unittest import mock
 
+from agent_fs_bench.benchmarks import mount_scale
 from agent_fs_bench.benchmarks.mount_scale_cluster import Allocation, Lifecycle, allocate
 
 
@@ -32,6 +34,15 @@ class PlacementTests(unittest.TestCase):
                       [('local', [])]):
             with self.subTest(hosts=hosts), self.assertRaises(ValueError):
                 allocate(hosts, None)
+
+
+class SmokeCapacityTests(unittest.TestCase):
+    def test_single_affinity_cpu_is_rejected_before_smoke_setup(self):
+        args = mount_scale.parse_args(['--directory-smoke'])
+        with (mock.patch.object(mount_scale.platform, 'system', return_value='Linux'),
+              mock.patch.object(mount_scale.os, 'sched_getaffinity', return_value={3}),
+              self.assertRaises(ValueError)):
+            mount_scale._validate(args)
 
 
 class WorkerDataTests(unittest.TestCase):

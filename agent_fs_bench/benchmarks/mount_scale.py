@@ -51,6 +51,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def _validate(args: argparse.Namespace) -> None:
     if platform.system() != 'Linux':
         raise ValueError('mount-scale requires a Linux controller and Open MPI')
+    if args.directory_smoke:
+        available = len(os.sched_getaffinity(0))
+        if available < 2:
+            raise ValueError('--directory-smoke requires at least 2 available logical CPUs '
+                             f'in the CPU affinity set; found {available}')
     for name in ('directories', 'files', 'file_size_bytes', 'repeats', 'connect_timeout_s'):
         if type(getattr(args, name)) is not int or getattr(args, name) < 1:
             raise ValueError(f'CONFIG[{name!r}] must be a positive integer')
@@ -198,7 +203,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
                         shared=tuple(Path(path) for path in client['shared']),
                     ))
                     mapping.append({'rank': len(mapping), 'host': worker.name, 'cpu': cpu})
-            ctx.parameters['rank_placement'] = mapping
+            ctx.parameters['planned_rank_placement'] = mapping
             mount = unmount = None
             if profile is not None:
                 started = time.perf_counter()
@@ -207,7 +212,14 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
             mounted = parallel(workers, 'idle')
             engine.warm(ranks, args.files, args.file_size_bytes, diagnostics / 'warm')
             parallel(workers, 'sample-start')
-            phases = engine.measure(ranks, args.files, args.file_size_bytes, diagnostics / 'measured')
+            phases, placements = engine.measure(ranks, args.files, args.file_size_bytes,
+                                                diagnostics / 'measured')
+            ctx.parameters['rank_placement'] = {
+                job: [{'rank': proof['index'], 'host': mapping[proof['index']]['host'],
+                       'hostname': proof['hostname'], 'cpu': proof['cpu'],
+                       'affinity': proof['affinity']} for proof in proofs]
+                for job, proofs in placements.items()
+            }
             workload = parallel(workers, 'sample-stop')
             if profile is not None:
                 started = time.perf_counter()

@@ -167,8 +167,8 @@ class NativeRankTests(unittest.TestCase):
         proofs = ('MDBENCH_PLACEMENT index=0 host=localhost hostname=node-a cpu=0 affinity=0\n'
                   'MDBENCH_PLACEMENT index=1 host=10.0.0.5 hostname=node-b cpu=4 affinity=4\n')
         self.assertEqual(Mdtest._proved('private', proofs, ranks),
-                         ({'index': 0, 'hostname': 'node-a', 'cpu': 0},
-                          {'index': 1, 'hostname': 'node-b', 'cpu': 4}))
+                         ({'index': 0, 'hostname': 'node-a', 'cpu': 0, 'affinity': [0]},
+                          {'index': 1, 'hostname': 'node-b', 'cpu': 4, 'affinity': [4]}))
         with self.assertRaisesRegex(RuntimeError, 'executed on node-c'):
             Mdtest._proved('private', proofs.replace('hostname=node-b',
                                                      'hostname=node-c'), ranks)
@@ -177,6 +177,13 @@ class NativeRankTests(unittest.TestCase):
                                                      'cpu=5 affinity=5'), ranks)
         with self.assertRaisesRegex(RuntimeError, 'did not prove placement'):
             Mdtest._proved('private', proofs.splitlines()[0] + '\n', ranks)
+
+    def test_correct_cpu_echo_cannot_hide_wrong_or_missing_affinity(self):
+        ranks = [self.rank('localhost', 'node-a', 4, '/mnt/a')]
+        proof = 'MDBENCH_PLACEMENT index=0 host=localhost hostname=node-a cpu=4'
+        for suffix in (' affinity=5', ' affinity=4,5', ' affinity=', '', ' affinity=invalid'):
+            with self.subTest(suffix=suffix), self.assertRaises(RuntimeError):
+                Mdtest._proved('private', proof + suffix + '\n', ranks)
 
     def test_metadata_carries_no_launcher_argv_or_inventory_path(self):
         with tempfile.TemporaryDirectory() as directory:
