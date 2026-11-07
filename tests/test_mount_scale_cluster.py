@@ -1,4 +1,4 @@
-"""Client placement invariants at local and cross-host capacity boundaries."""
+"""CPU reservation and worker data invariants."""
 
 import tempfile
 from pathlib import Path
@@ -6,34 +6,18 @@ import unittest
 from unittest import mock
 
 from agent_fs_bench.benchmarks import mount_scale
-from agent_fs_bench.benchmarks.mount_scale_cluster import Allocation, Lifecycle, allocate
+from agent_fs_bench.benchmarks.mount_scale_cluster import Lifecycle, usable_cpus
 
 
-class PlacementTests(unittest.TestCase):
-    def test_local_fills_before_remote_and_keeps_real_cpu_ids(self):
-        hosts = [('local', [7, 2, 11]), ('node-a', [6, 0]), ('node-b', [9, 4])]
-        for clients, expected in (
-            (1, (Allocation('local', (2,)),)),
-            (3, (Allocation('local', (2, 7, 11)),)),
-            (4, (Allocation('local', (2, 7, 11)), Allocation('node-a', (0,)))),
-            (6, (Allocation('local', (2, 7, 11)), Allocation('node-a', (0, 6)),
-                 Allocation('node-b', (4,)))),
-        ):
-            with self.subTest(clients=clients):
-                self.assertEqual(allocate(hosts, clients), expected)
+class ReservationTests(unittest.TestCase):
+    def test_highest_cpu_ids_are_reserved_and_real_ids_kept(self):
+        self.assertEqual(usable_cpus([7, 2, 11, 5, 0], 2), ([0, 2, 5], [7, 11]))
+        self.assertEqual(usable_cpus(list(range(64)), 4), (list(range(60)), [60, 61, 62, 63]))
 
-    def test_default_fills_inventory_without_oversubscribing(self):
-        self.assertEqual(allocate([('local', [8, 3]), ('node-a', [12])], None),
-                         (Allocation('local', (3, 8)), Allocation('node-a', (12,))))
-        for clients in (0, -1, 4, True, (1, 2)):
-            with self.subTest(clients=clients), self.assertRaises(ValueError):
-                allocate([('local', [8, 3]), ('node-a', [12])], clients)
-
-    def test_aliases_cannot_duplicate_capacity(self):
-        for hosts in ([('local', [0, 0])], [('local', [0]), ('local', [1])],
-                      [('local', [])]):
-            with self.subTest(hosts=hosts), self.assertRaises(ValueError):
-                allocate(hosts, None)
+    def test_reservation_must_leave_a_rank_cpu(self):
+        for reserved in (3, 4, -1):
+            with self.subTest(reserved=reserved), self.assertRaises(ValueError):
+                usable_cpus([0, 1, 2], reserved)
 
 
 class SmokeCapacityTests(unittest.TestCase):
@@ -42,9 +26,9 @@ class SmokeCapacityTests(unittest.TestCase):
         with (mock.patch.object(mount_scale.platform, 'system', return_value='Linux'),
               # create=True: os.sched_getaffinity exists only on Linux, while the
               # test exercises the Linux branch from any controller OS.
-              mock.patch.object(mount_scale.os, 'sched_getaffinity', return_value={3},
+              mock.patch.object(mount_scale.os, 'sched_getaffinity', return_value={3, 4},
                                 create=True),
-              self.assertRaises(ValueError)):
+              self.assertRaisesRegex(ValueError, 'at least 2 usable')):
             mount_scale._validate(args)
 
 
@@ -57,9 +41,10 @@ class WorkerDataTests(unittest.TestCase):
             work.mkdir()
             (data / '.owner').write_text('another-volume')
             lifecycle = Lifecycle({'directory_smoke': True, 'data_root': str(data),
-                                   'work_dir': str(work), 'name': 'local', 'token': 'expected'})
+                                   'work_dir': str(work), 'name': 'local', 'token': 'expected'},
+                                  frozenset())
             with self.assertRaisesRegex(RuntimeError, 'same run sentinel'):
-                lifecycle.setup(repeat=1, clients=2, total_clients=2)
+                lifecycle.setup(repeat=1, active=2, idle_clients=0, total_clients=2)
             self.assertFalse((data / 'N2-R1').exists())
 
 

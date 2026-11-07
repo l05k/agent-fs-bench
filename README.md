@@ -59,7 +59,7 @@ Targets run sequentially. Working data goes to
 | `kvtest` | SQLite `kvtest` random BLOB overwrites, per-write or batched commits | [kvtest](docs/bench-kvtest-openclaw.md) |
 | `sqlite-speedtest` | SQLite `speedtest1 main` SQL phases | [sqlite-speedtest](docs/bench-sqlite-speedtest.md) |
 | `multi-host` | Concurrent private-tree ops and directory contention from several SSH hosts | [multi-host](docs/bench-multi-host-nas.md) |
-| `mount-scale` | N independent clients (local cores first, then SSH hosts); Open MPI mdtest and mount lifecycle | [mount scale](docs/bench-mount-scale.md) |
+| `mount-scale` | N clients on local cores or on H homogeneous SSH hosts (CPUs reserved per machine), optional mounted-only idle clients; Open MPI mdtest and mount lifecycle | [mount scale](docs/bench-mount-scale.md) |
 | `mdtest` | Single-client POSIX metadata throughput; process-count sweep | [mdtest](docs/bench-mdtest.md) |
 | `agent-replay` | Real Harbor/Docker tasks driven by accepted model-response cassettes | [agent replay](docs/bench-agent-replay.md) |
 
@@ -67,14 +67,14 @@ Targets run sequentially. Working data goes to
 uv run python -m agent_fs_bench run <command> --dirs /mnt/fs-a
 ```
 
-The only workload flags are `clone --smoke`, `mdtest --smoke` and
-`mount-scale --directory-smoke` (pass them after `--`). All other settings
+The only workload flags are `clone --smoke`, `mdtest --smoke`,
+`mount-scale --directory-smoke` and `mount-scale --idle-clients-per-host M` (pass them after `--`). All other settings
 (scale, repeats, concurrency, PRAGMAs, tool versions, paths) live in the `CONFIG`
 dict at the top of each module in `agent_fs_bench/benchmarks/`. Changing an
 experiment means editing `CONFIG`; the source fingerprint in each result records
 it. Keep private values out of commits.
 
-`multi-host` and `mount-scale` read SSH hosts from `local/hosts.toml` (see
+`multi-host` and `mount-scale` (in `remote` mode) read SSH hosts from `local/hosts.toml` (see
 `experiments/hosts.example.toml`). Their sync and measurement protocols differ, so
 do not combine their results. `mount-scale` also needs `local/mounts.toml`.
 

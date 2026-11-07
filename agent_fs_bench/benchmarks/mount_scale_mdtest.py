@@ -25,6 +25,9 @@ mdtest runs unchanged upstream 4.0.0: one global ``MPI_COMM_WORLD``, exactly one
 ``-d`` path per rank (mdtest rejects several paths with ``-S`` and without
 ``-u``), its own phase barriers, and its own rank CSV. Every rank accesses the
 same rank-independent ``mdtest.shared.<n>`` names through its own client alias.
+Shared jobs pass ``-R --random-seed=<seed>``: mdtest adds the rank to the seed,
+so each rank stats and reads the shared files in its own reproducible order
+instead of every client hitting the same inode in lockstep.
 Private phases precreate each rank's ``test-dir.0-0`` in the wrapper on the host
 that owns the workspace, because mdtest creates it only for ranks below
 ``path_count``; each rank then creates ``mdtest_tree.<rank>.0``.
@@ -32,8 +35,8 @@ that owns the workspace, because mdtest creates it only for ranks below
 Timing comes only from mdtest's rank CSV: the ``all`` row is the aggregate
 (maximum rank time including the phase-end barrier), each ``<rank>`` row is that
 rank's time before the barrier. Command wall time is never a metric and rates
-are never summed in Python. Only global rank 0 writes the CSV and mdtest's own
-output, so the controller staging log directory needs no shared mount.
+are never summed in Python. Only global rank 0 writes the CSV, on its own host;
+a caller whose rank 0 is remote supplies that host's CSV directory and a reader.
 """
 
 from __future__ import annotations
@@ -50,7 +53,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 _VERSION = '4.0.0'
 # Open MPI 4.1 is the only supported launcher: per-app --host slot budgets and
@@ -157,7 +160,8 @@ def _absolute(value: object, what: str) -> str:
 class Mdtest:
     """Run upstream mdtest 4.0.0 file phases and report their upstream timings."""
 
-    def __init__(self, binary: str, launcher: Sequence[str], timeout_s: float) -> None:
+    def __init__(self, binary: str, launcher: Sequence[str], timeout_s: float,
+                 shared_seed: int = 1) -> None:
         if isinstance(launcher, str):
             raise ValueError('launcher must be an argv sequence, not a string')
         self._launcher = tuple(str(part) for part in launcher)
@@ -168,7 +172,11 @@ class Mdtest:
         if (isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float))
                 or not timeout_s > 0.0):
             raise ValueError('timeout_s must be a positive number')
+        # mdtest treats seed 0 as "pick one from the clock".
+        if isinstance(shared_seed, bool) or not isinstance(shared_seed, int) or shared_seed < 1:
+            raise ValueError('shared_seed must be a positive integer')
         self._timeout_s = float(timeout_s)
+        self._shared_seed = shared_seed
         self._binary = _executable(binary)
         self._sha256 = _sha256(self._binary)
         self._launcher_name, self._launcher_version = self._probe_launcher()
@@ -206,7 +214,9 @@ class Mdtest:
             if items != files:
                 raise RuntimeError(f'mdtest prepared {items} items, expected {files}')
 
-    def warm(self, ranks: Sequence[Rank], files: int, size: int, log_dir: Path) -> None:
+    def warm(self, ranks: Sequence[Rank], files: int, size: int, log_dir: Path,
+             csv_dir: Path | None = None,
+             read: Callable[[Path], str] | None = None) -> None:
         """Stat and read every client alias once, outside measured rows."""
         values = self._ranks(ranks)
         directory = self._log_dir(
@@ -215,38 +225,31 @@ class Mdtest:
         for resource in range(len(values[0].shared)):
             items, _, _, _ = self._job(
                 f'warm-shared-{resource + 1}', values,
-                [self._shared(rank.shared[resource], files, size) for rank in values],
-                ('File stat', 'File read'), directory,
+                [self._shared(rank.shared[resource], files, size, self._shared_seed)
+                 for rank in values],
+                ('File stat', 'File read'), directory, csv_dir=csv_dir, read=read,
             )
             if items != files:
                 raise RuntimeError(f'mdtest warmed {items} items, expected {files}')
 
     def measure(self, ranks: Sequence[Rank], files: int, size: int,
-                log_dir: Path
+                log_dir: Path, csv_dir: Path | None = None,
+                read: Callable[[Path], str] | None = None,
                 ) -> tuple[list[Phase], dict[str, tuple[dict[str, Any], ...]]]:
-        """Return native phases and verified placements for every measured job."""
+        """Shared jobs first (right after warm-up), then the private job."""
         values = self._ranks(ranks)
         directory = self._log_dir(
             log_dir, [path for rank in values for path in (rank.workspace, *rank.shared)]
         )
-        items, times, per_rank, private_placement = self._job(
-            'private', values,
-            [self._private(rank.workspace, files, size) for rank in values],
-            _FILE_PHASES, directory, private=True,
-        )
-        if items != files:
-            raise RuntimeError(f'mdtest reported {items} items per task, expected {files}')
-        placements = {'private': private_placement}
-        phases = [
-            Phase(f'private/{label}', len(values) * files, times[name], per_rank[name])
-            for name, label in zip(_FILE_PHASES, ('create', 'stat', 'read', 'remove'))
-        ]
+        phases: list[Phase] = []
+        placements: dict[str, tuple[dict[str, Any], ...]] = {}
         # One resource at a time; every client alias is one rank of the same job.
         for resource in range(len(values[0].shared)):
             items, times, per_rank, shared_placement = self._job(
                 f'shared-{resource + 1}', values,
-                [self._shared(rank.shared[resource], files, size) for rank in values],
-                ('File stat', 'File read'), directory,
+                [self._shared(rank.shared[resource], files, size, self._shared_seed)
+                 for rank in values],
+                ('File stat', 'File read'), directory, csv_dir=csv_dir, read=read,
             )
             if items != files:
                 raise RuntimeError(
@@ -258,6 +261,18 @@ class Mdtest:
                       times[name], per_rank[name])
                 for name, label in (('File stat', 'stat'), ('File read', 'read'))
             ]
+        items, times, per_rank, private_placement = self._job(
+            'private', values,
+            [self._private(rank.workspace, files, size) for rank in values],
+            _FILE_PHASES, directory, csv_dir=csv_dir, read=read, private=True,
+        )
+        if items != files:
+            raise RuntimeError(f'mdtest reported {items} items per task, expected {files}')
+        placements['private'] = private_placement
+        phases += [
+            Phase(f'private/{label}', len(values) * files, times[name], per_rank[name])
+            for name, label in zip(_FILE_PHASES, ('create', 'stat', 'read', 'remove'))
+        ]
         return phases, placements
 
     def _probe_launcher(self) -> tuple[str, str]:
@@ -289,8 +304,9 @@ class Mdtest:
         return Path(self._launcher[0]).name, '.'.join(match.group(2, 3, 4))
 
     @staticmethod
-    def _shared(path: Path, files: int, size: int) -> tuple[str, ...]:
-        return ('-S', '-T', '-E', '-d', str(path), *_options(files, size))
+    def _shared(path: Path, files: int, size: int, seed: int) -> tuple[str, ...]:
+        return ('-S', '-T', '-E', '-R', f'--random-seed={seed}', '-d', str(path),
+                *_options(files, size))
 
     @staticmethod
     def _private(path: Path, files: int, size: int) -> tuple[str, ...]:
@@ -299,13 +315,18 @@ class Mdtest:
 
     def _job(self, label: str, ranks: Sequence[Rank],
              groups: Sequence[Sequence[str]], phases: Sequence[str],
-             log_dir: Path, *, private: bool = False
+             log_dir: Path, *, csv_dir: Path | None = None,
+             read: Callable[[Path], str] | None = None, private: bool = False
              ) -> tuple[int, dict[str, float], dict[str, list[float]],
                         tuple[dict[str, Any], ...]]:
-        """Run one global MPMD job and validate its placement and timings."""
+        """Run one global MPMD job and validate its placement and timings.
+
+        ``csv_dir`` is a directory on rank 0's host and ``read`` fetches a file
+        from there; both default to the controller-local ``log_dir``.
+        """
         if len(ranks) != len(groups):
             raise ValueError('every rank needs exactly one mdtest argument group')
-        csv_path = log_dir / f'{label}.csv'
+        csv_path = (log_dir if csv_dir is None else csv_dir) / f'{label}.csv'
         # The CSV path travels inside the appfile, which Open MPI splits on spaces.
         _plain(str(csv_path), 'rank CSV path')
         appfile = log_dir / f'{label}.appfile'
@@ -324,8 +345,13 @@ class Mdtest:
             )
         stdout = stdout_path.read_text()
         placement = self._proved(label, stdout, ranks)
+        if read is None:
+            csv_text = csv_path.read_text()
+        else:
+            csv_text = read(csv_path)
+            (log_dir / f'{label}.csv').write_text(csv_text)
         self._version, items, times, per_rank = self._parse(
-            label, stdout, csv_path, phases, len(ranks), self._nodes(ranks)
+            label, stdout, csv_text, phases, len(ranks), self._nodes(ranks)
         )
         return items, times, per_rank, placement
 
@@ -426,7 +452,7 @@ class Mdtest:
         return tuple(placements)
 
     @staticmethod
-    def _parse(label: str, stdout: str, csv_path: Path, phases: Sequence[str],
+    def _parse(label: str, stdout: str, csv_text: str, phases: Sequence[str],
                tasks: int, nodes: int = 1
                ) -> tuple[str, int, dict[str, float], dict[str, list[float]]]:
         match = _BANNER.search(stdout)
@@ -441,8 +467,7 @@ class Mdtest:
                 f'mdtest run {label} launched {launched} task(s) on {reported} node(s), '
                 f'expected {tasks} on {nodes}'
             )
-        rows = [line.split(',') for line in csv_path.read_text().splitlines()
-                if line.strip()]
+        rows = [line.split(',') for line in csv_text.splitlines() if line.strip()]
         if (len(rows) < 2 or rows[0] != _HEADER or rows[1][0] != 'all'
                 or len(rows[1]) != len(_HEADER)):
             raise RuntimeError(f'mdtest run {label} wrote an unexpected rank CSV')
@@ -521,11 +546,6 @@ class Mdtest:
             spaces[key] = index
         if len({len(rank.shared) for rank in values}) != 1:
             raise ValueError('every rank needs the same number of shared resources')
-        if values[0].host != 'localhost':
-            raise ValueError(
-                'rank 0 must be the controller (host "localhost"): only global rank 0 '
-                'writes the mdtest rank CSV that this process reads back'
-            )
         return values
 
     @staticmethod

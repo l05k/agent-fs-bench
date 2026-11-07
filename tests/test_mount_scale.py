@@ -109,11 +109,8 @@ all,32,,,,,,,,,,,4.9618383734e+04,1.2898445129e-03,1.1046726584e+06,5.7935714722
     BANNER = 'mdtest-4.0.0 was launched with 2 total task(s) on 1 node(s)\n'
 
     def parse(self, csv, banner=None, nodes=1):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'native.csv'
-            path.write_text(csv)
-            return Mdtest._parse('private', self.BANNER if banner is None else banner,
-                                 path, ('File creation',), 2, nodes)
+        return Mdtest._parse('private', self.BANNER if banner is None else banner,
+                             csv, ('File creation',), 2, nodes)
 
     def test_aggregate_uses_barrier_time_not_average_rank_time(self):
         _, items, times, ranks = self.parse(self.CSV)
