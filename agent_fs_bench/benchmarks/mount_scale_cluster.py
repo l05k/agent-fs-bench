@@ -1,4 +1,4 @@
-"""Local-first CPU placement and SSH workers for mount-scale lifecycle only.
+"""CPU reservation and local/SSH lifecycle workers for mount-scale.
 
 All file-operation timing belongs to the separate, global Open MPI mdtest job.
 Workers keep Layout/Sampler state; JSON replies and diagnostics use local staging,
@@ -8,7 +8,6 @@ never the measured volume. A failed command leaves mounts and data for inspectio
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -29,39 +28,21 @@ from .mount_scale_mounts import Client, Layout, load_profile
 from . import mount_scale_resources as resources
 
 
-@dataclass(frozen=True)
-class Allocation:
-    name: str
-    cpus: tuple[int, ...]
+def usable_cpus(cpus: list[int], reserved: int) -> tuple[list[int], list[int]]:
+    """Split an affinity set: ranks get the lowest ids, the highest ``reserved`` ids
+    stay free for filesystem daemons, kernel threads, MPI daemons and the sampler."""
+    ordered = sorted(cpus)
+    if not 0 <= reserved < len(ordered):
+        raise ValueError(f'reserving {reserved} of {len(ordered)} affinity CPUs '
+                         'must leave at least one CPU for ranks')
+    split = len(ordered) - reserved
+    return ordered[:split], ordered[split:]
 
 
-def allocate(capacities: list[tuple[str, list[int]]], clients: int | None) -> tuple[Allocation, ...]:
-    """Fill available CPUs in host order, without oversubscription or a sweep."""
-    if not capacities or any(not cpus or len(set(cpus)) != len(cpus)
-                             for _, cpus in capacities):
-        raise ValueError('every host needs a non-empty, unique CPU affinity set')
-    if len({name for name, _ in capacities}) != len(capacities):
-        raise ValueError('host names must be unique')
-    total = sum(len(cpus) for _, cpus in capacities)
-    count = total if clients is None else clients
-    if type(count) is not int or not 1 <= count <= total:
-        raise ValueError(f'clients must be between 1 and {total} available logical CPUs')
-    allocations = []
-    remaining = count
-    for name, cpus in capacities:
-        selected = tuple(sorted(cpus)[:remaining])
-        if selected:
-            allocations.append(Allocation(name, selected))
-            remaining -= len(selected)
-        if remaining == 0:
-            break
-    return tuple(allocations)
-
-
-def idle(seconds: float) -> dict[str, int | float]:
-    before = resources.snapshot()
+def idle(seconds: float, reserved: frozenset[int]) -> dict[str, int | float]:
+    before = resources.snapshot(reserved)
     time.sleep(seconds)
-    after = resources.snapshot()
+    after = resources.snapshot(reserved)
     return {**resources.levels(after), **resources.interval(before, after)}
 
 
@@ -167,6 +148,7 @@ if job['profile'] is not None:
         assert self.process.stdin is not None
         self.process.stdin.write(json.dumps({'action': action, **data}) + '\n')
         self.process.stdin.flush()
+        # Each client runs its K mount commands in sequence; clients run concurrently.
         steps = self.job['directories'] if action in ('mount', 'unmount') else 1
         return self._reply(self.timeout_s * steps)
 
@@ -205,23 +187,27 @@ def preflight(job: dict) -> dict:
     binary = _executable(job['mdtest'])
     version = subprocess.run([*job['mpi_launcher'], '--version'], text=True,
                              capture_output=True, check=True,
-                             timeout=job['command_timeout_s']).stdout.strip()
+                             timeout=job['mount_timeout_s']).stdout.strip()
     if 'Open MPI' not in version and 'OpenRTE' not in version:
         raise ValueError('mount-scale requires Open MPI')
-    return {'hostname': platform.node(), 'cpus': sorted(os.sched_getaffinity(0)),
+    cpus, reserved = usable_cpus(list(os.sched_getaffinity(0)), job['reserved_cpus'])
+    return {'hostname': platform.node(), 'cpus': cpus, 'reserved_cpus': reserved,
             'kernel': platform.release(), 'machine': platform.machine(),
             'binary': str(binary), 'mdtest_sha256': _sha256(binary),
             'mpi_version': version, 'python': sys.version.split()[0]}
 
 
 class Lifecycle:
-    def __init__(self, job: dict):
+    def __init__(self, job: dict, reserved: frozenset[int]):
         self.job = job
+        self.reserved = reserved
         self.profile = (None if job['directory_smoke'] else
                         load_profile(Path(job['profiles']), job['target']))
         self.data_root = Path(job['data_root'])
         self.logs = Path(job['work_dir']) / 'diagnostics' / job['name']
         self.logs.mkdir(parents=True, exist_ok=True)
+        # Global rank 0 writes mdtest's rank CSV here when it runs on this host.
+        (Path(job['work_dir']) / 'mdtest').mkdir(exist_ok=True)
         self.layout: Layout | None = None
         self.sampler: resources.Sampler | None = None
         self.private: Path | None = None
@@ -230,7 +216,8 @@ class Lifecycle:
     def command(self, request: dict) -> dict:
         action = request['action']
         if action == 'setup':
-            return self.setup(request['repeat'], request['clients'], request['total_clients'])
+            return self.setup(request['repeat'], request['active'], request['idle'],
+                              request['total_clients'])
         if action == 'mount':
             assert self.layout is not None
             result = self.layout.mount()
@@ -240,9 +227,9 @@ class Lifecycle:
             result = self.layout.unmount()
             return {**result, 'agent_elapsed_s': self.layout.unmount_agent_elapsed_s}
         if action == 'idle':
-            return idle(self.job['idle_sample_s'])
+            return idle(self.job['idle_sample_s'], self.reserved)
         if action == 'sample-start':
-            self.sampler = resources.Sampler(self.job['resource_sample_s'])
+            self.sampler = resources.Sampler(self.job['resource_sample_s'], self.reserved)
             self.sampler.__enter__()
             return {}
         if action == 'sample-stop':
@@ -257,6 +244,8 @@ class Lifecycle:
             shutil.rmtree(self.local)
             self.private = self.local = None
             return {}
+        if action == 'read':
+            return {'text': Path(request['path']).read_text()}
         if action == 'diagnostics':
             return {str(path.relative_to(self.logs)): path.read_text()
                     for path in self.logs.rglob('*.txt')}
@@ -268,7 +257,8 @@ class Lifecycle:
             return {}
         raise ValueError(f'unknown mount-scale worker action: {action}')
 
-    def setup(self, repeat: int, clients: int, total_clients: int) -> dict:
+    def setup(self, repeat: int, active: int, idle_clients: int, total_clients: int) -> dict:
+        """Create ``active`` measured clients plus ``idle_clients`` mounted-only ones."""
         if (self.data_root / '.owner').read_text() != self.job['token']:
             raise RuntimeError('admin views do not see the same run sentinel')
         name = f'N{total_clients}-R{repeat}'
@@ -281,19 +271,22 @@ class Lifecycle:
                        for i in range(1, self.job['directories']))
         self.private, self.local = private, local
         if self.profile is None:
+            if idle_clients:
+                raise ValueError('idle clients need a mount profile')
             values = []
-            for index in range(clients):
+            for index in range(active):
                 workspace = private / f'agent-{index:04d}' / 'workspace'
                 workspace.mkdir(parents=True)
                 values.append(Client(workspace, shared))
             self.layout = None
             aliases = tuple(values)
         else:
-            self.layout = Layout(self.profile, local, private, shared, clients,
+            # Measured clients are agents 0..active-1; the rest only stay mounted.
+            self.layout = Layout(self.profile, local, private, shared, active + idle_clients,
                                  log_dir=self.logs / name / 'lifecycle',
-                                 timeout_s=self.job['command_timeout_s'])
-            aliases = self.layout.clients
-        baseline = idle(self.job['idle_sample_s'])
+                                 timeout_s=self.job['mount_timeout_s'])
+            aliases = self.layout.clients[:active]
+        baseline = idle(self.job['idle_sample_s'], self.reserved)
         return {'clients': [{'workspace': str(client.workspace),
                              'shared': [str(p) for p in client.shared]} for client in aliases],
                 'baseline': baseline}
@@ -303,7 +296,7 @@ def worker_main() -> int:
     job = json.loads(sys.stdin.readline())
     try:
         info = preflight(job)
-        lifecycle = Lifecycle(job)
+        lifecycle = Lifecycle(job, frozenset(info['reserved_cpus']))
         print(json.dumps({'result': info}), flush=True)
         for line in sys.stdin:
             request = json.loads(line)
