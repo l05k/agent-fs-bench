@@ -24,7 +24,7 @@ private homes and logs live elsewhere.
 | `agent_fs_bench/benchmarks/npm_install.py` | stdlib workload module and `CONFIG`; `data/pnpm-bench*/` holds the fixture inputs |
 | `<target>/agent-fs-bench/npm-install/<run-id>/<manager>-c<C>-r<batch>/task-<i>/` | one worker's project |
 | `<prep-dir>/agent-fs-bench/npm-install/<run-id>/<target>/` | `sources/`, `seeds/`, `templates/`, `batches/.../task-<i>/{source,home,tmp,xdg,config,data}` |
-| `results/npm-install/<run-id>/{results.jsonl,summary.csv}` | raw rows and derived summary; logs: `results/npm-install/<run-id>/<target>/logs/` |
+| `results/npm-install/<run-id>/{manifest.json,batches.csv,tasks.csv}` | run manifest, batch rows and per-worker samples; logs: `results/npm-install/<run-id>/<target>/logs/` |
 
 Committed manifests and lockfiles are inputs, not result tables: a missing lockfile is an error,
 and the seed aborts if a manager rewrote its lockfile. Preparation is per run, exclusive and
@@ -88,11 +88,11 @@ CONFIG["concurrent_jobs"] = [1, 2, 4, 8, 16]   # concurrency sweep
 valid preparation filesystem. Targets run sequentially within one invocation, in the given order:
 rotate that order across independent invocations (each with a new run ID) so position does not
 become a systematic advantage, and keep CPU count, CPU model, mount options and the preparation
-filesystem fixed across comparisons; the JSONL records `cpu_count` and `prep_fstype`, not the
-machine itself. `runs = 10` is the default, and more independent batches give a steadier mean and
-dispersion — often 10–20 per manager × C, from one run or several aggregated by the summary. That
-range is a convenience, not a minimum: nothing here computes a percentile, and batch-to-batch
-variation is part of the result.
+filesystem fixed across comparisons; the manifest records `cpu_count` and the fstypes, not the
+machine itself. `runs = 10` is the default, and more independent batches give a steadier median and
+dispersion — often 10–20 per manager × C, from one run or pooled across runs. That range is a
+convenience, not a minimum: nothing here computes a percentile, and batch-to-batch variation is part
+of the result.
 
 ## Placement
 
@@ -119,9 +119,9 @@ so the device comparison runs against real `st_dev` values; the type lookup itse
 | `concurrency` | `4` | Pool width pinned inside each install; `0` keeps tool defaults. |
 | `concurrent_jobs` | `[1]` | External batch sizes: installs released together, one sample each. |
 
-`concurrent_jobs` is the experiment axis. Each value is a separate case (`npm/c1`, `npm/c2`, …);
-each batch of a case emits one row, so a row never mixes batch sizes. Batches are synchronized but
-independent: the parent prepares one project, one private source copy and one private
+`concurrent_jobs` is the experiment axis. Each value is its own `concurrent_jobs` value in
+`batches.csv`; each batch emits one row, so a row never mixes batch sizes. Batches are synchronized
+but independent: the parent prepares one project, one private source copy and one private
 `HOME`/`TMPDIR`/XDG set per worker, fsyncs the inputs, prereads each worker's source, then releases
 all workers through one barrier. Workers are separate Python processes, each timing its own child
 install and flush; none shares a cache, store, home or project.
@@ -174,15 +174,13 @@ drops its sync calls, so nothing in the benchmark forces the tree to stable
 storage. The check that a project lies inside the measured target is not a sync
 and stays unconditional.
 
-Rows carry only `install_mean_s`, `batch_install_s`, `installs_per_s`, `user_s`,
-`sys_s` and the tree inventory; `flush_*`, `durable_*` and
-`durable_installs_per_s` are absent, and `details.tasks[]` has no `flush_s` or
-`durable_s`. `parameters` records `flush` (`true` for `npm-install`, `false`
-here), and results live under `results/npm-install-nofsync/`. `install_s` still
-covers the whole command, including whatever the tool itself syncs; it ends at
-process exit, so it describes page-cache completion, not durability. Without the
-between-batch `os.sync()`, writeback from one batch may still be in flight when
-the next batch starts.
+`batches.csv` carries only `install_mean_s`, `batch_install_s`, `installs_per_s`, `user_s`,
+`sys_s` and the tree inventory; `flush_*`, `durable_*` and `durable_installs_per_s` are absent,
+and `tasks.csv` has no `flush_s` or `durable_s`. The manifest `config` records `flush` (`true` for
+`npm-install`, `false` here), and results live under `results/npm-install-nofsync/`. `install_s`
+still covers the whole command, including whatever the tool itself syncs; it ends at process exit,
+so it describes page-cache completion, not durability. Without the between-batch `os.sync()`,
+writeback from one batch may still be in flight when the next batch starts.
 
 ## pnpm import method
 
@@ -193,71 +191,62 @@ install. That prevents offload across sources but does not guarantee a physical 
 filesystem may still deduplicate or compress blocks — so `allocated_bytes` and `du_kib` describe what
 the tree occupies, not how much was written. npm always unpacks from its cache into new files.
 
-## Output
+## Tables
 
-One row per manager × C × batch; `case` is `npm/c1`, `pnpm/c2`, … and `repeat` is the batch index.
+Two flat CSV tables per run; `run` also writes `summary/batches.csv` and `summary/tasks.csv` with
+n and the median of each metric per target × manager × `concurrent_jobs` (both `repeat` and
+`sample` are pooled).
+
+| Table | Key columns | Metric columns |
+| --- | --- | --- |
+| `batches` | `target`, `manager`, `concurrent_jobs`, `repeat` | `install_mean_s`, `flush_mean_s`, `durable_mean_s`, `batch_install_s`, `batch_durable_s`, `installs_per_s`, `durable_installs_per_s`, `user_s`, `sys_s`, `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` |
+| `tasks` | `target`, `manager`, `concurrent_jobs`, `repeat`, `sample` | `install_s`, `flush_s`, `durable_s`, `user_s`, `sys_s`, `start_offset_s` |
+
+`repeat` is the 1-based batch index and `sample` the 1-based worker within the batch, so every
+worker's raw, unrounded sample is one `tasks` row. `npm-install-nofsync` emits the same tables
+without the flush and durable columns (`flush_mean_s`, `durable_mean_s`, `batch_durable_s`,
+`durable_installs_per_s`, `flush_s`, `durable_s`).
 
 | Metric | Meaning |
 | --- | --- |
 | `install_mean_s`, `flush_mean_s`, `durable_mean_s` | Mean `install_s`, `flush_s`, `durable_s` over the batch. |
 | `batch_install_s` / `batch_durable_s` | Wall time to the last exit / durability point: `max(start_offset_s + install_s)` / `max(start_offset_s + durable_s)`. |
 | `installs_per_s` / `durable_installs_per_s` | `C / batch_install_s` / `C / batch_durable_s`. |
-| `user_s`, `sys_s`, `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` | Summed child CPU time and summed tree inventory. |
+| `user_s`, `sys_s` | Summed child CPU time. |
+| `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` | Summed tree inventory. |
 
 `start_offset_s` is measured from the parent's last monotonic reading before the barrier releases
 the workers, so `batch_*_s` includes release skew instead of assuming a simultaneous start. Means
 describe one install, batch times describe the batch, and throughput is a batch quantity, never a
 per-install latency.
 
-`details` keeps raw per-worker samples, unrounded: `details.tasks[].task` (1-based), `install_s`,
-`flush_s`, `durable_s`, `user_s`, `sys_s`, `start_offset_s`; `details.target_fstype` records the
-target's type. `parameters` is experiment identity only: `fixture`, `concurrent_jobs` (this row's
-batch size), `concurrency`, `placement` (`"external-local"`), `prep_fstype`, `ignore_scripts`,
-`pnpm_import_method`, `pnpm_global_virtual_store`, `cache_state`
-(`"warm-source-empty-node_modules"`), `tool_versions` (manager and node), `seed_input_sha256`,
-`cpu_count`. Runs, manager selection, paths, device IDs and resolved executables are not stored, so
-the same experiment repeated in another run ID aggregates; a non-zero exit, missing tree, walk or
-fsync failure, or failed `du` aborts the run and emits no row for that batch.
+Discovered facts live in `manifest.json`: `targets[].info` holds `target_fstype`, `prep_fstype`,
+`cpu_count`, `tool_versions` per manager and `seed_input_sha256` of the committed template inputs;
+`targets[].path` holds the target directory, `run_id` the run, and `config` the run settings
+(`fixture`, `pm`, `runs`, `concurrency`, `concurrent_jobs`, `prep_dir`, `ignore_scripts`, `flush`,
+`keep_node_modules`, `seed_only`, executable names, version pins). Device IDs and resolved
+executable paths are not stored. `plot` pools repeated runs only when their configs and source
+fingerprints match; a non-zero exit, missing tree, walk or fsync failure, or failed `du` aborts the
+run and emits no row for that batch.
 
-## Analysis and plotting
+## Figures
 
-`summary.csv` (automatic after a successful run, or from `analyze`) groups by `benchmark × target ×
-case × metric × parameters × source_sha256`, so different configurations are never silently merged:
+`run` renders the default figures into `results/npm-install/<run-id>/figures/`, one file per
+manager; `python -m agent_fs_bench plot <run-dir>...` re-renders them.
 
-```text
-target,case,metric,samples,mean,median,minimum,maximum,stddev,benchmark,run_ids,parameters,source_sha256
-```
+| Figure | Table | X | Y |
+| --- | --- | --- | --- |
+| `batches-install_mean_s-<manager>` | `batches` | `concurrent_jobs` | `install_mean_s` |
+| `batches-durable_mean_s-<manager>` | `batches` | `concurrent_jobs` | `durable_mean_s` |
 
-`parameters` is the canonical minified JSON of the parameter object (sorted keys, no spaces), so a
-summary row can be pasted into a plot selector; `samples` counts rows, not installs — one batch
-contributes one sample per metric, and `details.tasks` holds the per-worker values. `plot` rejects
-ambiguity: all selected rows of one case must share one `(parameters, source_sha256)` identity,
-otherwise it fails and lists the identities it found. Different cases may differ — a C sweep does, by
-design. `--parameters '<json>'` keeps rows whose parameters canonicalise to exactly that object; key
-order does not matter, but it must be the complete recorded object (including `tool_versions`,
-`seed_input_sha256`, `cpu_count`). `--source-sha256 <hash>[,<hash>…]` keeps the listed fingerprints;
-both combine with `--cases`/`--targets`, which select and order the axes, and filtering happens first
-so an excluded target never triggers ambiguity. `metrics.parameters_canonical` lists identities
-without a plot.
-
-```sh
-PARAMS='<parameters column of the wanted summary.csv row>'
-uv run --group analysis python -m agent_fs_bench plot \
-  'results/npm-install/*/results.jsonl' \
-  --benchmark npm-install --metric durable_mean_s \
-  --cases npm/c1 --targets fs-a,fs-b \
-  --parameters "$PARAMS" --source-sha256 <hash> \
-  --ylabel 'Durable install (s)' --output results/npm-latency
-```
-
-**Recommended figures.** The existing grouped box plot suffices; no new plot mode is needed. For
-single-task latency, plot `install_mean_s` per manager at `--cases npm/c1` (then `pnpm/c1`) plus a
-second figure for `durable_mean_s`, keeping command time and durability apart. For concurrency, run
-`concurrent_jobs = [1, 2, 4, 8, 16]` with `concurrency = 4` and enough batches per case, then plot
-`--cases npm/c1,npm/c2,npm/c4,npm/c8,npm/c16` (and `pnpm/*`) with latency and throughput in separate
-figures, since one is per install and the other per batch; do not pass `--parameters` for such a
-sweep, as `concurrent_jobs` is part of the identity. This repository commits no generated plots and
-never invents data to fill one.
+Each point is the median over repeats with IQR error bars, the x axis is logarithmic, and the series
+is the target, so several targets of one run share a figure. `npm-install-nofsync` renders only the
+install-time figure. A concurrency sweep uses `concurrent_jobs = [1, 2, 4, 8, 16]` with enough
+`runs` per value; latency and throughput stay in separate figures because one is per install and the
+other per batch. A one-off figure comes from the same tables:
+`python -m agent_fs_bench plot results/npm-install/<run-id> --table batches --x concurrent_jobs
+--y installs_per_s --split manager --ylabel 'Installs/s'`. This repository commits no generated
+plots and never invents data to fill one.
 
 ## Notes
 

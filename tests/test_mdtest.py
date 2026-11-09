@@ -1,7 +1,9 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from agent_fs_bench.benchmarks import mdtest, mdtest_peak
 from agent_fs_bench.benchmarks.mdtest import (
     BenchmarkError,
     Case,
@@ -147,6 +149,22 @@ class WorkloadTests(unittest.TestCase):
             with self.subTest(report=report):
                 with self.assertRaises(BenchmarkError):
                     check_workload(report, Case('file', 'private', 4, 1), 128, self.log)
+
+
+class ParseArgsTests(unittest.TestCase):
+    """A typo or uneven split must fail before measuring, not run under a wrong label."""
+
+    def test_unknown_layout_subset_or_uneven_split_is_rejected(self):
+        for override in ({'layouts': ('Private',)}, {'subsets': ('files',)},
+                         {'conc_levels': (3,)}, {'total_items': 4, 'conc_levels': (4,)}):
+            with self.subTest(override=override), mock.patch.dict(mdtest.CONFIG, override), \
+                    self.assertRaises(BenchmarkError):
+                mdtest.parse_args([])
+
+    def test_peak_rejects_unknown_layout(self):
+        with mock.patch.dict(mdtest_peak.CONFIG, {'layouts': ('Private',)}), \
+                self.assertRaises(BenchmarkError):
+            mdtest_peak.parse_args([])
 
 
 if __name__ == '__main__':

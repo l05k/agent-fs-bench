@@ -1,5 +1,4 @@
 import argparse
-import io
 import json
 import os
 from pathlib import Path
@@ -12,9 +11,8 @@ from unittest import mock
 
 from agent_fs_bench.benchmarks import agent_replay
 from agent_fs_bench.benchmarks.agent_replay import fingerprint, load_cases, restore
-from agent_fs_bench.results import RunContext
+from agent_fs_bench.results import RunContext, Tables, read_table
 from agent_fs_bench.targets import Target
-
 
 class ReplayInputTests(unittest.TestCase):
     def setUp(self):
@@ -33,6 +31,35 @@ class ReplayInputTests(unittest.TestCase):
             '[[cases]]\nname = "task-a"\ntask = "task"\ncassette = "cassette"\n'
             '[[cases.mounts]]\nsource = "initial"\ncontainer = "/app"\n'
         )
+        self.replay_root = self.root / 'replay'
+        self.bin_dir = self.replay_root / '.venv' / 'bin'
+
+    def install_replay_environment(self):
+        (self.cassette / 'validation.json').write_text('{}')
+        (self.cassette / 'manifest.json').write_text('{"model": "openai/test"}')
+        for name in ('flows.mitm', 'commands.json', 'task.toml'):
+            (self.cassette / name).touch()
+        self.bin_dir.mkdir(parents=True)
+        (self.bin_dir / 'agent-mitm-replay').touch()
+        for name in ('pyproject.toml', 'uv.lock', 'uv.toml', '.python-version'):
+            (self.replay_root / name).touch()
+
+    def subprocess_run(self, summary=None):
+        real_run = subprocess.run
+
+        def run_command(command, **kwargs):
+            if command[0] == str(self.bin_dir / 'python'):
+                return subprocess.CompletedProcess(command, 0, stdout='{}')
+            if summary is not None and command[0] == str(self.bin_dir / 'agent-mitm-replay'):
+                output = Path(command[command.index('--output') + 1])
+                output.mkdir()
+                (output / 'summary.json').write_text(json.dumps(summary))
+                return subprocess.CompletedProcess(command, 0)
+            if command[0] == 'cp':
+                return real_run(command, **kwargs)
+            self.fail('replay started with incorrect initial data')
+
+        return run_command
 
     def test_unaccepted_cassette_cannot_become_a_performance_sample(self):
         with self.assertRaisesRegex(ValueError, 'validate cassette'):
@@ -93,25 +120,7 @@ class ReplayInputTests(unittest.TestCase):
         os.link(payload, self.source / 'hardlink')
         with self.config.open('a') as handle:
             handle.write('[[cases.mounts]]\nsource = "initial"\ncontainer = "/data"\n')
-        (self.cassette / 'validation.json').write_text('{}')
-        (self.cassette / 'manifest.json').write_text('{"model": "openai/test"}')
-        for name in ('flows.mitm', 'commands.json', 'task.toml'):
-            (self.cassette / name).touch()
-        replay_root = self.root / 'replay'
-        bin_dir = replay_root / '.venv' / 'bin'
-        bin_dir.mkdir(parents=True)
-        (bin_dir / 'agent-mitm-replay').touch()
-        for name in ('pyproject.toml', 'uv.lock', 'uv.toml', '.python-version'):
-            (replay_root / name).touch()
-        real_run = subprocess.run
-
-        def run_command(command, **kwargs):
-            if command[0] == str(bin_dir / 'python'):
-                return subprocess.CompletedProcess(command, 0, stdout='{}')
-            if command[0] == 'cp':
-                return real_run(command, **kwargs)
-            self.fail('replay started with incorrect initial data')
-
+        self.install_replay_environment()
         for corruption in ('mode', 'hardlink'):
             with self.subTest(corruption=corruption):
                 target = self.root / f'target-{corruption}'
@@ -119,9 +128,8 @@ class ReplayInputTests(unittest.TestCase):
                 work.mkdir(parents=True)
                 results = self.root / f'results-{corruption}'
                 results.mkdir()
-                output = io.StringIO()
                 ctx = RunContext('agent-replay', 'run', Target('fs', target),
-                                 work, results, {}, 'source', output)
+                                 work, results, Tables(results))
 
                 def restore_with_loss(source, destination):
                     restore(source, destination)
@@ -135,15 +143,47 @@ class ReplayInputTests(unittest.TestCase):
                             link.chmod(0o755)
 
                 with (
-                    mock.patch.object(agent_replay, 'REPLAY_ROOT', replay_root),
+                    mock.patch.object(agent_replay, 'REPLAY_ROOT', self.replay_root),
                     mock.patch.object(agent_replay, 'restore', side_effect=restore_with_loss),
-                    mock.patch.object(subprocess, 'run', side_effect=run_command),
+                    mock.patch.object(subprocess, 'run', side_effect=self.subprocess_run()),
                     self.assertRaisesRegex(RuntimeError, 'restored task data differs from source'),
                 ):
                     agent_replay.run(ctx, argparse.Namespace(cases_file=self.config, repeats=1))
-                self.assertEqual(output.getvalue(), '')
-                self.assertEqual(ctx.records, 0)
+                self.assertEqual(ctx.rows, 0)
+                self.assertEqual(list(results.glob('*.csv')), [])
 
+    def test_measured_replay_writes_tables_and_case_facts(self):
+        self.install_replay_environment()
+        summary = {'mode': 'replay', 'checked': False, 'measured': True,
+                   'elapsed_sec': 12.5, 'model_requests': 3,
+                   'phase_seconds': {'environment_setup': 1.5,
+                                     'agent_execution': 10.0, 'verifier': None}}
+        target = self.root / 'target'
+        work = target / 'work'
+        work.mkdir(parents=True)
+        results = self.root / 'results'
+        results.mkdir()
+        tables = Tables(results)
+        ctx = RunContext('agent-replay', 'run', Target('fs', target), work, results, tables)
+        with (
+            mock.patch.object(agent_replay.sys, 'platform', 'linux'),
+            mock.patch.object(agent_replay, 'REPLAY_ROOT', self.replay_root),
+            mock.patch.object(agent_replay, 'restore', side_effect=shutil.copytree),
+            mock.patch.object(subprocess, 'run', side_effect=self.subprocess_run(summary)),
+        ):
+            agent_replay.run(ctx, argparse.Namespace(cases_file=self.config, repeats=2))
+        tables.close()
+        replays = read_table(results / 'replays.csv')
+        self.assertEqual([(row['case'], row['repeat'], row['elapsed_s'], row['model_requests'])
+                          for row in replays],
+                         [('task-a', '1', '12.5', '3'), ('task-a', '2', '12.5', '3')])
+        phases = read_table(results / 'phases.csv')
+        self.assertEqual([(row['repeat'], row['phase'], row['seconds']) for row in phases],
+                         [('1', 'environment_setup', '1.5'), ('1', 'agent_execution', '10.0'),
+                          ('2', 'environment_setup', '1.5'), ('2', 'agent_execution', '10.0')])
+        self.assertEqual(ctx.rows, 6)
+        self.assertEqual(ctx.info['cases']['task-a']['model'], 'openai/test')
+        self.assertEqual(ctx.info['cases']['task-a']['mounts'][0]['container'], '/app')
 
 if __name__ == '__main__':
     unittest.main()

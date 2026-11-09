@@ -40,24 +40,13 @@ class Client:
 
 def load_profile(path: Path, target_name: str) -> Profile:
     """Read ``[profiles.<target_name>]`` from a private TOML file."""
-    try:
-        with path.open("rb") as handle:
-            profiles = tomllib.load(handle).get("profiles")
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise ValueError(f"cannot read profile {path}: {exc}") from exc
-    table = profiles.get(target_name) if isinstance(profiles, dict) else None
-    if not isinstance(table, dict):
-        raise ValueError(f"{path}: missing [profiles.{target_name}] table")
-    unknown = set(table) - {'topology', 'admin_root', 'private_mount', 'shared_mount', 'unmount'}
-    if unknown:
-        raise ValueError(f'{path}: unknown profile keys: {sorted(unknown)}')
-
-    topology = table.get("topology")
-    if not isinstance(topology, str) or topology not in _TOPOLOGIES:
+    with path.open("rb") as handle:
+        table = tomllib.load(handle)["profiles"][target_name]
+    topology = table["topology"]
+    if topology not in _TOPOLOGIES:
         raise ValueError(f"{path}: topology must be {MULTI_MOUNT} or {SHARED_DIRECTORY}")
-    admin_root = table.get("admin_root")
-    admin_root = Path(admin_root) if isinstance(admin_root, str) else None
-    if admin_root is None or not admin_root.is_absolute() or not admin_root.is_dir():
+    admin_root = Path(table["admin_root"])
+    if not admin_root.is_absolute() or not admin_root.is_dir():
         raise ValueError(f"{path}: admin_root must be an existing absolute directory")
 
     def command(key: str, required: bool) -> tuple[str, ...]:
@@ -65,12 +54,7 @@ def load_profile(path: Path, target_name: str) -> Profile:
             if required:
                 raise ValueError(f"{path}: profile is missing {key}")
             return ()
-        value = table[key]
-        if not isinstance(value, list) or not value or not all(
-            isinstance(token, str) and token for token in value
-        ):
-            raise ValueError(f"{path}: {key} must be a non-empty argv list")
-        return tuple(value)
+        return tuple(table[key])
 
     return Profile(
         topology=topology,
@@ -87,11 +71,8 @@ def _volume_path(path: Path, admin_root: Path) -> str:
 
 
 def _mount_points() -> dict[int, Path]:
-    try:
-        with open(_MOUNTINFO, encoding="utf-8") as handle:
-            lines = handle.readlines()
-    except OSError as exc:
-        raise RuntimeError(f"cannot read {_MOUNTINFO}: {exc}") from exc
+    with open(_MOUNTINFO, encoding="utf-8") as handle:
+        lines = handle.readlines()
     points = {}
     for line in lines:
         before, separator, _ = line.partition(" - ")
@@ -118,8 +99,6 @@ def _run(argv: list[str], log_path: Path, timeout_s: float) -> None:
         raise RuntimeError(
             f'command exceeded {timeout_s:g}s; inspect {log_path.parent}'
         ) from exc
-    except OSError as exc:
-        raise RuntimeError(f'cannot execute command: {exc}') from exc
     if completed.returncode:
         raise RuntimeError(
             f'command exited with status {completed.returncode}; '
@@ -141,15 +120,8 @@ class Layout:
         log_dir: Path,
         timeout_s: float,
     ) -> None:
-        if not isinstance(profile.topology, str) or profile.topology not in _TOPOLOGIES:
+        if profile.topology not in _TOPOLOGIES:
             raise ValueError(f"unsupported topology: {profile.topology!r}")
-        if (
-            type(clients) is not int or clients < 1
-            or not profile.private_mount or not profile.unmount
-        ):
-            raise ValueError("clients and mount commands must be valid")
-        if profile.topology == MULTI_MOUNT and not profile.shared_mount:
-            raise ValueError("shared_mount is required for multi-mount")
         shared = tuple(shared_paths)
         if (
             not work_dir.is_dir() or not data_root.is_dir()
@@ -319,10 +291,7 @@ class Layout:
 
     @staticmethod
     def _expand(template: Sequence[str], context: dict[str, object]) -> list[str]:
-        try:
-            return [token.format_map(context) for token in template]
-        except (AttributeError, KeyError, TypeError, ValueError, IndexError) as exc:
-            raise ValueError(f"cannot expand command template: {exc}") from None
+        return [token.format_map(context) for token in template]
 
     def _time(
         self, plans: Sequence[Sequence[list[str]]], action: str

@@ -1,10 +1,15 @@
 import argparse
+import contextlib
+import io
+import shlex
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import agent_fs_bench.benchmarks.clone as clone
 from agent_fs_bench.benchmarks.clone import (
     BenchmarkError,
     Copier,
@@ -17,6 +22,8 @@ from agent_fs_bench.benchmarks.clone import (
     validate_copier,
     verify_tree,
 )
+from agent_fs_bench.cli import run_benchmark
+from agent_fs_bench.results import RunContext, Tables, Target, read_table
 
 CP_R = Copier('cp-r', ('cp', '-r', '{src}', '{dst}'))
 CP_RL = Copier('cp-rl', ('cp', '-rl', '{src}', '{dst}'))
@@ -154,6 +161,27 @@ class WorkloadPlanTests(unittest.TestCase):
             self.assertEqual({spec.concurrency for spec in cases}, {1, 3, 5})
             self.assertEqual({(spec.files, spec.file_size) for spec in cases}, {shape})
 
+    def test_a_payload_that_does_not_divide_evenly_is_rejected(self):
+        # Flooring would measure a different total than the requested x value.
+        for args in (
+            argparse.Namespace(stage='bytes', byte_files=3, byte_totals=(1000,)),
+            argparse.Namespace(stage='concurrency', byte_files=3, concurrency_large_bytes=1000,
+                               concurrency_small_files=1, small_file_size=64, conc_levels=(1,)),
+        ):
+            with self.subTest(stage=args.stage), self.assertRaisesRegex(BenchmarkError, 'divisible'):
+                build_plan(args)
+
+    def test_copier_selection_fails_instead_of_measuring_nothing(self):
+        base = argparse.Namespace(target_copiers={'fs': []}, copiers=['cp-r'],
+                                  commands={'cp-r': 'cp -r {src} {dst}'})
+        with self.assertRaisesRegex(BenchmarkError, 'no copiers configured'):
+            clone.resolve_copiers(base, 'fs')
+        for commands in ({}, {'cp-r': 'not-an-installed-command-xyz {src} {dst}'}):
+            with self.subTest(commands=commands), self.assertRaisesRegex(
+                    BenchmarkError, 'no command configured|executable not found'):
+                clone.resolve_copiers(
+                    argparse.Namespace(target_copiers={}, copiers=['cp-r'], commands=commands), 'fs')
+
 
 class DatasetShapeTests(unittest.TestCase):
     def setUp(self):
@@ -182,6 +210,83 @@ class DatasetShapeTests(unittest.TestCase):
             sum(1 for size in inventories[0].values() if size is None),
             5,  # '.', three populated data directories, one empty directory
         )
+
+
+@unittest.skipUnless(shutil.which('cp'), 'cp is required for copier tests')
+class RunTablesTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.work = self.root / 'work'
+        self.work.mkdir()
+
+    def test_run_uses_target_copier_and_emits_batches_and_requests(self):
+        args = argparse.Namespace(**clone.CONFIG)
+        args.stage = 'bytes'
+        args.repeats = 1
+        args.byte_totals = (4096,)
+        args.byte_files = 1
+        args.copiers = ['cp-r']
+        args.target_copiers = {'fs': ['tree-copy']}
+        args.commands = {
+            'cp-r': 'cp -r {src} {dst}',
+            'tree-copy': shlex.join([
+                sys.executable, '-c',
+                'import shutil, sys; shutil.copytree(sys.argv[1], sys.argv[2])',
+                '{src}', '{dst}',
+            ]),
+        }
+        tables = Tables(self.root)
+        ctx = RunContext('clone', 'run', Target('fs', self.root), self.work,
+                         self.root / 'res', tables)
+        with mock.patch.object(clone, 'fstype', return_value='testfs'):
+            clone.run(ctx, args)
+        tables.close()
+
+        batches = read_table(self.root / 'batches.csv')
+        requests = read_table(self.root / 'requests.csv')
+        self.assertEqual([row['copier'] for row in batches], ['tree-copy'])
+        self.assertEqual([row['copier'] for row in requests], ['tree-copy'])
+        self.assertEqual(batches[0]['experiment'], 'bytes')
+        self.assertEqual(batches[0]['files'], '1')
+        self.assertEqual(batches[0]['file_size_bytes'], '4096')
+        self.assertEqual(batches[0]['total_bytes'], '4096')
+        self.assertEqual(requests[0]['sample'], '1')
+        self.assertEqual(ctx.info['fstype'], 'testfs')
+        self.assertEqual(list(ctx.info['copier_sha256']), ['tree-copy'])
+
+
+@unittest.skipUnless(shutil.which('cp'), 'cp is required for copier tests')
+class DefaultFigureTests(unittest.TestCase):
+    """A real clone run must feed every default sweep figure; specs skip silently otherwise."""
+
+    def test_every_sweep_renders_with_its_x_axis_and_target_copier_series(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dirs = [root / 'a', root / 'b']
+            for path in dirs:
+                path.mkdir()
+            with mock.patch.dict(clone.CONFIG, {
+                'repeats': 1, 'byte_totals': (8192, 16384), 'byte_files': 2,
+                'file_counts': (2, 4), 'small_file_size': 64, 'conc_levels': (1, 2),
+                'concurrency_large_bytes': 8192, 'concurrency_small_files': 4,
+            }), mock.patch.object(clone, 'fstype', return_value='testfs'), \
+                    mock.patch('agent_fs_bench.cli.RESULTS_DIR', root / 'results'), \
+                    mock.patch('agent_fs_bench.figure.render') as render, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                run_benchmark(['clone', '--dirs', *map(str, dirs)])
+        figures = {stem.name: (data['x'], data['series'], data['logx'], data['logy'])
+                   for data, stem in (call.args for call in render.call_args_list)}
+        series = ['a/cp-r', 'b/cp-r']
+        self.assertEqual(figures, {
+            'latency-bytes': ([8192 / clone.MIB, 16384 / clone.MIB], series, True, True),
+            'latency-files': ([2.0, 4.0], series, True, True),
+            'latency-concurrency-large': ([1.0, 2.0], series, True, True),
+            'latency-concurrency-small': ([1.0, 2.0], series, True, True),
+            'throughput-large': ([1.0, 2.0], series, True, False),
+            'throughput-small': ([1.0, 2.0], series, True, False),
+        })
 
 
 if __name__ == '__main__':

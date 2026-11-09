@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 
+from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
 from .build_settings import read_compiler_version
 
@@ -46,6 +47,11 @@ CONFIG = {
     "verbose": False,
     "linux_url": DEFAULT_LINUX_URL,
 }
+
+FIGURES = [
+    Figure("steps", "kind", "ms", kind="box", xlabel="Step kind",
+           ylabel="Duration (s)", yscale=1000, name="step-duration"),
+]
 
 CORE_COMMANDS = ("git", "bash", "make", "patch", "grep", "sed", "python3")
 KERNEL_COMMANDS = ("bc", "bison", "flex", "perl", "openssl")
@@ -165,21 +171,18 @@ def run_command(
 
     start = time.perf_counter_ns()
     isolated_group = True
-    try:
-        proc = subprocess.Popen(
-            argv,
-            cwd=cwd,
-            env=env,
-            stdin=stdin,
-            stdout=stdout,
-            stderr=stderr,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            start_new_session=isolated_group,
-        )
-    except OSError as exc:
-        raise WorkflowError(f"{what}: cannot start {argv[0]}: {exc}") from exc
+    proc = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        env=env,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=isolated_group,
+    )
 
     try:
         captured_stdout, captured_stderr = proc.communicate()
@@ -244,22 +247,14 @@ def git_text(
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise WorkflowError(f"cannot read fixture {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise WorkflowError(f"cannot parse fixture {path}: {exc}") from exc
+    value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise WorkflowError(f"fixture {path} must contain a JSON object")
     return value
 
 
 def load_commands(path: Path) -> list[str]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise WorkflowError(f"cannot read command file {path}: {exc}") from exc
+    lines = path.read_text(encoding="utf-8").splitlines()
 
     if "%%" in lines:
         commands: list[str] = []
@@ -283,6 +278,22 @@ def load_commands(path: Path) -> list[str]:
         if stripped and not stripped.startswith("#"):
             commands.append(stripped + "\n")
     return commands
+
+def fixture_hashes(fixture_dir: Path, names: set[str]) -> dict[str, str]:
+    hashes = {}
+    for name in sorted(names):
+        with (fixture_dir / name).open("rb") as stream:
+            hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+    return hashes
+
+def tool_versions(work_dir: Path) -> dict[str, str]:
+    return {
+        name: run_command(
+            [name, "--version"], cwd=work_dir,
+            what=f"reading {name} version", capture_stdout=True,
+        ).stdout.strip().splitlines()[0]
+        for name in ("git", "make")
+    }
 
 
 def require_linux() -> None:
@@ -634,13 +645,13 @@ def verify_tree(repo: Path, commit_id: str) -> dict[str, Any]:
 def run_workflow(
     ctx: RunContext,
     args: argparse.Namespace,
+    series: dict[str, Any],
 ) -> dict[str, Any]:
     repo = ctx.work_dir / "repo"
     fixture_dir = Path(args.fixture_dir).expanduser().absolute()
     series_path = fixture_dir / DEFAULT_SERIES
     config_path = fixture_dir / DEFAULT_CONFIG
 
-    series = validate_fixtures(fixture_dir)
     base_commit_expression = series["base_commit"]
     commits = series["commits"]
     commit_ids = [commit["id"] for commit in commits]
@@ -671,7 +682,7 @@ def run_workflow(
     jobs = args.jobs
 
     steps: list[dict[str, Any]] = []
-    assertions: list[dict[str, Any]] = []
+    tree_assertions: list[dict[str, Any]] = []
     cleanup_error: str | None = None
     cleanup_ms: int | None = None
     preparation_ms: int | None = None
@@ -680,6 +691,7 @@ def run_workflow(
     error: str | None = None
     timed_start: int | None = None
     checkout_ready = False
+    compiler_version: str | None = None
 
     try:
         begin_checkout_run(
@@ -701,17 +713,17 @@ def run_workflow(
             what="make tinyconfig",
             verbose=args.verbose,
         )
-        try:
-            shutil.copyfile(config_path, repo / ".config")
-        except OSError as exc:
-            raise WorkflowError(f"cannot install config fixture {config_path}: {exc}") from exc
+        shutil.copyfile(config_path, repo / ".config")
         run_command(
             ["make", "olddefconfig"],
             cwd=repo,
             what="make olddefconfig",
             verbose=args.verbose,
         )
-        steps.append({"step": "config: tinyconfig", "ms": elapsed_ms(config_start)})
+        steps.append({
+            "kind": "config", "name": "config", "commit": "",
+            "ms": elapsed_ms(config_start),
+        })
 
 
         initial = run_command(
@@ -720,7 +732,9 @@ def run_workflow(
             what="initial build",
             verbose=args.verbose,
         )
-        steps.append({"step": "initial-build: make", "ms": initial.ms})
+        steps.append({
+            "kind": "build", "name": "initial-build", "commit": "", "ms": initial.ms,
+        })
 
 
         for commit in commits:
@@ -745,22 +759,21 @@ def run_workflow(
                 category = phase.removesuffix("_commands")
                 load_start = time.perf_counter_ns()
                 loaded = load_commands(fixture_dir / filename)
-                steps.append(
-                    {
-                        "step": f"{category}-load: {commit_id}",
-                        "ms": elapsed_ms(load_start),
-                    }
-                )
-                for idx, command in enumerate(loaded, 1):
+                steps.append({
+                    "kind": "command", "name": f"{category}-load",
+                    "commit": commit_id, "ms": elapsed_ms(load_start),
+                })
+                for command in loaded:
                     result = run_shell(
                         command,
                         cwd=repo,
-                        what=f"{category} command for {commit_id} #{idx}",
+                        what=f"{category} command for {commit_id}",
                         verbose=args.verbose,
                     )
-                    steps.append(
-                        {"step": f"{category}: {commit_id} #{idx}", "ms": result.ms}
-                    )
+                    steps.append({
+                        "kind": "command", "name": category,
+                        "commit": commit_id, "ms": result.ms,
+                    })
 
             incremental = run_command(
                 ["make", f"-j{jobs}"],
@@ -768,9 +781,10 @@ def run_workflow(
                 what=f"incremental build for {commit_id}",
                 verbose=args.verbose,
             )
-            steps.append(
-                {"step": f"incremental-build: {commit_id}", "ms": incremental.ms}
-            )
+            steps.append({
+                "kind": "build", "name": "incremental-build",
+                "commit": commit_id, "ms": incremental.ms,
+            })
 
 
             status = run_git(
@@ -779,7 +793,9 @@ def run_workflow(
                 what=f"git status for {commit_id}",
                 verbose=args.verbose,
             )
-            steps.append({"step": f"git-status: {commit_id}", "ms": status.ms})
+            steps.append({
+                "kind": "git", "name": "status", "commit": commit_id, "ms": status.ms,
+            })
 
             diff = run_git(
                 repo,
@@ -787,7 +803,9 @@ def run_workflow(
                 what=f"git diff for {commit_id}",
                 verbose=args.verbose,
             )
-            steps.append({"step": f"git-diff: {commit_id}", "ms": diff.ms})
+            steps.append({
+                "kind": "git", "name": "diff", "commit": commit_id, "ms": diff.ms,
+            })
 
             add = run_git(
                 repo,
@@ -795,7 +813,9 @@ def run_workflow(
                 what=f"git add for {commit_id}",
                 verbose=args.verbose,
             )
-            steps.append({"step": f"git-add: {commit_id}", "ms": add.ms})
+            steps.append({
+                "kind": "git", "name": "add", "commit": commit_id, "ms": add.ms,
+            })
 
             commit_result = run_git(
                 repo,
@@ -812,13 +832,17 @@ def run_workflow(
                 what=f"git commit for {commit_id}",
                 verbose=args.verbose,
             )
-            steps.append({"step": f"git-commit: {commit_id}", "ms": commit_result.ms})
+            steps.append({
+                "kind": "git", "name": "commit", "commit": commit_id,
+                "ms": commit_result.ms,
+            })
 
             verify_start = time.perf_counter_ns()
-            assertions.append(verify_tree(repo, commit_id))
-            steps.append(
-                {"step": f"tree-verify: {commit_id}", "ms": elapsed_ms(verify_start)}
-            )
+            tree_assertions.append(verify_tree(repo, commit_id))
+            steps.append({
+                "kind": "verify", "name": "tree-verify", "commit": commit_id,
+                "ms": elapsed_ms(verify_start),
+            })
 
         success = True
     except WorkflowError as exc:
@@ -839,9 +863,7 @@ def run_workflow(
             workflow_ms = 0
         if success:
             try:
-                ctx.parameters.setdefault("tool_versions", {})["compiler"] = (
-                    read_compiler_version(repo)
-                )
+                compiler_version = read_compiler_version(repo)
             except (OSError, RuntimeError) as exc:
                 success = False
                 error = str(exc)
@@ -873,12 +895,13 @@ def run_workflow(
         "success": success,
         "error": error,
         "base_commit": base_commit,
+        "compiler_version": compiler_version,
         "elapsed_ms": workflow_ms,
         "preparation_ms": preparation_ms,
         "cleanup_ms": cleanup_ms,
         "unattributed_ms": unattributed_ms,
+        "tree_assertions": tree_assertions,
         "steps": steps,
-        "tree_assertions": assertions,
     }
 
 
@@ -895,35 +918,31 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
     require_linux()
-    if type(args.jobs) is not int or args.jobs < 1:
-        raise WorkflowError("jobs must be a positive integer")
     ensure_dependencies(require_fstype=bool(args.require_fstype))
     fixture_dir = Path(args.fixture_dir).expanduser().absolute()
     series = validate_fixtures(fixture_dir)
     names = {DEFAULT_SERIES, DEFAULT_CONFIG}
     for commit in series["commits"]:
         names.update(commit[key] for key in ("search_commands", "read_commands", "edit_commands"))
-    hashes = {}
-    for name in sorted(names):
-        with (fixture_dir / name).open("rb") as stream:
-            hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
-    tools = {}
-    for name in ("git", "make"):
-        tools[name] = run_command(
-            [name, "--version"], cwd=ctx.work_dir,
-            what=f"reading {name} version", capture_stdout=True,
-        ).stdout.strip().splitlines()[0]
-    ctx.parameters = {
+    ctx.info.update({
         "jobs": args.jobs,
-        "fixture_sha256": hashes,
-        "tool_versions": tools,
-    }
-    result = run_workflow(ctx, args)
-    ctx.parameters["base_commit"] = result.pop("base_commit")
+        "fixture_sha256": fixture_hashes(fixture_dir, names),
+        "tool_versions": tool_versions(ctx.work_dir),
+    })
+    result = run_workflow(ctx, args, series)
+    ctx.info["base_commit"] = result.pop("base_commit")
+    ctx.info["tree_assertions"] = result.pop("tree_assertions")
+    compiler = result.pop("compiler_version")
+    if compiler is not None:
+        ctx.info["tool_versions"]["compiler"] = compiler
     if not result.pop("success"):
         raise WorkflowError(result["error"] or "workflow failed")
     result.pop("error")
-    metrics = {key: result.pop(key) for key in (
+    ctx.emit("workflow", {}, {key: result.pop(key) for key in (
         "elapsed_ms", "preparation_ms", "cleanup_ms", "unattributed_ms"
-    )}
-    ctx.emit("workflow", metrics, details=result)
+    )})
+    for step, entry in enumerate(result.pop("steps"), 1):
+        ctx.emit("steps", {
+            "step": step, "name": entry["name"],
+            "kind": entry["kind"], "commit": entry["commit"],
+        }, {"ms": entry["ms"]})

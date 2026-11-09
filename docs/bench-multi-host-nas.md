@@ -55,8 +55,8 @@ is one executable name or absolute path, not a command with arguments.
 `ssh_args` contains individual OpenSSH argv tokens, not a shell string; include
 `-o` before each SSH option and `-i` before an identity path. Use an absolute
 identity path; a literal `~` inside TOML is not shell-expanded. Authentication
-must be noninteractive and SSH host keys must already be trusted. JSONL records
-only logical host names, not SSH addresses, users or transport arguments.
+must be noninteractive and SSH host keys must already be trusted. Result tables
+record only logical host names, not SSH addresses, users or transport arguments.
 
 ### Code configuration
 
@@ -82,18 +82,14 @@ deliberate experiment. Defaults are:
 | `run_timeout_s` | 1800 | worker alarm after GO; controller allows 60 extra seconds |
 | `keep_remote` | `False` | retain uploaded package and internal job files |
 
-All counts and timeouts must be positive and the boolean keys must be booleans;
-this is validated at run start. The former workload flags for every setting above
-are removed and rejected, with no compatibility path.
-
 ## Execution and safety
 
 1. Preflight every host over real SSH: require Linux, Python 3.12+, and a writable
    existing target directory. No sudo, mount utilities or remote checkout is needed.
 2. Upload the actual Python package and a JSON **input job**, using SSH stdin,
    under `<worker-dir>/<run-id>/<target-name>/<host-name>/`. The worker imports
-   shared package code; workers need no third-party Python dependency. The
-   controller needs DuckDB for the final CSV. Deployment uses a fresh directory with mode 0700.
+   shared package code; workers need no third-party Python dependency. Deployment
+   uses a fresh directory with mode 0700.
 3. Create the unique shared run directory on the first host:
    `<target>/agent-fs-bench/multi-host/<run-id>/`. Write a random owner sentinel;
    every host reads it and writes its own sentinel. Each worker must read all host
@@ -107,8 +103,9 @@ are removed and rejected, with no compatibility path.
    after every READY. There are **no per-round or per-phase barriers**: independent
    workers free-run after the original start gate.
 5. Collect the in-memory phase results over stdout, retain diagnostic logs locally,
-   remove deployed package/job directories unless requested otherwise, and emit
-   JSONL measurements. No raw result files are written to the shared filesystem.
+   remove deployed package/job directories unless requested otherwise, and append
+   rows to the `phases` and `latencies` tables. No raw result files are written to
+   the shared filesystem.
 
 The controller never creates the target path locally and never deletes the shared
 run root or target root. Targets and staging paths must be absolute non-root paths
@@ -168,25 +165,37 @@ result diagnostics. Clock synchronization is not required for the start gate.
 
 ## Results
 
-The common runner writes `results/multi-host/<run-id>/results.jsonl`. Each host,
-phase and round is a separate row: case `<host-name>/<phase>`, repeat = round.
-Numeric metrics are `ops`, `elapsed_s`, `ops_per_s`, `bytes`, `mib_per_s`,
-`p50_ms`, `p95_ms`, `p99_ms`, `max_ms`, and `mean_ms`. A failed target's multi-host
-workload emits no rows, but earlier successful targets may already have written
-JSONL; there is no always-zero error-count metric.
+The common runner writes `results/multi-host/<run-id>/manifest.json` and one CSV
+per record kind. Host and phase identity are columns, not case strings:
 
-`parameters` contains the workload sizes, rounds, fsync/read policy and logical
-host list. Host and phase identity are already in `case`; `details` retains
-**all per-operation `latencies_ns` samples** and the shared-sentinel check.
-No SSH settings, remote runtime/preflight dumps, paths, timestamps or stdout/stderr
-are copied into JSONL. Existing local `<host>.stdout.log` and `<host>.stderr.log`
-remain diagnostic attachments, not analysis inputs.
+| Table | Key columns | Metric columns |
+| --- | --- | --- |
+| `phases` | `host`, `phase`, `repeat` | `ops`, `elapsed_s`, `ops_per_s`, `bytes`, `mib_per_s`, `p50_ms`, `p95_ms`, `p99_ms`, `max_ms`, `mean_ms` |
+| `latencies` | `host`, `phase`, `repeat`, `sample` | `latency_ns` |
 
-The common runner derives `summary.csv` only after all selected targets succeed.
-Default summary/plot combines runs by benchmark, target alias, case and metric,
-with contributing IDs in CSV `run_ids`. Host cases remain separate; environment
-consistency is the operator's responsibility. If a later target fails, earlier
-rows remain in JSONL without an automatic CSV summary.
+`repeat` is the 1-based round and `sample` indexes one operation within a
+phase/round; `latencies` holds every per-operation sample. Percentiles in
+`phases` use sorted samples at `round((n - 1) * fraction)`. The shared-sentinel
+check gates READY and is not a result column. The manifest `config` holds the
+workload sizes, rounds, fsync/read policy and hosts file path; host names are
+already in the rows. No SSH settings, remote runtime/preflight dumps, paths,
+timestamps or stdout/stderr are copied into tables. Local `<host>.stdout.log` and
+`<host>.stderr.log` remain diagnostic attachments, not analysis inputs.
+
+Both tables pool over `repeat`/`sample` into `summary/<table>.csv`, which holds
+`n` and the median of each metric per target and remaining key columns (host,
+phase). Host rows remain separate; environment consistency is the operator's
+responsibility. A failed target's multi-host workload emits no
+rows; there is no always-zero error-count metric.
+
+Default figures in `figures/` split by phase and draw one box per host:
+
+| Figure stem | Table | x | y |
+| --- | --- | --- | --- |
+| `phases-throughput-<phase>` | `phases` | host | throughput (Kops/s) from `ops_per_s` |
+| `latencies-<phase>` | `latencies` | host | operation latency (ms) from `latency_ns`, log scale |
+
+Re-render with `uv run python -m agent_fs_bench plot results/multi-host/<run-id>`.
 
 Hosts free-run: summing their phase rates is not a synchronized server-wide
 throughput measurement, and averaging host percentiles is not a pooled percentile.
@@ -198,7 +207,7 @@ to measure spread.
 ## Smoke strategies
 
 A real local Linux SSH server with one host entry exercises upload, shared-package
-imports, sentinel setup, the READY/GO protocol, workload, JSONL and remote cleanup.
+imports, sentinel setup, the READY/GO protocol, workload, tables and remote cleanup.
 The defaults are a full-sized run, so set the smoke values in `CONFIG` first:
 `files_per_host = 8`, `file_size_bytes = 128`, `directories = 2`,
 `shared_files_per_host = 4`, `rounds = 2`, `cleanup_private = True`. Then run:
@@ -208,8 +217,8 @@ uv run python -m agent_fs_bench run multi-host --dirs /mnt/smoke-share
 ```
 
 Create `/mnt/smoke-share` externally first. With fsync/read enabled, expect 20
-rows per host, 8 private operations (except private fsync: 11), and 4 shared
-operations (except shared fsync: 5), with a matching number of latency samples.
+`phases` rows per host, 8 private operations (except private fsync: 11), and 4
+shared operations (except shared fsync: 5), plus one `latencies` row per operation.
 Two genuinely independent Linux hosts using an externally prepared common share
 are required to test cross-client contention and namespace visibility. A mismatched
 namespace should fail before any READY gate release and emit no measurement rows.
@@ -226,4 +235,4 @@ printf 'GO\n' | python3 -u -m agent_fs_bench.benchmarks.multi_host --worker --jo
 
 The internal worker emits READY then one RESULT_JSON protocol message, not a public
 result file. This isolated smoke does not test SSH, controller gates, deployment,
-JSONL collection or actual multi-client storage.
+table collection or actual multi-client storage.

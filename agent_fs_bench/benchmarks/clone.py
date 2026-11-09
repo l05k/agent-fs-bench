@@ -18,18 +18,42 @@ from pathlib import Path
 import re
 import shlex
 import shutil
-import statistics
 import subprocess
 import threading
 import time
 from typing import Any, Sequence
 
+from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import RunContext
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
 CHUNK = 4 * MIB
-CACHE_STATE = "source-preread-every-repeat"
+
+LATENCY = dict(series=("target", "copier"), logx=True, logy=True,
+               xlabel="Concurrency", ylabel="Clone latency (s)")
+FIGURES = [
+    Figure("requests", "total_bytes", "latency_s", where={"experiment": "bytes"},
+           series=("target", "copier"), xscale=MIB, logx=True, logy=True,
+           xlabel="Total bytes (MiB)", ylabel="Clone latency (s)", name="latency-bytes"),
+    Figure("requests", "files", "latency_s", where={"experiment": "files"},
+           series=("target", "copier"), logx=True, logy=True,
+           xlabel="Total files", ylabel="Clone latency (s)", name="latency-files"),
+    Figure("requests", "concurrency", "latency_s",
+           where={"experiment": "concurrency", "kind": "large"}, name="latency-concurrency-large",
+           **LATENCY),
+    Figure("requests", "concurrency", "latency_s",
+           where={"experiment": "concurrency", "kind": "small"}, name="latency-concurrency-small",
+           **LATENCY),
+    Figure("batches", "concurrency", "clones_s",
+           where={"experiment": "concurrency", "kind": "large"}, series=("target", "copier"),
+           logx=True, xlabel="Concurrency", ylabel="Throughput (clones/s)",
+           name="throughput-large"),
+    Figure("batches", "concurrency", "clones_s",
+           where={"experiment": "concurrency", "kind": "small"}, series=("target", "copier"),
+           logx=True, xlabel="Concurrency", ylabel="Throughput (clones/s)",
+           name="throughput-small"),
+]
 
 # Commands run without a shell. Only selected commands must be installed.
 # Example: target_copiers={"LakeBase": ["lakebase", "cp-r"]}; other targets
@@ -70,10 +94,6 @@ class Workload:
     @property
     def total_bytes(self) -> int:
         return self.files * self.file_size
-
-    @property
-    def case(self) -> str:
-        return f"{self.experiment}/N{self.files}_S{self.file_size}/C{self.concurrency}"
 
 
 @dataclass(frozen=True)
@@ -199,23 +219,18 @@ def warm_source(source: Path, expected_bytes: int) -> None:
 
 
 def resolve_copiers(args: argparse.Namespace, target_name: str) -> list[Copier]:
+    """Expand the selected copier names into executable argv templates."""
     names = args.target_copiers.get(target_name, args.copiers)
     if not names:
         raise BenchmarkError(f"no copiers configured for {target_name}")
     copiers = []
     for name in dict.fromkeys(names):
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
-            raise BenchmarkError(f"invalid copier name: {name!r}")
         if name not in args.commands:
             raise BenchmarkError(f"no command configured for copier {name!r}")
-        command = args.commands[name]
-        fields = set(re.findall(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", command))
-        if fields != {"src", "dst"}:
-            raise BenchmarkError(f"{name}: command must use only {{src}} and {{dst}} placeholders")
-        argv = shlex.split(command)
+        argv = shlex.split(args.commands[name])
         executable = shutil.which(argv[0]) if argv else None
         if executable is None:
-            raise BenchmarkError(f"{name}: executable not found: {argv[0] if argv else command}")
+            raise BenchmarkError(f"{name}: executable not found: {argv[0] if argv else ''}")
         copiers.append(Copier(name, (executable, *argv[1:])))
     return copiers
 
@@ -224,10 +239,7 @@ def copy_request(source: Path, destination: Path, copier: Copier) -> RequestResu
     """Copy one complete tree into an absent destination, including persistence."""
     command = [token.replace("{src}", str(source)).replace("{dst}", str(destination)) for token in copier.argv]
     started = time.perf_counter()
-    try:
-        subprocess.run(command, check=True)
-    except subprocess.CalledProcessError as error:
-        raise BenchmarkError(f"{copier.name} exited with status {error.returncode}: {shlex.join(command)}") from error
+    subprocess.run(command, check=True)
     copied_at = time.perf_counter()
     fsync_tree(destination)
     fsync_dir(destination.parent)
@@ -321,26 +333,28 @@ def build_plan(args: argparse.Namespace) -> list[Workload]:
             raise BenchmarkError("concurrency_large_bytes must be divisible by byte_files")
         for concurrency in args.conc_levels:
             plan.extend((
-                Workload("concurrency", "large", args.byte_files, args.concurrency_large_bytes // args.byte_files, concurrency),
-                Workload("concurrency", "small", args.concurrency_small_files, args.small_file_size, concurrency),
+                Workload("concurrency", "large", args.byte_files,
+                         args.concurrency_large_bytes // args.byte_files, concurrency),
+                Workload("concurrency", "small", args.concurrency_small_files,
+                         args.small_file_size, concurrency),
             ))
     return plan
 
 
-def run_case(ctx: RunContext, spec: Workload, args: argparse.Namespace, copiers: Sequence[Copier]) -> None:
+def run_workload(ctx: RunContext, spec: Workload, args: argparse.Namespace, copiers: Sequence[Copier]) -> None:
     scratch = ctx.work_dir / "scratch"
-    root = scratch / spec.case.replace("/", "_")
+    label = f"{spec.experiment}-{spec.kind}-{spec.files}-{spec.file_size}-{spec.concurrency}"
+    root = scratch / label
     source, destination_root = root / "source", root / "destinations"
     copies = spec.concurrency + 1
     entries = spec.files + (spec.files + args.files_per_dir - 1) // args.files_per_dir + 2
     need = copies * (spec.total_bytes + entries * 4096) + 256 * MIB
     if shutil.disk_usage(ctx.target.path).free < need:
-        raise BenchmarkError(f"{spec.case}: needs approximately {need / MIB:.0f} MiB free")
-    fs_type = fstype(ctx.target.path)
+        raise BenchmarkError(f"{label}: needs approximately {need / MIB:.0f} MiB free")
     root.mkdir()
     fsync_dir(scratch)
     try:
-        log(f"[{ctx.target.name}] generate {spec.case}: {spec.total_bytes / MIB:g} MiB per request")
+        log(f"[{ctx.target.name}] generate {label}: {spec.total_bytes / MIB:g} MiB per request")
         gen_dataset(spec, source, args.files_per_dir)
         inventory = tree_inventory(source)
         for repeat in range(1, args.repeats + 1):
@@ -352,61 +366,38 @@ def run_case(ctx: RunContext, spec: Workload, args: argparse.Namespace, copiers:
                 wall, results = copy_requests(source, destinations, copier)
                 for destination in destinations:
                     verify_tree(source, destination, inventory)
-                requests = [
-                    {"copy_s": result.copy_s, "fsync_s": result.fsync_s, "latency_s": result.latency_s}
-                    for result in results
-                ]
-                ctx.emit(
-                    spec.case,
-                    {
-                        "total_bytes": spec.total_bytes,
-                        "total_files": spec.files,
-                        "concurrency": spec.concurrency,
-                        "wall_s": wall,
-                        "clones_s": spec.concurrency / wall,
-                        **{metric: statistics.median(request[metric] for request in requests)
-                           for metric in ("latency_s", "copy_s", "fsync_s")},
-                    },
-                    repeat=repeat,
-                    details={
-                        "experiment": spec.experiment,
-                        "kind": spec.kind,
-                        "copier": copier.name,
-                        "fstype": fs_type,
-                        "requests": requests,
-                    },
-                )
-                log(f"[{ctx.target.name}/{copier.name}] {spec.case} rep{repeat}: "
+                keys = {
+                    "copier": copier.name,
+                    "experiment": spec.experiment,
+                    "kind": spec.kind,
+                    "files": spec.files,
+                    "file_size_bytes": spec.file_size,
+                    "total_bytes": spec.total_bytes,
+                    "concurrency": spec.concurrency,
+                    "repeat": repeat,
+                }
+                ctx.emit("batches", keys, {"wall_s": wall, "clones_s": spec.concurrency / wall})
+                for sample, result in enumerate(results, 1):
+                    ctx.emit("requests", {**keys, "sample": sample},
+                             {"copy_s": result.copy_s, "fsync_s": result.fsync_s,
+                              "latency_s": result.latency_s})
+                log(f"[{ctx.target.name}/{copier.name}] {label} rep{repeat}: "
                     f"batch={wall:.4f}s, {spec.concurrency / wall:.2f} clones/s")
     finally:
         if not args.keep_scratch:
             shutil.rmtree(root)
 
 
-def experiment_parameters(args: argparse.Namespace, copiers: Sequence[Copier]) -> dict[str, Any]:
-    names = [copier.name for copier in copiers]
-    hashes = {}
-    for copier in copiers:
-        with open(copier.argv[0], "rb") as handle:
-            hashes[copier.name] = hashlib.file_digest(handle, "sha256").hexdigest()
-    return {
-        **{key: getattr(args, key) for key in (
-            "stage", "smoke", "repeats", "byte_totals", "byte_files", "file_counts",
-            "small_file_size", "conc_levels", "concurrency_large_bytes",
-            "concurrency_small_files", "files_per_dir",
-        )},
-        "copiers": names,
-        "commands": {name: args.commands[name] for name in names},
-        "cache_state": CACHE_STATE,
-        "completion": "copy+fsync-tree+fsync-parent",
-        "executable_sha256": hashes,
-    }
+def executable_sha256(path: str) -> str:
+    with open(path, "rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
     copiers = resolve_copiers(args, ctx.target.name)
     plan = build_plan(args)
-    ctx.parameters = experiment_parameters(args, copiers)
+    ctx.info["fstype"] = fstype(ctx.target.path)
+    ctx.info["copier_sha256"] = {copier.name: executable_sha256(copier.argv[0]) for copier in copiers}
     scratch = ctx.work_dir / "scratch"
     scratch.mkdir()
     # Persist the run namespace prepared by the shared runner before any timing.
@@ -420,7 +411,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     for copier in copiers:
         validate_copier(copier, scratch)
     for spec in plan:
-        run_case(ctx, spec, args, copiers)
+        run_workload(ctx, spec, args, copiers)
     if not args.keep_scratch:
         scratch.rmdir()
 
@@ -437,13 +428,4 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             concurrency_large_bytes=4 * MIB, concurrency_small_files=32,
         )
     args = argparse.Namespace(**settings, **vars(parsed))
-    if args.stage not in ("all", "bytes", "files", "concurrency"):
-        raise BenchmarkError("stage must be all, bytes, files or concurrency")
-    for name in ("repeats", "byte_files", "small_file_size", "concurrency_large_bytes", "concurrency_small_files", "files_per_dir"):
-        if getattr(args, name) < 1:
-            raise BenchmarkError(f"{name} must be positive")
-    for name in ("byte_totals", "file_counts", "conc_levels"):
-        values = getattr(args, name)
-        if not values or any(value < 1 for value in values) or len(set(values)) != len(values):
-            raise BenchmarkError(f"{name} must contain distinct positive values")
     return args

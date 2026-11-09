@@ -32,6 +32,7 @@ import shutil
 import subprocess
 from typing import Any, Sequence
 
+from agent_fs_bench.analysis import Figure
 from agent_fs_bench.benchmarks.mdtest import (
     MDTEST_VERSION, BenchmarkError, Case, check_banner, check_workload, log,
     read_phases, unexpected_warnings,
@@ -58,6 +59,13 @@ CONFIG: dict[str, Any] = {
 OPERATION_NAMES = {"file-create": "file-create", "file-stat": "file-stat",
                    "file-open": "file-read", "file-unlink": "file-unlink"}
 DATA_OPERATIONS = ("file-create", "file-read")
+
+FIGURES = [
+    Figure('phases', 'procs', 'ops_per_s', split=('operation', 'layout', 'file_size_bytes'),
+           xlabel='Client processes', ylabel='Throughput (Kops/s)', yscale=1000, logx=True),
+    Figure('phases', 'procs', 'mib_per_s', split=('operation', 'layout', 'file_size_bytes'),
+           xlabel='Client processes', ylabel='Bandwidth (MiB/s)', logx=True),
+]
 
 
 def available_cpus() -> int:
@@ -110,17 +118,22 @@ def run_case(ctx: RunContext, args: argparse.Namespace, layout: str,
     summary = []
     for phase, ops, elapsed, rate in read_phases(csv_path, "file", total):
         operation = OPERATION_NAMES[phase]
-        metrics = {"concurrency": concurrency, "ops": ops, "elapsed_s": elapsed, "ops_per_s": rate}
-        if size and operation in DATA_OPERATIONS:
-            metrics["bytes"] = ops * size
-            metrics["mib_per_s"] = ops * size / MIB / elapsed
+        mib_per_s = (ops * size / MIB / elapsed
+                     if size and operation in DATA_OPERATIONS else None)
         ctx.emit(
-            f"{operation}/{layout}/S{size}/n{items}/P{concurrency}", metrics, repeat=repeat,
-            details={"operation": operation, "layout": layout,
-                     "file_size_bytes": size, "items_per_proc": items},
+            "phases",
+            {
+                "operation": operation,
+                "layout": layout,
+                "procs": concurrency,
+                "repeat": repeat,
+                "file_size_bytes": size,
+                "items_per_proc": items,
+            },
+            {"ops": ops, "elapsed_s": elapsed, "ops_per_s": rate, "mib_per_s": mib_per_s},
         )
         summary.append(f"{operation} {rate:.0f} ops/s"
-                       + (f" {metrics['mib_per_s']:.1f} MiB/s" if "mib_per_s" in metrics else ""))
+                       + (f" {mib_per_s:.1f} MiB/s" if mib_per_s is not None else ""))
     log(f"[{ctx.target.name}] {name}: " + ", ".join(summary))
     shutil.rmtree(directory)
     csv_path.unlink()
@@ -135,14 +148,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         raise BenchmarkError(f"MPI launcher not found: {CONFIG['mpi_command'][0]}")
     with Path(args.mdtest_bin).open("rb") as binary:
         executable_sha256 = hashlib.file_digest(binary, "sha256").hexdigest()
-    ctx.parameters.clear()
-    ctx.parameters.update(
-        items_per_proc={str(size): items for size, items in args.items_per_proc.items()},
-        conc_levels=list(args.conc_levels),
-        client_cpus=args.client_cpus,
-        layouts=list(args.layouts),
-        repeats=args.repeats,
-        smoke=args.smoke,
+    ctx.info.update(
         mdtest_version=MDTEST_VERSION,
         cache_state=CACHE_STATE,
         completion=COMPLETION,
@@ -171,10 +177,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         settings.update(items_per_proc={size: 16 for size in CONFIG["items_per_proc"]},
                         conc_levels=(1, 2), repeats=1)
     args = argparse.Namespace(**settings, **vars(parsed))
-    if args.repeats < 1 or not args.conc_levels or min(args.conc_levels) < 1:
-        raise BenchmarkError("repeats and process counts must be positive")
-    if not args.items_per_proc or min(args.items_per_proc.values()) < 2 or min(args.items_per_proc) < 0:
-        raise BenchmarkError("items_per_proc needs sizes >= 0 with at least two files per process")
-    if not args.layouts or set(args.layouts) - {"private", "shared"}:
-        raise BenchmarkError("layouts must select private and/or shared")
+    if (args.repeats < 1 or not args.layouts or not args.conc_levels
+            or not args.items_per_proc or set(args.layouts) - {"private", "shared"}):
+        raise BenchmarkError("layouts must be private and/or shared, with a non-empty "
+                             "process and size selection")
     return args

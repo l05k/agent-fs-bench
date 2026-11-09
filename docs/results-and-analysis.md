@@ -1,128 +1,99 @@
-# Results, analysis and plots
+# Results, summaries and figures
 
 ## Layout
 
 ```text
 results/<bench>/<run-id>/
-  results.jsonl   # the only raw data
-  summary.csv     # derived; regenerate any time
-  <target>/       # optional per-target diagnostics
+  manifest.json        # run-level facts
+  <table>.csv          # one row per measurement or raw sample
+  summary/<table>.csv  # derived: n and medians per target × dimensions
+  figures/             # derived: default figures (.pdf, .png, .py)
+  <target>/            # optional per-target diagnostics and logs
 ```
 
-`results.jsonl` is self-contained: analysis needs no mounts, logs or work
-directories. Results are written outside timed regions. A failed check emits no
-successful measurement.
+Each workload doc lists its tables and default figures. Rows are appended and
+flushed one at a time outside timed regions, so a crash keeps every completed
+measurement. A failed check emits no row.
 
-## JSONL rows
-
-Usually one row per case × repeat. Exceptions:
-
-- dev-workflow / mini-dev-workflow: a full workflow is one row; steps are in `details`.
-- multi-host: rows split by host / phase / round.
-- npm-install: one row per manager × concurrency batch (`case` like `npm/c1`,
-  `pnpm/c2`); metrics aggregate the batch, per-worker samples are in `details.tasks`.
+## manifest.json
 
 | Field | Meaning |
 | --- | --- |
 | `benchmark`, `run_id` | Workload; UTC run ID with microseconds |
-| `target.name`, `target.path` | Target alias and actual directory |
-| `case`, `repeat` | Case and repeat index |
-| `parameters` | Workload parameters, tool versions, input/binary fingerprints |
-| `source_sha256` | Fingerprint of benchmark source and fixed inputs |
-| `metrics` | Flat numeric metrics; names carry units |
-| `details` | Workload-specific values, checks, steps, raw samples |
+| `source_sha256` | Fingerprint of benchmark sources and fixed inputs, including uncommitted edits; each workload's `CONFIG` literal is excluded because `config` records it |
+| `config` | The workload's settings: `CONFIG` plus workload flags |
+| `targets[]` | `name`, `path` and `info` (tool versions, binary hashes, fstype, ...) of each finished target |
+| `tables` | `keys` and `metrics` columns of each table |
 
-## summary.csv
+The manifest is rewritten after each target. A failed target is absent; its
+partial rows stay in the CSV.
 
-Written automatically once all targets succeed and the JSONL is closed. If a later
-target fails, earlier rows stay in JSONL but no summary is written; those rows are
-not a complete experiment.
+## Tables
 
-```text
-target,case,metric,samples,mean,median,minimum,maximum,stddev,benchmark,run_ids,parameters,source_sha256
-```
+Columns are `target`, then key columns, then metric columns (numbers whose names
+carry units). Key columns are dimensions (such as `operation` or `procs`) plus
+the pooled keys `repeat` (1-based repetition) and `sample` (index of one raw
+sample within a measurement, e.g. a request or a worker). An empty cell means
+the metric does not apply to that row. Booleans are `0`/`1`.
 
-Each row aggregates `benchmark × target × case × metric × parameters ×
-source_sha256`. For clone, `target` is `target.name/copier`, separating native
-clone from `cp-r` on one filesystem. `parameters` is canonical JSON (keys sorted
-recursively, no whitespace). Because `parameters` and `source_sha256` are grouping
-keys, different configs or source versions never merge silently, while repeats of
-the same experiment across run IDs do. `run_ids` lists the contributing runs,
-sorted and `;`-separated. Use JSONL, not CSV, for per-operation percentiles,
-outliers or step analysis.
+## summary/
 
-## analyze
-
-DuckDB query over any JSONL files. Views: `measurements` (nested JSON) and
-`metrics` (numeric long table with `parameters_canonical`).
-
-```sh
-# Default summary to stdout; quote globs
-uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl'
-
-# Regenerate one run's summary
-uv run python -m agent_fs_bench analyze 'results/clone/<run-id>/results.jsonl' \
-  --output 'results/clone/<run-id>/summary.csv'
-
-# Rebuild a disposable DuckDB database
-uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl' \
-  --database results/analysis.duckdb
-
-# List config identities per case, for plot selectors
-uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl' \
-  --sql 'SELECT DISTINCT benchmark, "case", parameters_canonical, source_sha256 FROM metrics ORDER BY 1,2'
-```
+Written once all targets succeed. For each table with a `repeat` or `sample`
+column: one row per target × dimensions with `n` (pooled rows) and the median of
+each metric (6 significant digits). Compute other statistics from the tables.
 
 ## plot
 
-Requires `uv sync --locked --group analysis`. Writes `<stem>.pdf`, a 600-dpi
-`<stem>.png`, and a self-contained `<stem>.py` with embedded data.
+`run` renders the workload's default figures (`FIGURES` in its module) into
+`figures/` after the last target. Re-render them, pool runs, or draw a custom
+figure:
 
 ```sh
-# Grouped box plot
-uv run --group analysis python -m agent_fs_bench plot 'results/clone/*/results.jsonl' \
-  --benchmark clone --metric mib_s --ylabel 'Throughput (MiB/s)' \
-  --cases L256M/C1/cp,L1G/C1/cp --targets ours,ext4,nfs --output results/clone
+# Default figures again, primary system first in the legend
+uv run python -m agent_fs_bench plot results/mdtest/<run-id> --targets ours,nfs,ext4
 
-# Select one config identity
-PARAMS='<parameters column from summary.csv>'
-uv run --group analysis python -m agent_fs_bench plot 'results/npm-install/*/results.jsonl' \
-  --benchmark npm-install --metric durable_mean_s --cases npm/c1 --targets fs-a,fs-b \
-  --parameters "$PARAMS" --source-sha256 <hash> \
-  --ylabel 'Durable install (s)' --output results/npm-latency
+# Pool repeated runs; their configs and source fingerprints must match
+uv run python -m agent_fs_bench plot results/mdtest/<run-a> results/mdtest/<run-b> \
+  --output figures/mdtest
 
-# mdtest: one median/IQR curve per operation and layout, x = process count
-uv run --group analysis python -m agent_fs_bench plot 'results/mdtest/<run-id>/results.jsonl' \
-  --benchmark mdtest --metric ops_per_s --targets ours,nfs,ext4 --output results/mdtest-metadata
+# One mount-scale run per client count: let `clients` differ to draw the curve
+uv run python -m agent_fs_bench plot results/mount-scale/<run-n64> results/mount-scale/<run-n256> \
+  --vary clients --output figures/mount-scale
+
+# Custom figure: one per operation, private layout only, in Kops/s
+uv run python -m agent_fs_bench plot results/mdtest/<run-id> --table phases \
+  --x procs --y ops_per_s --split operation --where layout=private --yscale 1000 \
+  --logx --xlabel 'Client processes' --ylabel 'Throughput (Kops/s)' --name private
 ```
 
-Plot kinds:
+- `--kind line` (default): median with IQR error bars over all pooled rows at
+  each numeric x. `--kind box`: one box per x category, in first-appearance order.
+- `--series` (default `target`): columns joined with `/` as legend labels, at
+  most 4 per figure.
+- `--targets`: legend order and filter; each entry is a target (all its series)
+  or a full series label such as `LakeBase/cp-r`. A name matching nothing is an
+  error. Default: target run order.
+- `--split`: one figure per value combination, titled in the upper-left corner,
+  file `<name>-<values>` (punctuation in values becomes `_`).
+- `--where COLUMN=VALUE` (repeatable): exact match on the CSV text.
+- `--xscale`/`--yscale` divide values (`1048576` for MiB); `--logx`/`--logy`;
+  `--size W H` in inches (default single column `3.5 1.5`).
 
-- **Default:** box plot per target × case, pooling samples across runs.
-- **clone:** line plots over a numeric x axis, one series per `target/copier`,
-  showing median and IQR of raw request samples. It writes `<stem>-bytes`,
-  `<stem>-files`, `<stem>-concurrency-large` and `<stem>-concurrency-small` for
-  the sweeps present in the input.
-- **mdtest:** one figure per operation and layout, e.g.
-  `<stem>-file-create-private.pdf`; y axis in Kops/s. Selected targets must cover
-  the same process counts. These are throughput samples, not per-op latency.
-- **mdtest-peak:** same curves, one per operation, layout and file size
-  (`<stem>-file-read-private-S1048576.pdf`); `--metric ops_per_s` (Kops/s) or
-  `--metric mib_per_s` (MiB/s, create/read with non-empty files only).
+Runs pool only when their `benchmark` and `source_sha256` match and their
+`config` matches apart from keys given to `--vary`; otherwise `plot` names what
+differs. Vary a key only when the figure keeps those runs apart as x, series or
+split. Each figure writes
+`<stem>.pdf`, a 600-dpi
+`<stem>.png` and a self-contained `<stem>.py` with embedded data; `python
+<stem>.py` regenerates both images. Style follows
+`.agents/skills/paper-figure-style/SKILL.md` (Arial 9 pt, vector PDF),
+implemented in `agent_fs_bench/figure.py`. Plotting fails if Arial is missing.
 
-Every box, line or curve accepts exactly one `(parameters, source_sha256)`
-identity. If a selection mixes identities, `plot` fails and lists the
-candidates. Narrow with:
+## Queries
 
-- `--parameters '<json>'`: exact match against the full canonical object (key
-  order and whitespace ignored, no partial match).
-- `--source-sha256 <hash>[,<hash>…]`.
+There is no built-in query layer; DuckDB, pandas or a spreadsheet read the CSVs
+directly:
 
-Selectors apply before `--cases`/`--targets`. Different cases may carry different
-configs.
-
-`--targets` sets legend order; the first is the primary system. `--cases` sets
-x-axis order and filters (clone sweeps stay sorted numerically). `--size` defaults
-to single-column `3.5 1.5` inches. Style follows
-`.agents/skills/paper-figure-style/SKILL.md` (Arial 9 pt, vector PDF); the
-implementation is in `agent_fs_bench/figure.py`. Plotting fails if Arial is missing.
+```sh
+duckdb -c "SELECT target, procs, median(ops_per_s) FROM 'results/mdtest/*/phases.csv' GROUP BY ALL"
+```

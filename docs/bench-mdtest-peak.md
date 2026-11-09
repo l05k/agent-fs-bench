@@ -40,26 +40,30 @@ Each launch is `mdtest -a POSIX -F -i 1 -n <n> -w S -e S -y [-u]`:
 
 ## Results
 
-Case names look like `file-read/shared/S65536/n2048/P64`. Metrics:
+Each run writes one flat CSV per record kind plus a `manifest.json`:
+
+| Table | Key columns | Metric columns |
+| --- | --- | --- |
+| `phases` | `operation`, `layout`, `procs`, `repeat`, `file_size_bytes`, `items_per_proc` | `ops`, `elapsed_s`, `ops_per_s`, `mib_per_s` |
 
 | Metric | Definition |
 | --- | --- |
 | `ops` | n×P, checked against mdtest's own `P tasks, n×P files` report |
 | `elapsed_s` | Aggregate `all`-row phase time from the CSV: max over ranks, including the end barrier |
 | `ops_per_s` | ops / elapsed_s |
-| `bytes`, `mib_per_s` | create/read with S>0 only: ops×S and ops×S / MiB / elapsed_s (logical bytes) |
+| `mib_per_s` | create/read with S>0 only: ops×S / MiB / elapsed_s (logical bytes); empty elsewhere |
 
-Timing, validation and the IOR 4.0.0 CSV item-count caveat are identical to [`mdtest`](bench-mdtest.md#timing-and-results). Launch checks and helpers are shared with that module. `parameters.client_cpus` records the CPU count the sweep was derived from.
+`run` also writes `summary/phases.csv` (n and the median of each metric per target and dimension). Timing, validation and the IOR 4.0.0 CSV item-count caveat are identical to [`mdtest`](bench-mdtest.md#timing-and-results). Launch checks and helpers are shared with that module. The client CPU count the sweep was derived from is in the manifest config.
 
-## Figures
+## Default figures
+
+`run` renders one figure per operation, layout and size for both metrics, e.g. `figures/phases-ops_per_s-file_read-private-1048576.pdf` and `figures/phases-mib_per_s-file_read-private-1048576.pdf` (punctuation in split values becomes `_`), plus standalone Python scripts with the raw samples. X is the process count (log scale). Y is Kops/s or MiB/s, with the median/IQR over repeats. Bandwidth figures only contain rows that have a bandwidth value, so `mib_per_s` appears for create/read with S>0.
 
 ```sh
-uv run --group analysis python -m agent_fs_bench plot 'results/mdtest-peak/<run-id>/results.jsonl' \
-  --benchmark mdtest-peak --metric mib_per_s --targets ours,nfs --output results/mdtest-peak-bw
-uv run --group analysis python -m agent_fs_bench plot 'results/mdtest-peak/<run-id>/results.jsonl' \
-  --benchmark mdtest-peak --metric ops_per_s --targets ours,nfs --output results/mdtest-peak-ops
+# Re-render the default figures for a finished run (or pool runs of one config).
+uv run python -m agent_fs_bench plot results/mdtest-peak/<run-id> --targets ours,nfs
 ```
 
-There is one figure per operation, layout and size, e.g. `mdtest-peak-bw-file-read-private-S1048576.pdf`. X is the process count (log scale). Y is MiB/s or Kops/s, with the median/IQR over repeats. `mib_per_s` figures exist only for create/read with S>0. Series must share the mdtest version and the cache/completion policy. Each size's files-per-process value is part of the case and of the parameters, so changing `items_per_proc` produces a separate configuration.
+`plot` accepts several run directories of the same benchmark and rejects runs whose config or source fingerprint differ. `--targets` sets legend order and filtering; the first entry is the paper's primary system. Each size's files-per-process value is part of the config, so changing `items_per_proc` produces a separate configuration.
 
 The ceiling is the plateau of a curve. Points beyond the CPU count show whether more outstanding requests still help; past that plateau the client CPU, not the target, is the bottleneck. Report the client CPU count, mount options and server hardware with the numbers.

@@ -2,8 +2,9 @@
 
 Same workload, fixtures and commands as ``npm-install``; the only difference is
 ``CONFIG['flush'] = False``: the timed project flush, the pre-timing input fsync
-and the between-batch ``os.sync()`` are all skipped. Rows therefore carry only
-``install_*`` metrics; ``flush_s``/``durable_s`` are not measured.
+and the between-batch ``os.sync()`` are all skipped. Batch rows therefore carry
+only install-time, throughput, CPU and tree-inventory metrics; ``flush_s`` and
+``durable_s`` are not measured.
 """
 
 from __future__ import annotations
@@ -11,10 +12,16 @@ from __future__ import annotations
 import argparse
 from typing import Any
 
+from agent_fs_bench.analysis import Figure
 from agent_fs_bench.benchmarks import npm_install
 from agent_fs_bench.results import RunContext
 
 CONFIG: dict[str, Any] = {**npm_install.CONFIG, "flush": False}
+
+FIGURES = [
+    Figure("batches", "concurrent_jobs", "install_mean_s", split=("manager",),
+           xlabel="Concurrent installs", ylabel="Install time (s)", logx=True),
+]
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     return npm_install.parse_args(argv, CONFIG)

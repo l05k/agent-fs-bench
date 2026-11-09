@@ -21,22 +21,27 @@ Never run concurrent writers/readers against the measured database: official
 kvtest can report writes despite failed commits; integrity_check is not proof
 of committed work. A workload invocation owns its database exclusively.
 
-Reported microseconds/write amortize connection setup and final close/checkpoint;
-they are not individually sampled transaction latencies. JSONL records the actual
-journal mode, cache size and page size printed by kvtest. Other settings remain
-requests. A fresh database directory is allocated for each invocation.
+Each timed invocation emits one ``repeats`` row: the experiment settings and
+repeat index as key columns, then ``microseconds_per_write``,
+``write_rate_mb_s`` and ``total_elapsed_s``. Reported microseconds/write
+amortize connection setup and final close/checkpoint; they are not individually
+sampled transaction latencies. The observed journal mode, cache size and page
+size, the SQLite version, the build provenance and the final integrity-check
+result go to the run manifest. A fresh database directory is allocated for each
+invocation.
 
-The workload uses the standard library; the runner needs DuckDB for CSV export.
-A C compiler and network access are needed for the first source download/build.
+The workload uses the standard library. A C compiler and network access are
+needed for the first source download/build.
 """
 
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
-
+from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
 
 from . import sqlite_tools
@@ -48,9 +53,9 @@ DEFAULT_VARIANCE = 0
 DEFAULT_COUNT = 2000
 DEFAULT_CACHE_KIB = 1000
 
-# Deliberate experiment settings. Edit for an ablation; workload values are
-# recorded in every JSONL row. build_dir and force_download are run management
-# and are not recorded. Private settings must never be committed.
+# Deliberate experiment settings. Edit for an ablation; they become the
+# per-row key columns. build_dir and force_download are run management.
+# Private settings must never be committed.
 CONFIG = {
     "size": DEFAULT_PAYLOAD,
     "variance": DEFAULT_VARIANCE,
@@ -65,16 +70,13 @@ CONFIG = {
     "force_download": False,
 }
 
-
-def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
-    """Validate and normalize settings shared by CLI and direct callers."""
-    args.jmode = sqlite_tools.normalize_journal_mode(getattr(args, "jmode", None))
-    if args.repeats < 1 or args.count < 1 or args.size < 1 or args.cache_size < 1:
-        raise sqlite_tools.BenchmarkError("repeats, count, size and cache_size must be positive")
-    if not 0 <= args.variance < args.size:
-        raise sqlite_tools.BenchmarkError("variance must be nonnegative and smaller than size")
-    return args
-
+FIGURES = [
+    Figure(
+        "repeats", "transaction", "microseconds_per_write", kind="box",
+        xlabel="Transaction mode", ylabel="Microseconds per write",
+        name="kvtest-microseconds-per-write",
+    ),
+]
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -83,8 +85,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         )
     )
     parser.parse_args(argv)
-    return normalize_args(argparse.Namespace(**CONFIG))
-
+    args = argparse.Namespace(**CONFIG)
+    args.jmode = args.jmode.lower()
+    return args
 
 PARSE_PATTERNS = {
     "sqlite_version": re.compile(
@@ -113,7 +116,6 @@ PARSE_PATTERNS = {
 INTEGRITY_PATTERN = re.compile(
     r"^Integrity-check:[ \t]*(\S.*?)[ \t]*\r?$", re.MULTILINE
 )
-
 
 def parse_kvtest_output(text: str) -> Dict[str, Any]:
     """Parse ``kvtest run`` output, rejecting any missing measured field.
@@ -148,7 +150,6 @@ def parse_kvtest_output(text: str) -> Dict[str, Any]:
         "write_rate_mb_s": float(matches["write_rate_mb_s"].group(1)),
     }
 
-
 def parse_integrity_check(text: str) -> str:
     """Parse ``kvtest stat`` output; every printed check must be ``ok``."""
     values = INTEGRITY_PATTERN.findall(text)
@@ -163,15 +164,14 @@ def parse_integrity_check(text: str) -> str:
         + text)
     return "ok"
 
-
-def measure(args: argparse.Namespace) -> Dict[str, Any]:
-    normalize_args(args)
-    build_dir = args.build_dir or (PROJECT_ROOT / "build" / "kvtest")
+def measure(args: argparse.Namespace, target_dir: Path) -> Dict[str, Any]:
+    build_dir = Path(
+        args.build_dir or (PROJECT_ROOT / "build" / "kvtest")
+    ).expanduser().resolve()
     sources = sqlite_tools.ensure_sources(build_dir, "kvtest", args.force_download)
     binary, provenance = sqlite_tools.build(build_dir, "kvtest", sources, args.force_download)
 
-    target_dir = args.target_dir
-    sqlite_tools.ensure_directory(target_dir, "target directory")
+    target_dir.mkdir(parents=True, exist_ok=True)
     db_path = target_dir / DB_FILENAME
     sqlite_tools.remove_database(db_path)
 
@@ -221,37 +221,20 @@ def measure(args: argparse.Namespace) -> Dict[str, Any]:
         )
 
     # One final validation after all timed runs, using the same binary.
-    integrity_check = parse_integrity_check(
+    integrity = parse_integrity_check(
         sqlite_tools.run_command([str(binary), "stat", str(db_path)]).stdout
     )
 
     return {
-        # Requests only; parsed output carries the values SQLite read back.
-        "requests": {
-            "size": args.size,
-            "variance": args.variance,
-            "count": args.count,
-            "cache_size_kib": args.cache_size,
-            "jmode": args.jmode,
-            "nosync": args.nosync,
-            "mmap_bytes": args.mmap,
-            "multitrans": args.multitrans,
-            "repeats": args.repeats,
-        },
         "provenance": provenance,
         "repeats": repeats,
-        "integrity_check": integrity_check,
+        "integrity_check": integrity,
     }
 
-
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
-    args.target_dir = ctx.work_dir
-    if args.build_dir is not None:
-        args.build_dir = args.build_dir.expanduser().resolve()
-    result = measure(args)
+    result = measure(args, ctx.work_dir)
     provenance = result["provenance"]
     repeats = result["repeats"]
-    integrity_check = result["integrity_check"]
     sqlite_version = repeats[0]["parsed"]["sqlite_version"]
     if any(
         entry["parsed"]["sqlite_version"] != sqlite_version
@@ -259,38 +242,36 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     ):
         raise sqlite_tools.BenchmarkError("kvtest reported different SQLite versions across repeats")
 
-    ctx.parameters.clear()
-    ctx.parameters.update(result["requests"])
-    ctx.parameters["tool_versions"] = {
-        "sqlite": sqlite_version,
-        "compiler": provenance["compiler_version"],
-    }
-    ctx.parameters["source_sha256"] = provenance["source_sha256"]
-    ctx.parameters["binary_sha256"] = provenance["binary_sha256"]
-
-    sync = "off" if args.nosync else "full"
-    transaction = "autocommit" if args.multitrans else "batch"
-    case = (
-        f"overwrite/{args.jmode}/{sync}/B{args.size}/V{args.variance}/N{args.count}"
-        f"/K{args.cache_size}/M{args.mmap}/{transaction}/C1"
+    ctx.info.update(
+        sqlite_version=sqlite_version,
+        compiler=provenance["compiler_version"],
+        source_sha256=provenance["source_sha256"],
+        binary_sha256=provenance["binary_sha256"],
+        integrity_check=result["integrity_check"],
+        observed=[{
+            "repeat": entry["repeat"],
+            **{key: entry["parsed"][key] for key in ("journal_mode", "cache_size", "page_size")},
+        } for entry in repeats],
     )
 
+    keys = {
+        "jmode": args.jmode,
+        "sync": "off" if args.nosync else "full",
+        "transaction": "autocommit" if args.multitrans else "batch",
+        "payload_bytes": args.size,
+        "variance_bytes": args.variance,
+        "count": args.count,
+        "cache_size_kib": args.cache_size,
+        "mmap_bytes": args.mmap,
+    }
     for entry in repeats:
         parsed = entry["parsed"]
         ctx.emit(
-            case,
+            "repeats",
+            {**keys, "repeat": entry["repeat"]},
             {
                 "microseconds_per_write": parsed["microseconds_per_write"],
                 "write_rate_mb_s": parsed["write_rate_mb_s"],
                 "total_elapsed_s": parsed["total_elapsed_s"],
-            },
-            repeat=entry["repeat"],
-            details={
-                "observed": {
-                    "journal_mode": parsed["journal_mode"],
-                    "cache_size": parsed["cache_size"],
-                    "page_size": parsed["page_size"],
-                },
-                "integrity_check": integrity_check,
             },
         )

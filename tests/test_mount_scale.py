@@ -7,8 +7,11 @@ import sys
 import tempfile
 import unittest
 
-from agent_fs_bench.benchmarks.mount_scale_mdtest import Mdtest, Rank
+from agent_fs_bench.benchmarks import mount_scale
+from agent_fs_bench.benchmarks.mount_scale_mdtest import Mdtest, Phase, Rank
 from agent_fs_bench.benchmarks.mount_scale_mounts import Layout, Profile, _run
+from agent_fs_bench.results import RunContext, Tables, read_table
+from agent_fs_bench.targets import Target
 
 
 class MountTopologyTests(unittest.TestCase):
@@ -219,6 +222,70 @@ class NativeRankTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, r'requires Open MPI 4\.1\.x'):
                 Mdtest(str(binary), [str(launcher)], 5)
 
+
+class TableEmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.ctx = RunContext('mount-scale', 'run', Target('fs', self.root),
+                              self.root / 'work', self.root / 'res', Tables(self.root))
+
+    def tearDown(self):
+        self.ctx.tables.close()
+        self.directory.cleanup()
+
+    @staticmethod
+    def levels() -> dict:
+        return {'used_bytes': 10, 'cached_bytes': 2, 'dirty_bytes': 0, 'slab_bytes': 3,
+                'slab_reclaimable_bytes': 1, 'slab_unreclaimable_bytes': 2,
+                'mount_entries': 4, 'sample_elapsed_s': 1.0, 'cpu_busy_s': 0.5,
+                'cpu_busy_cores': 0.5, 'cpu_busy_percent': 50.0}
+
+    def test_host_samples_become_lifecycle_agent_and_resource_rows(self):
+        mount = {'mount_elapsed_s': 0.2, 'measured_mounts': 3,
+                 'agent_elapsed_s': (0.1, 0.2)}
+        unmount = {'unmount_elapsed_s': 0.1, 'remaining_mounts': 0,
+                   'agent_elapsed_s': (0.05, 0.05)}
+        workload = {'sample_elapsed_s': 2.0, 'cpu_busy_s': 1.0, 'cpu_busy_cores': 0.5,
+                    'cpu_busy_percent': 50.0, 'peak_used_bytes': 20,
+                    'peak_used_bytes_delta': 10}
+        mount_scale._emit_host(self.ctx, 'multi-mount', 2, 'local', 1, self.levels(),
+                               self.levels(), self.levels(), workload, mount, unmount)
+        lifecycle = read_table(self.root / 'lifecycle.csv')
+        self.assertEqual(
+            [(row['action'], row['elapsed_s'], row['measured_mounts'], row['remaining_mounts'])
+             for row in lifecycle],
+            [('mount', '0.2', '3', ''), ('unmount', '0.1', '', '0')])
+        agents = read_table(self.root / 'agents.csv')
+        self.assertEqual([(row['action'], row['sample'], row['elapsed_s']) for row in agents],
+                         [('mount', '0', '0.1'), ('mount', '1', '0.2'),
+                          ('unmount', '0', '0.05'), ('unmount', '1', '0.05')])
+        resources = read_table(self.root / 'resources.csv')
+        self.assertEqual([row['state'] for row in resources],
+                         ['baseline', 'mounted-idle', 'released-idle', 'workload'])
+        self.assertEqual(resources[0]['used_bytes_delta'], '')
+        self.assertEqual(resources[1]['used_bytes_delta'], '0')
+        self.assertEqual(resources[3]['used_bytes'], '')
+        self.assertEqual(resources[3]['peak_used_bytes'], '20')
+        self.assertEqual(resources[3]['peak_used_bytes_delta'], '10')
+
+    def test_phase_rows_and_rank_samples_share_the_phase_identity(self):
+        phases = [Phase('private/create', 4, 0.5, [0.2, 0.3]),
+                  Phase('private/stat', 4, 0.25, [0.1, 0.15])]
+        mapping = [{'host': 'local', 'cpu': 0}, {'host': 'node-a', 'cpu': 4}]
+        mount_scale._emit_phases(self.ctx, 'multi-mount', 2, 1, phases, mapping, 4096)
+        rows = read_table(self.root / 'phases.csv')
+        self.assertEqual([row['phase'] for row in rows], ['private/create', 'private/stat'])
+        self.assertEqual(rows[0]['bytes'], str(4 * 4096))
+        self.assertEqual(rows[1]['bytes'], '')
+        ranks = read_table(self.root / 'ranks.csv')
+        self.assertEqual(
+            [(row['phase'], row['sample'], row['host'], row['cpu'], row['elapsed_s'])
+             for row in ranks],
+            [('private/create', '0', 'local', '0', '0.2'),
+             ('private/create', '1', 'node-a', '4', '0.3'),
+             ('private/stat', '0', 'local', '0', '0.1'),
+             ('private/stat', '1', 'node-a', '4', '0.15')])
 
 if __name__ == '__main__':
     unittest.main()

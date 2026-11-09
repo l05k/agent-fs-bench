@@ -87,27 +87,43 @@ the run before replay. Fingerprints ignore timestamps, owner, xattrs and ACLs.
 Restore and fingerprinting are untimed and warm the cache, so results are not
 cold-cache.
 
+## Tables and figures
+
+`results/agent-replay/<run-id>/` holds one `manifest.json` plus flat CSV tables:
+
+| Table | Key columns | Metric columns |
+| --- | --- | --- |
+| `replays` | `case`, `repeat` | `elapsed_s`, `model_requests` |
+| `phases` | `case`, `repeat`, `phase` | `seconds` |
+
+A `replays` row is one `target × case × repeat`; a `phases` row is one phase
+Harbor reported for that replay. Because both tables have a `repeat`
+column, `summary/<table>.csv` holds the median of each metric per target and the
+remaining keys, with `n` samples. `figures/` holds `replay-time.pdf` (box plot of
+`elapsed_s` per case) and one `replay-phases-<case>.pdf` per case (box plot of
+`seconds` per Harbor phase; punctuation in the case name becomes `_`).
+`python -m agent_fs_bench plot <run-dir>...` re-renders them.
+
+Per-case facts — model name, and the SHA-256 of the task, cassette and each
+initial mount — are in `manifest.json` under `targets[i].info`, together with the
+Python/Harbor/mitmproxy versions and the submodule source hash. Response bodies
+are never written to the tables. Raw upstream diagnostics go to
+`results/agent-replay/<run-id>/<target>/<case>/repeat-N/`.
+
 ## Metrics
 
 | Metric | Boundary |
 | --- | --- |
-| `elapsed_s` | Upstream `elapsed_sec`: Harbor subprocess start to exit, including environment setup/cleanup, agent, verifier, artifacts and Harbor's own output |
-| `environment_setup_s`, `agent_setup_s`, `agent_execution_s`, `verifier_s` | Phase times reported by Harbor; missing phases are left empty, not zero |
-| `model_requests` | Model requests received during this replay; diagnostic only, not proof of trace equivalence |
+| `elapsed_s` (`replays`) | Upstream `elapsed_sec`: Harbor subprocess start to exit, including environment setup/cleanup, agent, verifier, artifacts and Harbor's own output |
+| `seconds` (`phases`) | Phase time reported by Harbor in `phase_seconds`; a phase Harbor does not report has no row, it is not zero |
+| `model_requests` (`replays`) | Model requests received during this replay; diagnostic only, not proof of trace equivalence |
 
 `elapsed_s` excludes input restore, fingerprinting, proxy start/stop, runner
-post-processing and JSONL/CSV writes. The verifier does real I/O and is timed even
+post-processing and CSV writes. The verifier does real I/O and is timed even
 when reward is zero. Model calls have no inference latency, but fixed waits in the
 recorded commands remain. Terminal output, shell branches, background jobs and
 slow filesystems can change real I/O, so do not claim identical syscalls or task
 correctness on every target.
-
-Each JSONL row is `target × case × repeat`. `parameters` records the absolute
-`cases_file`, Python/Harbor/mitmproxy versions, model name, and SHA-256 of the
-submodule source and lockfile, task, cassette and each initial mount. The
-cassette fingerprint covers replay inputs and the acceptance marker, not run
-logs; response bodies are never written to JSONL. Raw upstream diagnostics go to
-`results/agent-replay/<run-id>/<target>/<case>/repeat-N/`.
 
 ## Data confidentiality
 

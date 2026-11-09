@@ -2,7 +2,9 @@
 
 import unittest
 
-from agent_fs_bench.ssh import Host, _select_host
+from pathlib import Path
+
+from agent_fs_bench.ssh import Host, _select_host, openmpi_agent
 
 
 class MpiHostSelectionTests(unittest.TestCase):
@@ -20,6 +22,16 @@ class MpiHostSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'conflicting'):
             _select_host(hosts, 'bench@10.0.0.8', 'root')
         self.assertEqual(_select_host(hosts, 'bench@10.0.0.8', None), hosts[0])
+
+
+class AgentCommandTests(unittest.TestCase):
+    def test_agent_tokens_survive_openmpi_word_splitting(self):
+        value = openmpi_agent(Path('/tmp/hosts.toml'))
+        tokens = value.split(' ')
+        self.assertEqual(tokens, value.split())
+        for token in tokens:
+            self.assertTrue(token)
+            self.assertNotIn(':', token)
 
 
 if __name__ == '__main__':

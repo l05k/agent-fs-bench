@@ -2,8 +2,8 @@
 
 Filesystem benchmarks for agent workloads. Each workload runs against an
 already-mounted directory, so local disks, FUSE and NFS share one interface
-(`mount-scale` can also run real mount commands). Raw results are JSONL; each run
-also writes a derived `summary.csv`. Figures are generated on demand.
+(`mount-scale` can also run real mount commands). Each run writes a manifest and
+flat CSV tables, then per-group medians and paper-style figures.
 
 Formal runs target Linux with Python 3.12+. The repository contains no internal
 filesystem implementation or credentials. Any error stops the run; fix the
@@ -12,10 +12,12 @@ environment and rerun.
 ## Install
 
 ```sh
-uv sync --locked                       # includes DuckDB
-uv sync --locked --group analysis      # Matplotlib, only for plotting
+uv sync --locked
 uv run python -m agent_fs_bench --help
 ```
+
+Figures need the Arial font (Ubuntu: `sudo apt install ttf-mscorefonts-installer`).
+Without it, `run` fails after the CSV tables are written; re-plot them elsewhere.
 
 Deploy the whole checkout, including `data/`. External tools are prepared by the
 experimenter; each workload doc lists its requirements. `agent-replay` needs a
@@ -72,8 +74,8 @@ The only workload flags are `clone --smoke`, `mdtest --smoke`, `mdtest-peak --sm
 `mount-scale --directory-smoke` (pass them after `--`). All other settings
 (scale, repeats, concurrency, PRAGMAs, tool versions, paths) live in the `CONFIG`
 dict at the top of each module in `agent_fs_bench/benchmarks/`. Changing an
-experiment means editing `CONFIG`; the source fingerprint in each result records
-it. Keep private values out of commits.
+experiment means editing `CONFIG`; each run's manifest records the resulting
+`config` and a source fingerprint. Keep private values out of commits.
 
 `multi-host` and `mount-scale` read SSH hosts from `local/hosts.toml` (see
 `experiments/hosts.example.toml`). Their sync and measurement protocols differ, so
@@ -83,29 +85,32 @@ do not combine their results. `mount-scale` also needs `local/mounts.toml`.
 
 ```text
 results/<bench>/<run-id>/
-  results.jsonl   # raw data, self-contained
-  summary.csv     # mean/median/min/max/stddev per target × case × metric
+  manifest.json        # benchmark, config, source fingerprint, per-target info
+  <table>.csv          # one row per measurement or raw sample
+  summary/<table>.csv  # n and medians per target × dimensions
+  figures/             # default figures: .pdf, .png, self-contained .py
 ```
 
-`summary.csv` groups by `parameters` and `source_sha256`, so different configs or
-source versions never merge silently. Regenerate it, query with DuckDB, or plot:
+`run` writes the summaries and default figures after the last target. Re-plot,
+pool runs with identical configs and sources, or draw a custom figure:
 
 ```sh
-uv run python -m agent_fs_bench analyze 'results/*/*/results.jsonl' \
-  --sql 'SELECT benchmark, "case", metric, value FROM metrics'
-
-uv run --group analysis python -m agent_fs_bench plot 'results/clone/*/results.jsonl' \
-  --benchmark clone --metric mib_s --targets ours,ext4,nfs --output results/clone
+uv run python -m agent_fs_bench plot results/mdtest/<run-id> --targets ours,ext4,nfs
+uv run python -m agent_fs_bench plot results/mdtest/<run-id> --table phases \
+  --x procs --y ops_per_s --split operation,layout --yscale 1000 --logx
 ```
 
-Schema, plot kinds and selectors: [results and analysis](docs/results-and-analysis.md).
+Columns, summaries and plot options: [results and analysis](docs/results-and-analysis.md).
 
 ## Reproducibility
 
-- Archive the checkout, `uv.lock`, `local/` configs and JSONL. The source
-  fingerprint covers uncommitted changes but does not replace a source archive.
-- Kernel, mount options and host environment are not grouping keys; tool
-  versions recorded in `parameters` are. Keep the former consistent yourself.
+- Archive the checkout, `uv.lock`, `local/` configs and result directories. The
+  source fingerprint covers uncommitted changes (except each workload's `CONFIG`
+  literal, recorded as `config`) but does not replace a source archive.
+- `plot` pools runs only when their source fingerprints match and their `config`
+  matches apart from keys given to `--vary`. It does not compare tool versions (in
+  each target's `info`), kernel, mount options or host environment; keep those
+  consistent yourself.
 - No result is cold-cache. Page cache, FUSE client cache and server cache are
   separate layers, and each workload keeps its own sync and cache semantics.
 - Resource limits (cgroups) for FUSE clients, servers and the benchmark are set

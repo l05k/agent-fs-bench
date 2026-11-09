@@ -13,8 +13,6 @@ dist/
 # Recorded model traffic can contain provider credentials and private task data
 *.mitm
 **/cassettes/
-*.duckdb
-*.duckdb.wal
 /thirdparty/
 
 # Generated fixture checkout; the portable bundle is committed

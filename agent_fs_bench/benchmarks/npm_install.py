@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
 from agent_fs_bench.benchmarks.clone import fstype
 
@@ -54,6 +55,13 @@ CONFIG: dict[str, Any] = {
     "seed_only": False,
     "flush": True,
 }
+
+FIGURES = [
+    Figure("batches", "concurrent_jobs", "install_mean_s", split=("manager",),
+           xlabel="Concurrent installs", ylabel="Install time (s)", logx=True),
+    Figure("batches", "concurrent_jobs", "durable_mean_s", split=("manager",),
+           xlabel="Concurrent installs", ylabel="Durable install time (s)", logx=True),
+]
 
 
 
@@ -94,17 +102,14 @@ def remove_tree(path: Path) -> None:
 
 
 def command_version(command: str, timeout: float = 10.0) -> str:
-    try:
-        result = subprocess.run(
-            [command, "--version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise BenchError(f"cannot obtain version of {command}: {exc}") from exc
+    result = subprocess.run(
+        [command, "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
     if result.returncode != 0 or not result.stdout.strip():
         die(f"{command} --version failed: {result.stderr.strip()}")
     return result.stdout.strip()
@@ -234,12 +239,6 @@ def run_visible(command: list[str], cwd: Path, env: dict[str, str] | None = None
 
 
 def fixture_dir_for(name: str) -> Path:
-    """Return the vendored fixture directory named by ``CONFIG['fixture']``."""
-    if name not in FIXTURES:
-        die(
-            f"unknown fixture {name!r}; choose from: "
-            + ", ".join(sorted(FIXTURES))
-        )
     path = PROJECT_ROOT / FIXTURES[name]
     if not path.is_dir():
         die(f"fixture {name} is missing: {path}")
@@ -582,24 +581,20 @@ def run_batch(
         sync_filesystem()
     return metrics, tasks
 
+def task_metrics(task: dict[str, int | float], flush: bool) -> dict[str, int | float]:
+    names = ("install_s", "flush_s", "durable_s") if flush else ("install_s",)
+    return {**{name: task[name] for name in names},
+            **{name: task[name] for name in ("user_s", "sys_s", "start_offset_s")}}
 
 def parse_args(argv: list[str], config: dict[str, Any] = CONFIG) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Offline installation batches; edit CONFIG for experiment settings."
     )
     namespace = argparse.Namespace(**config, **vars(parser.parse_args(argv)))
-    if namespace.fixture not in FIXTURES:
-        die(f"unknown fixture {namespace.fixture!r}; choose from: {', '.join(FIXTURES)}")
-    if namespace.pm not in ("npm", "pnpm", "both"):
-        die("pm must be npm, pnpm or both")
-    if namespace.runs < 1 or namespace.concurrency < 0:
-        die("runs must be positive and concurrency must be nonnegative")
-    if not namespace.concurrent_jobs or any(count < 1 for count in namespace.concurrent_jobs):
-        die("concurrent_jobs must contain positive batch sizes")
-    if len(set(namespace.concurrent_jobs)) != len(namespace.concurrent_jobs):
-        die("concurrent_jobs must not contain duplicate batch sizes")
-    if not namespace.prep_dir:
-        die("prep_dir must name an external local filesystem")
+    # Duplicate sizes would write rows with identical keys and double-weight the summary.
+    if len(set(namespace.concurrent_jobs)) != len(namespace.concurrent_jobs) or any(
+            count < 1 for count in namespace.concurrent_jobs):
+        die("concurrent_jobs must be distinct positive batch sizes")
     return namespace
 
 
@@ -660,6 +655,16 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
             if (template / name).is_file()
         }
         sources[manager], templates[manager] = source, template
+    ctx.info.update({
+        "target_fstype": target_type,
+        "prep_fstype": prep_type,
+        "cpu_count": len(os.sched_getaffinity(0)),
+        "tool_versions": {
+            manager: {tool: versions[tool] for tool in ("node", manager)}
+            for manager in managers
+        },
+        "seed_input_sha256": fingerprints,
+    })
     if args.flush:
         sync_filesystem()
     if args.seed_only:
@@ -667,28 +672,14 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         return
     for manager in managers:
         for count in args.concurrent_jobs:
-            ctx.parameters = {
-                "fixture": args.fixture,
-                "concurrent_jobs": count,
-                "concurrency": args.concurrency,
-                "placement": "external-local",
-                "prep_fstype": prep_type,
-                "ignore_scripts": args.ignore_scripts,
-                "flush": args.flush,
-                "pnpm_import_method": PNPM_IMPORT_METHOD,
-                "pnpm_global_virtual_store": False,
-                "cache_state": "warm-source-empty-node_modules",
-                "tool_versions": {tool: versions[tool] for tool in ("node", manager)},
-                "seed_input_sha256": {manager: fingerprints[manager]},
-                "cpu_count": len(os.sched_getaffinity(0)),
-            }
             for repeat in range(1, args.runs + 1):
                 metrics, tasks = run_batch(
                     ctx, args, manager, binaries[manager], sources[manager],
                     templates[manager], prep, count, repeat,
                 )
-                ctx.emit(
-                    f"{manager}/c{count}", metrics, repeat=repeat,
-                    details={"tasks": tasks, "target_fstype": target_type},
-                )
+                keys = {"manager": manager, "concurrent_jobs": count, "repeat": repeat}
+                ctx.emit("batches", keys, metrics)
+                for task in tasks:
+                    ctx.emit("tasks", {**keys, "sample": task["task"]},
+                             task_metrics(task, args.flush))
     remove_tree(prep)
