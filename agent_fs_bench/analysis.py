@@ -443,7 +443,7 @@ def mdtest_plot_data(connection, args: argparse.Namespace) -> list[tuple[str, di
     rows = filter_identities(rows, wanted_parameters, wanted_sources,
                              lambda row: (row[2], row[3]))
     if not rows:
-        raise ValueError('no mdtest measurements match the plot selection'
+        raise ValueError(f'no {benchmark} measurements match the plot selection'
                          + selection_detail(wanted_parameters, wanted_sources))
     targets = args.targets or sorted({row[0] for row in rows})
     cases = args.cases or sorted({row[1] for row in rows})
@@ -453,7 +453,7 @@ def mdtest_plot_data(connection, args: argparse.Namespace) -> list[tuple[str, di
     ):
         missing = set(wanted) - found
         if missing:
-            raise ValueError(f'no mdtest measurements for {kind}: {", ".join(sorted(missing))}')
+            raise ValueError(f'no {benchmark} measurements for {kind}: {", ".join(sorted(missing))}')
     selected = [(row[0], (row[2], row[3]), json.loads(row[4]),
                  json.loads(row[5]), json.loads(row[6]))
                 for row in rows if row[0] in targets and row[1] in cases]
@@ -507,7 +507,7 @@ def mdtest_plot_data(connection, args: argparse.Namespace) -> list[tuple[str, di
             'logx': True, 'logy': False, 'size': list(args.size),
         }))
     if not figures:
-        raise ValueError(f'no {benchmark} measurements match the plot selection')
+        raise ValueError(f'no {benchmark} {args.metric} measurements match the plot selection')
     return figures
 
 
