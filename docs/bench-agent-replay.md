@@ -96,7 +96,8 @@ cold-cache.
 | `replays` | `case`, `repeat` | `elapsed_s`, `model_requests` |
 | `phases` | `case`, `repeat`, `phase` | `seconds` |
 
-Every row is one `target × case × repeat`. Because both tables have a `repeat`
+A `replays` row is one `target × case × repeat`; a `phases` row is one phase
+Harbor reported for that replay. Because both tables have a `repeat`
 column, `summary/<table>.csv` holds the median of each metric per target and the
 remaining keys, with `n` samples. `figures/` holds `replay-time.pdf` (box plot of
 `elapsed_s` per case) and one `replay-phases-<case>.pdf` per case (box plot of

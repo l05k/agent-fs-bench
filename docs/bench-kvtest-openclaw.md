@@ -72,7 +72,7 @@ compile argv stay in `build/kvtest/kvtest-build.json`; they are not copied into
 the results tables.
 
 `CONFIG["jmode"]` is lowercased. The mode kvtest's own connection reports is in
-`targets[].info.observed.journal_mode` and may differ for nonpersistent modes.
+`targets[].info.observed[].journal_mode` and may differ for nonpersistent modes.
 
 The generic NAS baseline is DELETE + FULL on every target. SQLite warns that
 network-filesystem locking and synchronization vary; WAL is not a generic
@@ -122,17 +122,18 @@ The run writes one flat table:
 `summary/repeats.csv` pools repeats per target and setting and reports `n` and
 each metric's median. The manifest's `targets[].info` holds the SQLite version
 parsed from kvtest's own stdout, the build cache's compiler version, the source
-and binary hashes, and the values kvtest read back from SQLite: `journal_mode`,
-`cache_size` (raw PRAGMA value; negative means KiB) and `page_size` in bytes.
+and binary hashes, the final `integrity_check` result, and `observed`: per
+repeat, the values kvtest read back from SQLite (`journal_mode`, `cache_size`
+as the raw PRAGMA value, negative meaning KiB, and `page_size` in bytes).
 
 The SQLite version is the one compiled into the measured binary, not the
 Python `sqlite3` module version. `--mmap` is only echoed by kvtest and
 `synchronous` is never printed, so neither is reported as observed.
 
 The harness passes a negative SQLite `cache_size` so `CONFIG["cache_size"]` is
-in KiB, not pages. `targets[].info.observed.cache_size` is the raw PRAGMA value
+in KiB, not pages. `targets[].info.observed[].cache_size` is the raw PRAGMA value
 kvtest printed, so `-1000` means 1000 KiB.
-`targets[].info.observed.journal_mode` comes from kvtest's own connection output
+`targets[].info.observed[].journal_mode` comes from kvtest's own connection output
 (nonpersistent modes can differ on a later inspection connection). After all
 timed repeats finish, the harness runs `kvtest stat <db>` once with the same
 binary, outside any timing; any `Integrity-check` result other than `ok` is a

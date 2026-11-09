@@ -31,6 +31,11 @@ def run_benchmark(argv: list[str]) -> int:
     module = analysis.workload(options.benchmark)
     config = vars(module.parse_args(workload_argv))
     targets = load_targets(TARGETS_FILE, options.dirs)
+    # A misspelled override would silently measure cp-r; check before --target filtering.
+    unknown = set(config.get('target_copiers', {})) - {target.name for target in targets}
+    if unknown:
+        raise ValueError(f'unknown target_copiers aliases: {", ".join(sorted(unknown))}; '
+                         f'targets: {", ".join(target.name for target in targets)}')
     if options.target:
         unknown = set(options.target) - {target.name for target in targets}
         if unknown:

@@ -65,14 +65,14 @@ Cache state is **create-then-access-no-drop**, not guaranteed warm residency or 
 
 ## Default figures
 
-`run` renders one figure per operation/layout, e.g. `figures/phases-ops_per_s-file-create-private.pdf`, plus a standalone Python script with the raw samples. X is client process count (log scale); Y is Kops/s. Lines show the median and IQR across independent repeats; these are throughput variation, **not operation-latency percentiles**.
+`run` renders one figure per operation/layout, e.g. `figures/phases-ops_per_s-file_create-private.pdf` (punctuation in split values becomes `_`), plus a standalone Python script with the raw samples. X is client process count (log scale); Y is Kops/s. Lines show the median and IQR across independent repeats; these are throughput variation, **not operation-latency percentiles**.
 
 ```sh
 # Re-render the default figures for a finished run (or pool runs of one config).
 uv run python -m agent_fs_bench plot results/mdtest/<run-id> --targets ours,nfs,ext4
 ```
 
-`plot` accepts several run directories of the same benchmark and rejects configs that differ. `--targets` sets legend order and filtering; the first entry is the paper's primary system. A custom figure uses `--table phases --x procs --y ops_per_s` with optional `--split`, `--where`, `--xlabel` and `--ylabel`.
+`plot` accepts several run directories of the same benchmark and rejects runs whose config or source fingerprint differ. `--targets` sets legend order and filtering; the first entry is the paper's primary system. A custom figure uses `--table phases --x procs --y ops_per_s` with optional `--split`, `--where`, `--xlabel` and `--ylabel`.
 
 For the paper, prioritize create/stat/unlink curves for private and shared directories; keep the remaining operations as supplemental results. Describe local filesystems as local references, not resource-equivalent NAS baselines. Input series must use the same total work, mdtest version, cache/completion policy and process counts. Mounts, hardware and server settings remain the experimenter's responsibility.
 

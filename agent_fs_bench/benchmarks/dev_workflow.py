@@ -682,6 +682,7 @@ def run_workflow(
     jobs = args.jobs
 
     steps: list[dict[str, Any]] = []
+    tree_assertions: list[dict[str, Any]] = []
     cleanup_error: str | None = None
     cleanup_ms: int | None = None
     preparation_ms: int | None = None
@@ -837,7 +838,7 @@ def run_workflow(
             })
 
             verify_start = time.perf_counter_ns()
-            verify_tree(repo, commit_id)
+            tree_assertions.append(verify_tree(repo, commit_id))
             steps.append({
                 "kind": "verify", "name": "tree-verify", "commit": commit_id,
                 "ms": elapsed_ms(verify_start),
@@ -899,6 +900,7 @@ def run_workflow(
         "preparation_ms": preparation_ms,
         "cleanup_ms": cleanup_ms,
         "unattributed_ms": unattributed_ms,
+        "tree_assertions": tree_assertions,
         "steps": steps,
     }
 
@@ -929,6 +931,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     })
     result = run_workflow(ctx, args, series)
     ctx.info["base_commit"] = result.pop("base_commit")
+    ctx.info["tree_assertions"] = result.pop("tree_assertions")
     compiler = result.pop("compiler_version")
     if compiler is not None:
         ctx.info["tool_versions"]["compiler"] = compiler

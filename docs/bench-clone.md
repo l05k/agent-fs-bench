@@ -51,7 +51,11 @@ CONFIG["commands"] = {
 All other targets use `cp-r`. Running both operations on LakeBase separates
 native-clone benefits from ordinary filesystem access performance. Use exact
 registered target names, or the directory basenames when using `--dirs`; only
-selected copiers need installed executables.
+selected copiers need installed executables. Before creating a run, every
+`target_copiers` key is checked case-sensitively against the complete target
+catalog (or all `--dirs` basenames). An unknown key is an error, never an
+implicit switch to `cp-r`; the check precedes `--target` filtering, so valid
+overrides for unselected targets are allowed.
 
 A command must return only when the copied tree is complete and available to
 filesystem operations; a command that only submits an asynchronous job is not
@@ -164,9 +168,9 @@ directories per second.
 
 A `target/copier` pair identifies a series, e.g. `LakeBase/lakebase`,
 `LakeBase/cp-r`, `NFS/cp-r`; operations cannot merge into one filesystem row.
-The `plot` command pools several runs only when their manifest configurations
-match. This is a clean cutover from the old sharded format: remeasure old clone
-runs instead of combining their rows with new results.
+The `plot` command pools several runs only when their source fingerprints and
+manifest configurations match. This is a clean cutover from the old sharded
+format: remeasure old clone runs instead of combining their rows with new results.
 
 ## Default figures
 
@@ -183,8 +187,9 @@ PNG, and a standalone Python script with the raw samples:
 | `throughput-small` | `batches` | `concurrency` | `clones_s` | `experiment=concurrency`, `kind=small` |
 
 Lines show medians with IQR error bars. Series are `target/copier`, ordered by
-target; pass `--targets` to select and order them, putting the paper's primary
-system first. Re-render with:
+target. A figure holds at most 4 series; `--targets` selects and orders them by
+target (`LakeBase`) or full series label (`LakeBase/lakebase`), putting the
+paper's primary system first, and rejects names that match nothing. Re-render with:
 
 ```sh
 uv run python -m agent_fs_bench plot results/clone/<run-id>

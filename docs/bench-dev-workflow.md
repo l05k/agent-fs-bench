@@ -241,12 +241,13 @@ column identifies each row.
 `kind` groups steps for figures: `config`, `build`, `command`, `git` and
 `verify` for the kernel workload; `worktree`, `build`, `command` and `git` for
 mini. `name` is the concrete operation (`initial-build`, `search-load`,
-`search`, `git-commit`, ...). `commit` holds the fixture commit for
+`search`, `commit`, ...). The `commit` column holds the fixture commit for
 commit-specific steps and is empty otherwise. Neither table has a pooled
 sample index, so the runner writes no `summary/<table>.csv` for them.
 
 The manifest records the run configuration and per-target facts: resolved
-`jobs`, `fixture_sha256`, `base_commit`, and Git, Make and compiler versions.
+`jobs`, `fixture_sha256`, `base_commit`, Git, Make and compiler versions, and
+(kernel workload) `tree_assertions`, the verified tree hash of every replayed commit.
 The compiler version is read through the makefile-selected `$(CC)`, not a
 Python guess based on environment `CC`. Collection is outside workload and
 cleanup timers. No full fixture body, kernel config, inherited build-variable

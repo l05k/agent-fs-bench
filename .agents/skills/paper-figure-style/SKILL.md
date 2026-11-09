@@ -11,7 +11,7 @@ Use this skill when drawing or updating system-experiment figures for papers.
 
 - `agent_fs_bench/figure.py` holds the shared style (`RC`, `PALETTE`, `HATCHES`, inch-based layout). It must import only stdlib and Matplotlib: its source is copied verbatim into every exported figure script.
 - `python -m agent_fs_bench plot <run-dir>...` (also run automatically at the end of `run`) writes `<stem>.pdf`, `<stem>.png` (600 dpi) and `<stem>.py` (self-contained: style code + raw samples) for each default figure in the workload module's `FIGURES`, or for one custom figure given `--table --x --y`. Rerun `python <stem>.py` to regenerate both images without the CSVs.
-- `--targets a,b,c` fixes legend order and filters targets; the first target is the primary system. Line figures sort x numerically; box figures keep first-appearance order. `--xlabel`/`--ylabel` set labels (default: column names). `--size W H` sets inches per figure (default `3.5 1.5`).
+- `--targets a,b,c` fixes legend order and filters by target name or full series label (e.g. `LakeBase/cp-r`); the first entry is the primary system, and a name matching nothing is an error. Line figures sort x numerically; box figures keep first-appearance order. `--xlabel`/`--ylabel` set labels (default: column names). `--size W H` sets inches per figure (default `3.5 1.5`).
 - Legend entries are target aliases; name targets as they should appear in the paper.
 - All figure text is English, so only Arial is required; SimHei rules below do not apply to this project.
 - Hatch order puts vertical lines on the primary system so the horizontal box median stays visible.

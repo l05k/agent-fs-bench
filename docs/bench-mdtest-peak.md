@@ -57,13 +57,13 @@ Each run writes one flat CSV per record kind plus a `manifest.json`:
 
 ## Default figures
 
-`run` renders one figure per operation, layout and size for both metrics, e.g. `figures/phases-ops_per_s-file-read-private-1048576.pdf` and `figures/phases-mib_per_s-file-read-private-1048576.pdf`, plus standalone Python scripts with the raw samples. X is the process count (log scale). Y is Kops/s or MiB/s, with the median/IQR over repeats. Bandwidth figures only contain rows that have a bandwidth value, so `mib_per_s` appears for create/read with S>0.
+`run` renders one figure per operation, layout and size for both metrics, e.g. `figures/phases-ops_per_s-file_read-private-1048576.pdf` and `figures/phases-mib_per_s-file_read-private-1048576.pdf` (punctuation in split values becomes `_`), plus standalone Python scripts with the raw samples. X is the process count (log scale). Y is Kops/s or MiB/s, with the median/IQR over repeats. Bandwidth figures only contain rows that have a bandwidth value, so `mib_per_s` appears for create/read with S>0.
 
 ```sh
 # Re-render the default figures for a finished run (or pool runs of one config).
 uv run python -m agent_fs_bench plot results/mdtest-peak/<run-id> --targets ours,nfs
 ```
 
-`plot` accepts several run directories of the same benchmark and rejects configs that differ. `--targets` sets legend order and filtering; the first entry is the paper's primary system. Each size's files-per-process value is part of the config, so changing `items_per_proc` produces a separate configuration.
+`plot` accepts several run directories of the same benchmark and rejects runs whose config or source fingerprint differ. `--targets` sets legend order and filtering; the first entry is the paper's primary system. Each size's files-per-process value is part of the config, so changing `items_per_proc` produces a separate configuration.
 
 The ceiling is the plateau of a curve. Points beyond the CPU count show whether more outstanding requests still help; past that plateau the client CPU, not the target, is the bottleneck. Report the client CPU count, mount options and server hardware with the numbers.

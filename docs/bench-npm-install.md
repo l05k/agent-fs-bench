@@ -199,8 +199,8 @@ n and the median of each metric per target × manager × `concurrent_jobs` (both
 
 | Table | Key columns | Metric columns |
 | --- | --- | --- |
-| `batches` | `manager`, `concurrent_jobs`, `repeat` | `install_mean_s`, `flush_mean_s`, `durable_mean_s`, `batch_install_s`, `batch_durable_s`, `installs_per_s`, `durable_installs_per_s`, `user_s`, `sys_s`, `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` |
-| `tasks` | `manager`, `concurrent_jobs`, `repeat`, `sample` | `install_s`, `flush_s`, `durable_s`, `user_s`, `sys_s`, `start_offset_s` |
+| `batches` | `target`, `manager`, `concurrent_jobs`, `repeat` | `install_mean_s`, `flush_mean_s`, `durable_mean_s`, `batch_install_s`, `batch_durable_s`, `installs_per_s`, `durable_installs_per_s`, `user_s`, `sys_s`, `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` |
+| `tasks` | `target`, `manager`, `concurrent_jobs`, `repeat`, `sample` | `install_s`, `flush_s`, `durable_s`, `user_s`, `sys_s`, `start_offset_s` |
 
 `repeat` is the 1-based batch index and `sample` the 1-based worker within the batch, so every
 worker's raw, unrounded sample is one `tasks` row. `npm-install-nofsync` emits the same tables
@@ -222,11 +222,12 @@ per-install latency.
 
 Discovered facts live in `manifest.json`: `targets[].info` holds `target_fstype`, `prep_fstype`,
 `cpu_count`, `tool_versions` per manager and `seed_input_sha256` of the committed template inputs;
-`config` holds the run settings (`fixture`, `pm`, `runs`, `concurrency`, `concurrent_jobs`,
-`ignore_scripts`, `flush`, `keep_node_modules`, `seed_only`, executable names, version pins). Runs,
-paths, device IDs and resolved executables are not stored, so the same experiment repeated in
-another run ID aggregates; a non-zero exit, missing tree, walk or fsync failure, or failed `du`
-aborts the run and emits no row for that batch.
+`targets[].path` holds the target directory, `run_id` the run, and `config` the run settings
+(`fixture`, `pm`, `runs`, `concurrency`, `concurrent_jobs`, `prep_dir`, `ignore_scripts`, `flush`,
+`keep_node_modules`, `seed_only`, executable names, version pins). Device IDs and resolved
+executable paths are not stored. `plot` pools repeated runs only when their configs and source
+fingerprints match; a non-zero exit, missing tree, walk or fsync failure, or failed `du` aborts the
+run and emits no row for that batch.
 
 ## Figures
 

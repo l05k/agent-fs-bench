@@ -92,7 +92,7 @@ results/<bench>/<run-id>/
 ```
 
 `run` writes the summaries and default figures after the last target. Re-plot,
-pool runs with identical configs, or draw a custom figure:
+pool runs with identical configs and sources, or draw a custom figure:
 
 ```sh
 uv run python -m agent_fs_bench plot results/mdtest/<run-id> --targets ours,ext4,nfs
@@ -105,10 +105,12 @@ Columns, summaries and plot options: [results and analysis](docs/results-and-ana
 ## Reproducibility
 
 - Archive the checkout, `uv.lock`, `local/` configs and result directories. The
-  source fingerprint covers uncommitted changes but does not replace a source archive.
-- `plot` pools runs only when their `config` matches, apart from keys given to
-  `--vary`. It does not compare tool versions (in each target's `info`), kernel,
-  mount options or host environment; keep those consistent yourself.
+  source fingerprint covers uncommitted changes (except each workload's `CONFIG`
+  literal, recorded as `config`) but does not replace a source archive.
+- `plot` pools runs only when their source fingerprints match and their `config`
+  matches apart from keys given to `--vary`. It does not compare tool versions (in
+  each target's `info`), kernel, mount options or host environment; keep those
+  consistent yourself.
 - No result is cold-cache. Page cache, FUSE client cache and server cache are
   separate layers, and each workload keeps its own sync and cache semantics.
 - Resource limits (cgroups) for FUSE clients, servers and the benchmark are set

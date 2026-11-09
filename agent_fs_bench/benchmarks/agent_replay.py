@@ -84,6 +84,8 @@ def load_cases(config: Path) -> list[ReplayCase]:
         if not (case.cassette / "validation.json").is_file():
             raise ValueError(f"validate cassette once before benchmarking: {case.cassette}")
         cases.append(case)
+    if not cases:
+        raise ValueError("at least one replay case is required")
     return cases
 
 

@@ -221,10 +221,17 @@ def warm_source(source: Path, expected_bytes: int) -> None:
 def resolve_copiers(args: argparse.Namespace, target_name: str) -> list[Copier]:
     """Expand the selected copier names into executable argv templates."""
     names = args.target_copiers.get(target_name, args.copiers)
+    if not names:
+        raise BenchmarkError(f"no copiers configured for {target_name}")
     copiers = []
     for name in dict.fromkeys(names):
+        if name not in args.commands:
+            raise BenchmarkError(f"no command configured for copier {name!r}")
         argv = shlex.split(args.commands[name])
-        copiers.append(Copier(name, (shutil.which(argv[0]) or argv[0], *argv[1:])))
+        executable = shutil.which(argv[0]) if argv else None
+        if executable is None:
+            raise BenchmarkError(f"{name}: executable not found: {argv[0] if argv else ''}")
+        copiers.append(Copier(name, (executable, *argv[1:])))
     return copiers
 
 
@@ -316,10 +323,14 @@ def build_plan(args: argparse.Namespace) -> list[Workload]:
     plan = []
     if args.stage in ("bytes", "all"):
         for total in args.byte_totals:
+            if total % args.byte_files:
+                raise BenchmarkError("byte_totals must be divisible by byte_files")
             plan.append(Workload("bytes", "large", args.byte_files, total // args.byte_files))
     if args.stage in ("files", "all"):
         plan.extend(Workload("files", "small", count, args.small_file_size) for count in args.file_counts)
     if args.stage in ("concurrency", "all"):
+        if args.concurrency_large_bytes % args.byte_files:
+            raise BenchmarkError("concurrency_large_bytes must be divisible by byte_files")
         for concurrency in args.conc_levels:
             plan.extend((
                 Workload("concurrency", "large", args.byte_files,

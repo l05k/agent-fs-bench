@@ -221,6 +221,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         if profile is not None:
             ctx.info['mount_profile_sha256'] = hashlib.sha256(
                 args.profiles.read_bytes()).hexdigest()
+        ctx.info['rank_placement'] = {}
         for repeat in range(1, args.repeats + 1):
             name = f'N{count}-R{repeat}'
             print(f'  {topology} {name}, K={args.directories}, hosts={len(workers)}', flush=True)
@@ -256,8 +257,13 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
             mounted = parallel(workers, 'idle')
             engine.warm(ranks, args.files, args.file_size_bytes, diagnostics / 'warm')
             parallel(workers, 'sample-start')
-            phases = engine.measure(ranks, args.files, args.file_size_bytes,
-                                    diagnostics / 'measured')[0]
+            phases, placements = engine.measure(ranks, args.files, args.file_size_bytes,
+                                                diagnostics / 'measured')
+            # Verified placement proofs per mdtest job; the planned host/CPU is in `ranks`.
+            ctx.info['rank_placement'][name] = {
+                job: [{**proof, 'host': mapping[proof['index']]['host']} for proof in proofs]
+                for job, proofs in placements.items()
+            }
             workload = parallel(workers, 'sample-stop')
             if profile is not None:
                 started = time.perf_counter()

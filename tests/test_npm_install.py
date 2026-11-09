@@ -400,5 +400,11 @@ class PlacementTests(unittest.TestCase):
                 with self.assertRaisesRegex(bench.BenchError, 'different device'):
                     bench.check_placement(target, prep)
 
+class ParseArgsTests(unittest.TestCase):
+    def test_duplicate_or_nonpositive_batch_sizes_are_rejected(self):
+        for jobs in ([2, 2], [0], [1, -1]):
+            with self.subTest(jobs=jobs), self.assertRaises(bench.BenchError):
+                bench.parse_args([], {**bench.CONFIG, 'concurrent_jobs': jobs})
+
 if __name__ == '__main__':
     unittest.main()

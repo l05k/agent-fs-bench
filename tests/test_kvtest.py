@@ -367,11 +367,12 @@ class MeasurementBoundaryTests(unittest.TestCase):
                     self.assertEqual(context.info["compiler"], "test compiler")
                     self.assertEqual(context.info["source_sha256"], {})
                     self.assertEqual(context.info["binary_sha256"], "test binary")
-                    self.assertEqual(context.info["observed"], {
-                        "journal_mode": "wal",
-                        "cache_size": -1000,
-                        "page_size": 4096,
-                    })
+                    self.assertEqual(context.info["integrity_check"], "ok")
+                    self.assertEqual(context.info["observed"], [
+                        {"repeat": repeat, "journal_mode": "wal", "cache_size": -1000,
+                         "page_size": 4096}
+                        for repeat in (1, 2)
+                    ])
                 else:
                     self.assertFalse(path.exists())
 

@@ -221,21 +221,21 @@ def measure(args: argparse.Namespace, target_dir: Path) -> Dict[str, Any]:
         )
 
     # One final validation after all timed runs, using the same binary.
-    parse_integrity_check(
+    integrity = parse_integrity_check(
         sqlite_tools.run_command([str(binary), "stat", str(db_path)]).stdout
     )
 
     return {
         "provenance": provenance,
         "repeats": repeats,
+        "integrity_check": integrity,
     }
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
     result = measure(args, ctx.work_dir)
     provenance = result["provenance"]
     repeats = result["repeats"]
-    observed = repeats[0]["parsed"]
-    sqlite_version = observed["sqlite_version"]
+    sqlite_version = repeats[0]["parsed"]["sqlite_version"]
     if any(
         entry["parsed"]["sqlite_version"] != sqlite_version
         for entry in repeats
@@ -247,11 +247,11 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         compiler=provenance["compiler_version"],
         source_sha256=provenance["source_sha256"],
         binary_sha256=provenance["binary_sha256"],
-        observed={
-            "journal_mode": observed["journal_mode"],
-            "cache_size": observed["cache_size"],
-            "page_size": observed["page_size"],
-        },
+        integrity_check=result["integrity_check"],
+        observed=[{
+            "repeat": entry["repeat"],
+            **{key: entry["parsed"][key] for key in ("journal_mode", "cache_size", "page_size")},
+        } for entry in repeats],
     )
 
     keys = {

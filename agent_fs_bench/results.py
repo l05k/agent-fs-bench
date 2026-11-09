@@ -1,5 +1,6 @@
 """Per-run results: manifest.json plus one flat CSV per record kind."""
 
+import ast
 import csv
 from dataclasses import dataclass, field
 import hashlib
@@ -14,7 +15,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def source_digest() -> str:
-    """Identify the actual Python sources and fixed inputs, including local edits."""
+    """Identify the Python sources and fixed inputs, including local edits.
+
+    Each module's top-level CONFIG literal is excluded: the manifest records its
+    values as `config`, so one sweep can edit CONFIG per run (e.g. mount-scale
+    clients) while any other source change still yields a new fingerprint.
+    """
     digest = hashlib.sha256()
     paths = list((PROJECT_ROOT / 'agent_fs_bench').rglob('*.py'))
     paths += [PROJECT_ROOT / 'pyproject.toml', PROJECT_ROOT / 'uv.lock']
@@ -24,14 +30,28 @@ def source_digest() -> str:
     for path in sorted(paths):
         digest.update(str(path.relative_to(PROJECT_ROOT)).encode())
         digest.update(b'\0')
-        digest.update(path.read_bytes())
+        digest.update(_without_config(path) if path.suffix == '.py' else path.read_bytes())
         digest.update(b'\0')
     return digest.hexdigest()
 
 
+def _without_config(path: Path) -> bytes:
+    text = path.read_text(encoding='utf-8')
+    lines = text.splitlines(keepends=True)
+    for node in reversed(ast.parse(text).body):
+        targets = (node.targets if isinstance(node, ast.Assign)
+                   else [node.target] if isinstance(node, ast.AnnAssign) else [])
+        if any(isinstance(target, ast.Name) and target.id == 'CONFIG' for target in targets):
+            del lines[node.lineno - 1:node.end_lineno]
+    return ''.join(lines).encode()
+
+
 def write_json(path: Path, value: Any) -> None:
-    path.write_text(json.dumps(value, indent=2, ensure_ascii=False, default=str) + '\n',
-                    encoding='utf-8')
+    """Replace the file in one step; the manifest is rewritten after every target."""
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False, default=str) + '\n',
+                         encoding='utf-8')
+    temporary.replace(path)
 
 
 def read_table(path: Path) -> list[dict[str, str]]:

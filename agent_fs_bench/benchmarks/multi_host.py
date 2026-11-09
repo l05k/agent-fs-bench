@@ -795,6 +795,9 @@ def _drive_workers(plan: ExperimentPlan, sessions: Sequence[WorkerSession]) -> N
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
     worker_dir = Path(args.worker_dir)
     hosts_path = Path(args.hosts)
+    # Fail on the controller; a relative or root path is only rejected remotely.
+    _safe_absolute(worker_dir)
+    _safe_absolute(ctx.target.path)
     if worker_dir.is_relative_to(ctx.target.path):
         raise ValueError("worker-dir must be outside the measured target")
     hosts = load_hosts(hosts_path)

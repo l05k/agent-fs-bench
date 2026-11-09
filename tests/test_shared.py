@@ -9,7 +9,7 @@ from unittest import mock
 
 from agent_fs_bench.analysis import Figure, figure_data, plot
 from agent_fs_bench.cli import run_benchmark
-from agent_fs_bench.results import RunContext, Tables, read_table, write_json
+from agent_fs_bench.results import RunContext, Tables, _without_config, read_table, write_json
 from agent_fs_bench.targets import Target, load_targets
 
 
@@ -152,6 +152,13 @@ class RunCommandTests(unittest.TestCase):
             self.invoke(fake_workload(), '--dirs', str(self.dirs[0]))
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_misspelled_target_copier_alias_fails_before_creating_run(self):
+        module = fake_workload()
+        module.parse_args = lambda argv: SimpleNamespace(target_copiers={'LakeBase': ['lakebase']})
+        with self.assertRaisesRegex(ValueError, 'unknown target_copiers aliases: LakeBase'):
+            self.invoke(module, '--dirs', *map(str, self.dirs))
+        self.assertFalse(self.results.exists())
+
 
 def rows(*values):
     return [dict(zip(('target', 'operation', 'procs', 'repeat', 'ops_per_s'), map(str, value)))
@@ -180,6 +187,16 @@ class FigureDataTests(unittest.TestCase):
             ('-1', '1', ['stat'], {'a': [[3.0]]}),
         ])
 
+    def test_legend_entries_match_full_series_labels_or_bare_targets(self):
+        spec = Figure('t', 'procs', 'ops_per_s', series=('target', 'copier'))
+        table = [dict(zip(('target', 'copier', 'procs', 'ops_per_s'), values)) for values in (
+            ('a', 'cp-r', '1', '1'), ('a', 'native', '1', '2'), ('b', 'cp-r', '1', '3'))]
+        for legend, series in ((['a/native', 'b/cp-r'], ['a/native', 'b/cp-r']),
+                               (['b', 'a/cp-r'], ['b/cp-r', 'a/cp-r'])):
+            with self.subTest(legend=legend):
+                (_, data), = figure_data(spec, table, legend, (3.5, 1.5))
+                self.assertEqual(data['series'], series)
+
 
 class PlotRunsTests(unittest.TestCase):
     def setUp(self):
@@ -189,14 +206,15 @@ class PlotRunsTests(unittest.TestCase):
         self.render = self.enterContext(mock.patch('agent_fs_bench.figure.render'))
         self.spec = Figure('phases', 'procs', 'ops_per_s')
 
-    def make_run(self, name, target, value, repeats=3):
+    def make_run(self, name, target, value, repeats=3, source='s'):
         run = self.root / name
         run.mkdir()
         tables = Tables(run)
         RunContext('mdtest', name, Target(target, run), run, run, tables).emit(
             'phases', {'procs': 1, 'repeat': 1}, {'ops_per_s': value})
         tables.close()
-        write_json(run / 'manifest.json', {'benchmark': 'mdtest', 'config': {'repeats': repeats},
+        write_json(run / 'manifest.json', {'benchmark': 'mdtest', 'source_sha256': source,
+                                           'config': {'repeats': repeats},
                                            'targets': [{'name': target}], 'tables': tables.schemas})
         return run
 
@@ -219,10 +237,38 @@ class PlotRunsTests(unittest.TestCase):
         plot(runs, [self.spec], vary=('repeats',))
         self.assertEqual(self.render.call_args.args[0]['values'], {'a': [[1.0]], 'b': [[2.0]]})
 
+    def test_runs_of_different_sources_never_pool(self):
+        runs = [self.make_run('r1', 'a', 1.0), self.make_run('r2', 'b', 2.0, source='t')]
+        for vary in ((), ('repeats',)):
+            with self.subTest(vary=vary), self.assertRaisesRegex(ValueError, 'source_sha256'):
+                plot(runs, [self.spec], vary=vary)
+        self.render.assert_not_called()
+
+    def test_unknown_target_names_fail_instead_of_drawing_nothing(self):
+        run = self.make_run('r1', 'nfs', 1.0)
+        with mock.patch('agent_fs_bench.analysis.workload', return_value=fake_workload()), \
+                self.assertRaisesRegex(ValueError, 'unknown --targets Ours'):
+            plot([run], targets=['Ours', 'nfs'])
+        self.render.assert_not_called()
+
     def test_custom_figure_without_rows_fails(self):
         run = self.make_run('r1', 'a', 1.0)
         with self.assertRaisesRegex(ValueError, 'no rows'):
             plot([run], [Figure('phases', 'procs', 'ops_per_s', where={'procs': 8})])
+
+
+class SourceDigestTests(unittest.TestCase):
+    def test_config_literal_is_excluded_but_any_other_code_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'workload.py'
+
+            def digest(clients, code):
+                path.write_text(f"CONFIG: dict = {{\n    'clients': {clients},\n}}\n"
+                                f"def run():\n    return {code}\n")
+                return _without_config(path)
+
+            self.assertEqual(digest(64, 1), digest(256, 1))
+            self.assertNotEqual(digest(64, 1), digest(64, 2))
 
 
 if __name__ == '__main__':

@@ -28,7 +28,7 @@ For example, with 64 available logical CPUs locally and 64 on each of two remote
 
 ## Dependencies and network
 
-Every participating machine preinstalls Linux, Python 3.12+, and the **same mdtest binary and Open MPI 4.1.x version on the same architecture**. The controller also needs the repository and its Python environment. mdtest must link this Open MPI; other MPI implementations are not supported. The benchmark does not install tools or use sudo.
+Every participating machine preinstalls Linux, Python 3.12+, and the **same mdtest binary and Open MPI 4.1.x version on the same architecture**. The controller also needs the repository, its Python environment and the Arial font: `run` renders the default figures after the last measurement, so a missing font fails the run only after the CSV tables are written (re-plot them elsewhere with `plot`). mdtest must link this Open MPI; other MPI implementations are not supported. The benchmark does not install tools or use sudo.
 
 Build upstream IOR as follows:
 
@@ -143,12 +143,12 @@ Each run writes `results/mount-scale/<run-id>/manifest.json` (run configuration 
 
 | Table | Key columns | Metric columns |
 | --- | --- | --- |
-| `phases` | topology, clients, phase, repeat | ops, elapsed_s, ops_per_s, ops_per_s_per_client, rank_mean_us_per_op, bytes, mib_per_s |
-| `ranks` | topology, clients, phase, repeat, sample, host, cpu | elapsed_s |
-| `mounts` | topology, clients, action, repeat | controller_dispatch_elapsed_s, measured_mounts, remaining_mounts |
-| `lifecycle` | topology, clients, host, action, repeat | elapsed_s, measured_mounts, remaining_mounts |
-| `agents` | topology, clients, host, action, repeat, sample | elapsed_s |
-| `resources` | topology, clients, host, state, repeat | levels, interval, deltas and peaks (below) |
+| `phases` | target, topology, clients, phase, repeat | ops, elapsed_s, ops_per_s, ops_per_s_per_client, rank_mean_us_per_op, bytes, mib_per_s |
+| `ranks` | target, topology, clients, phase, repeat, sample, host, cpu | elapsed_s |
+| `mounts` | target, topology, clients, action, repeat | controller_dispatch_elapsed_s, measured_mounts, remaining_mounts |
+| `lifecycle` | target, topology, clients, host, action, repeat | elapsed_s, measured_mounts, remaining_mounts |
+| `agents` | target, topology, clients, host, action, repeat, sample | elapsed_s |
+| `resources` | target, topology, clients, host, state, repeat | levels, interval, deltas and peaks (below) |
 
 `phase` is `private/create`, `private/stat`, `private/read`, `private/remove`, or `shared-<n>/stat`/`shared-<n>/read`. `action` is `mount` or `unmount`; `state` is `baseline`, `mounted-idle`, `released-idle` or `workload`. In `ranks`, `sample` is the global mdtest rank index and `host`/`cpu` are that rank's logical host and pinned CPU; in `agents`, `sample` is the client index on that host. Metric cells that do not apply to a row stay empty (for example `remaining_mounts` on a mount row, `bytes` on a stat phase, deltas on the baseline, peaks on a non-workload state). `summary/phases.csv` therefore has one row per target × topology × clients × phase with `n` and each metric's median; `summary/resources.csv` has one row per target × topology × clients × host × state.
 
@@ -168,9 +168,9 @@ Each run writes `results/mount-scale/<run-id>/manifest.json` (run configuration 
 
 `scaling_efficiency` is not emitted: a single-point run has no same-round N=1 baseline. If a paper needs efficiency, choose a comparable baseline in separate runs; the harness does not add experiment points implicitly.
 
-`manifest.json` stores the parsed configuration once; `targets[i].info` stores discovered facts: per-host hostname, kernel, architecture, Python, CPU affinity list and assigned CPUs; the mdtest binary path and SHA256; the Open MPI version; and the mount profile SHA256. The verified rank placement is not duplicated there: `ranks` carries each rank's host and CPU for every phase, and the wrapper's proof already fails the run on any host/CPU mismatch. SSH transport configuration and mount credentials are not written; archive inventory/profile privately. Raw placement proofs, mdtest stdout/stderr, CSV/appfile remain as diagnostic attachments.
+`manifest.json` stores the parsed configuration once; `targets[i].info` stores discovered facts: per-host hostname, kernel, architecture, Python, CPU affinity list and assigned CPUs; the mdtest binary path and SHA256; the Open MPI version; the mount profile SHA256; and `rank_placement`, the verified placement proof per run case (`N<clients>-R<repeat>`) and mdtest job: each rank's index, logical host, hostname, CPU and affinity. `ranks` carries each rank's planned host and CPU for every phase; the wrapper's proof fails the run on any host/CPU mismatch. SSH transport configuration and mount credentials are not written; archive inventory/profile privately. Raw placement proofs, mdtest stdout/stderr, CSV/appfile remain as diagnostic attachments.
 
-Default figures (every run renders them, including the directory smoke; re-render with `uv run python -m agent_fs_bench plot <run-dir>...`):
+Default figures (each is rendered when its table has rows, so the directory smoke, which mounts nothing, skips `mount-dispatch`; re-render with `uv run python -m agent_fs_bench plot <run-dir>...`):
 
 | Figure stem | Table | x | y | Split |
 | --- | --- | --- | --- | --- |
@@ -178,9 +178,9 @@ Default figures (every run renders them, including the directory smoke; re-rende
 | `mount-dispatch-<topology>-<action>` | `mounts` | clients | controller_dispatch_elapsed_s | topology, action |
 | `memory-delta-<topology>` | `resources` | clients | used_bytes_delta for `mounted-idle` | topology |
 
-Each run measures one N, so its default figures hold one x point. Pool runs of different N into scaling curves with `uv run python -m agent_fs_bench plot <run-N1> <run-N2>... --vary clients`; all other configuration must match. Line figures draw the median and IQR of all matching rows at each x.
+Each run measures one N, so its default figures hold one x point. Pool runs of different N into scaling curves with `uv run python -m agent_fs_bench plot <run-N1> <run-N2>... --vary clients`; all other configuration and the source fingerprint must match (the fingerprint ignores each module's `CONFIG` literal, so editing `CONFIG['clients']` between runs is fine). Line figures draw the median and IQR of all matching rows at each x.
 
-Resources come from **whole-host counters on each machine**: CPU busy, MemTotal−MemAvailable, cache, dirty, slab, etc. Every `resources` row carries the raw levels (`used_bytes`, `cached_bytes`, `dirty_bytes`, `slab_bytes`, `slab_reclaimable_bytes`, `slab_unreclaimable_bytes`, `mount_entries`) and the sampling interval (`sample_elapsed_s`, `cpu_busy_s`, `cpu_busy_cores`, `cpu_busy_percent`); `mounted-idle` and `released-idle` additionally carry `used_bytes_delta`, `slab_bytes_delta`, `slab_unreclaimable_bytes_delta` and `mount_entries_delta` against `baseline`; `workload` carries observed `peak_*` levels and `peak_*_delta`. Counters include Python, MPI, daemons, the kernel and other processes; there is no filesystem CPU/RSS attribution. Sampling windows include MPI startup/shutdown and phase gaps, and control timing differs across machines; do not add per-host peaks and call it a simultaneous global peak. Mount entries belong to the worker's current namespace, so a daemon must create mounts in that namespace.
+Resources come from **whole-host counters on each machine**: CPU busy, MemTotal−MemAvailable, cache, dirty, slab, etc. The `baseline`, `mounted-idle` and `released-idle` rows carry the raw levels (`used_bytes`, `cached_bytes`, `dirty_bytes`, `slab_bytes`, `slab_reclaimable_bytes`, `slab_unreclaimable_bytes`, `mount_entries`); every row carries the sampling interval (`sample_elapsed_s`, `cpu_busy_s`, `cpu_busy_cores`, `cpu_busy_percent`); `mounted-idle` and `released-idle` additionally carry `used_bytes_delta`, `slab_bytes_delta`, `slab_unreclaimable_bytes_delta` and `mount_entries_delta` against `baseline`; `workload` leaves the raw levels empty and carries observed `peak_*` levels and `peak_*_delta`. Counters include Python, MPI, daemons, the kernel and other processes; there is no filesystem CPU/RSS attribution. Sampling windows include MPI startup/shutdown and phase gaps, and control timing differs across machines; do not add per-host peaks and call it a simultaneous global peak. Mount entries belong to the worker's current namespace, so a daemon must create mounts in that namespace.
 
 ## Paper claim boundaries
 

@@ -20,7 +20,7 @@ measurement. A failed check emits no row.
 | Field | Meaning |
 | --- | --- |
 | `benchmark`, `run_id` | Workload; UTC run ID with microseconds |
-| `source_sha256` | Fingerprint of benchmark sources and fixed inputs, including uncommitted edits |
+| `source_sha256` | Fingerprint of benchmark sources and fixed inputs, including uncommitted edits; each workload's `CONFIG` literal is excluded because `config` records it |
 | `config` | The workload's settings: `CONFIG` plus workload flags |
 | `targets[]` | `name`, `path` and `info` (tool versions, binary hashes, fstype, ...) of each finished target |
 | `tables` | `keys` and `metrics` columns of each table |
@@ -30,13 +30,11 @@ partial rows stay in the CSV.
 
 ## Tables
 
-Columns are `target`, then key columns (dimensions such as `operation`,
-`procs`, `repeat`), then metric columns (numbers whose names carry units). An
-empty cell means the metric does not apply to that row. Booleans are `0`/`1`.
-
-`repeat` (1-based repetition) and `sample` (index of one raw sample within a
-measurement, e.g. a request or a worker) are pooled keys; every other key is a
-dimension.
+Columns are `target`, then key columns, then metric columns (numbers whose names
+carry units). Key columns are dimensions (such as `operation` or `procs`) plus
+the pooled keys `repeat` (1-based repetition) and `sample` (index of one raw
+sample within a measurement, e.g. a request or a worker). An empty cell means
+the metric does not apply to that row. Booleans are `0`/`1`.
 
 ## summary/
 
@@ -54,7 +52,7 @@ figure:
 # Default figures again, primary system first in the legend
 uv run python -m agent_fs_bench plot results/mdtest/<run-id> --targets ours,nfs,ext4
 
-# Pool repeated runs; their configs must match
+# Pool repeated runs; their configs and source fingerprints must match
 uv run python -m agent_fs_bench plot results/mdtest/<run-a> results/mdtest/<run-b> \
   --output figures/mdtest
 
@@ -71,16 +69,20 @@ uv run python -m agent_fs_bench plot results/mdtest/<run-id> --table phases \
 - `--kind line` (default): median with IQR error bars over all pooled rows at
   each numeric x. `--kind box`: one box per x category, in first-appearance order.
 - `--series` (default `target`): columns joined with `/` as legend labels, at
-  most 4. Legend order follows `--targets` (which also filters), else run order.
+  most 4 per figure.
+- `--targets`: legend order and filter; each entry is a target (all its series)
+  or a full series label such as `LakeBase/cp-r`. A name matching nothing is an
+  error. Default: target run order.
 - `--split`: one figure per value combination, titled in the upper-left corner,
-  file `<name>-<values>`.
+  file `<name>-<values>` (punctuation in values becomes `_`).
 - `--where COLUMN=VALUE` (repeatable): exact match on the CSV text.
 - `--xscale`/`--yscale` divide values (`1048576` for MiB); `--logx`/`--logy`;
   `--size W H` in inches (default single column `3.5 1.5`).
 
-Runs pool only when their `benchmark` and `config` match, apart from keys given
-to `--vary`; otherwise `plot` names the differing keys. Vary a key only when the
-figure keeps those runs apart as x, series or split. Each figure writes
+Runs pool only when their `benchmark` and `source_sha256` match and their
+`config` matches apart from keys given to `--vary`; otherwise `plot` names what
+differs. Vary a key only when the figure keeps those runs apart as x, series or
+split. Each figure writes
 `<stem>.pdf`, a 600-dpi
 `<stem>.png` and a self-contained `<stem>.py` with embedded data; `python
 <stem>.py` regenerates both images. Style follows

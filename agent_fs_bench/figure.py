@@ -81,7 +81,8 @@ def render(data: dict, stem: Path) -> None:
 
     series, xs, values = data['series'], data['x'], data['values']
     if len(series) > len(PALETTE):
-        raise ValueError(f'at most {len(PALETTE)} series per figure, got {series}')
+        raise ValueError(f'at most {len(PALETTE)} series per figure, got {series}; '
+                         'select them with plot --targets')
     try:
         font_manager.findfont('Arial', fallback_to_default=False)
     except ValueError:

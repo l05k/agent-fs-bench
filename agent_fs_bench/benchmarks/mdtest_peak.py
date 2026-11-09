@@ -176,4 +176,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     if parsed.smoke:
         settings.update(items_per_proc={size: 16 for size in CONFIG["items_per_proc"]},
                         conc_levels=(1, 2), repeats=1)
-    return argparse.Namespace(**settings, **vars(parsed))
+    args = argparse.Namespace(**settings, **vars(parsed))
+    if (args.repeats < 1 or not args.layouts or not args.conc_levels
+            or not args.items_per_proc or set(args.layouts) - {"private", "shared"}):
+        raise BenchmarkError("layouts must be private and/or shared, with a non-empty "
+                             "process and size selection")
+    return args

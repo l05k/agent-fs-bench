@@ -590,7 +590,12 @@ def parse_args(argv: list[str], config: dict[str, Any] = CONFIG) -> argparse.Nam
     parser = argparse.ArgumentParser(
         description="Offline installation batches; edit CONFIG for experiment settings."
     )
-    return argparse.Namespace(**config, **vars(parser.parse_args(argv)))
+    namespace = argparse.Namespace(**config, **vars(parser.parse_args(argv)))
+    # Duplicate sizes would write rows with identical keys and double-weight the summary.
+    if len(set(namespace.concurrent_jobs)) != len(namespace.concurrent_jobs) or any(
+            count < 1 for count in namespace.concurrent_jobs):
+        die("concurrent_jobs must be distinct positive batch sizes")
+    return namespace
 
 
 def check_placement(target: Path, prep: Path) -> tuple[str, str]:

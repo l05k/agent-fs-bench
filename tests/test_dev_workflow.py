@@ -132,6 +132,7 @@ class WorkflowRecordingTests(unittest.TestCase):
         self.assertEqual(ctx.info['base_commit'], base)
         self.assertEqual(ctx.info['jobs'], 1)
         self.assertEqual(ctx.info['tool_versions']['compiler'], self.compiler_version())
+        self.assertEqual([entry['ok'] for entry in ctx.info['tree_assertions']], [True])
         workflow = read_table(ctx.result_dir / 'workflow.csv')
         self.assertEqual(len(workflow), 1)
         self.assertEqual(workflow[0]['target'], 'local')

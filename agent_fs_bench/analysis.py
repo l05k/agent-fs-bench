@@ -80,22 +80,29 @@ def _cell(value) -> str:
     return str(int(value) if isinstance(value, bool) else value)
 
 
-def figure_data(spec: Figure, rows: list[dict], targets: list[str],
+def figure_data(spec: Figure, rows: list[dict], legend: list[str],
                 size: tuple[float, float]) -> list[tuple[str, dict]]:
-    """Group rows into one dataset per split value: series × x → raw y samples."""
+    """Group rows into one dataset per split value: series × x → raw y samples.
+
+    A row joins the first legend entry equal to its series label (columns of
+    `series` joined by '/') or to its target; rows matching no entry are dropped.
+    """
     groups: dict[tuple, dict] = {}
     for row in rows:
-        if row[spec.y] == '' or any(row[key] != _cell(value) for key, value in spec.where.items()):
+        label = '/'.join(row[key] for key in spec.series)
+        rank = next((index for index, name in enumerate(legend)
+                     if name in (label, row['target'])), None)
+        if rank is None or row[spec.y] == '' or any(
+                row[key] != _cell(value) for key, value in spec.where.items()):
             continue
         group = groups.setdefault(tuple(row[key] for key in spec.split), {'x': {}, 'series': {}})
         x = float(row[spec.x]) / spec.xscale if spec.kind == 'line' else row[spec.x]
         group['x'].setdefault(x, None)
-        rank, points = group['series'].setdefault(
-            '/'.join(row[key] for key in spec.series), (targets.index(row['target']), {}))
+        _, points = group['series'].setdefault(label, (rank, {}))
         points.setdefault(x, []).append(float(row[spec.y]) / spec.yscale)
     datasets = []
     for split, group in groups.items():
-        # Stable sort: target order first, then first appearance within a target.
+        # Stable sort: legend order first, then first appearance within an entry.
         names = sorted(group['series'], key=lambda name: group['series'][name][0])
         xs = sorted(group['x']) if spec.kind == 'line' else list(group['x'])
         datasets.append((''.join('-' + re.sub(r'[^A-Za-z0-9.]+', '_', value) for value in split), {
@@ -112,31 +119,45 @@ def plot(run_dirs: list[Path], figures: list[Figure] | None = None, *,
          size: tuple[float, float] = (3.5, 1.5), vary: tuple[str, ...] = ()) -> list[Path]:
     """Render `figures` (default: the workload's FIGURES) and return the written stems.
 
-    Several runs of one benchmark pool their rows only if their configs match,
-    apart from keys in `vary` (e.g. one mount-scale run per client count).
+    Several runs pool their rows only if they share benchmark and source
+    fingerprint and their configs match apart from keys in `vary` (e.g. one
+    mount-scale run per client count). `targets` orders and filters the legend
+    by target name or full series label (e.g. `LakeBase/cp-r`).
     """
     manifests = [json.loads((run / 'manifest.json').read_text(encoding='utf-8')) for run in run_dirs]
     first = manifests[0]
     for run, manifest in zip(run_dirs[1:], manifests[1:]):
         if manifest['benchmark'] != first['benchmark']:
             raise ValueError(f'{run}: benchmark {manifest["benchmark"]} is not {first["benchmark"]}')
+        if manifest['source_sha256'] != first['source_sha256']:
+            raise ValueError(f'{run}: source_sha256 differs from {run_dirs[0]}; '
+                             'runs of different benchmark sources never pool')
         differ = sorted(key for key in first['config'].keys() | manifest['config'].keys()
                         if key not in vary
                         and first['config'].get(key) != manifest['config'].get(key))
         if differ:
             raise ValueError(f'{run}: config differs from {run_dirs[0]} in {", ".join(differ)}; '
                              'pass --vary KEY,... only if the figure separates them')
-    targets = targets or list(dict.fromkeys(
+    finished = list(dict.fromkeys(
         target['name'] for manifest in manifests for target in manifest['targets']))
+    legend = targets or finished
     required = figures is not None
     if figures is None:
         figures = getattr(workload(first['benchmark']), 'FIGURES', [])
+    tables = {spec.table: [row for run in run_dirs if (run / f'{spec.table}.csv').exists()
+                           for row in read_table(run / f'{spec.table}.csv')]
+              for spec in figures}
+    if targets:
+        known = set(finished) | {'/'.join(row[key] for key in spec.series)
+                                 for spec in figures for row in tables[spec.table]}
+        unknown = [name for name in targets if name not in known]
+        if unknown:
+            raise ValueError(f'unknown --targets {", ".join(unknown)}; '
+                             f'targets and series: {", ".join(sorted(known))}')
     output = output or run_dirs[0] / 'figures'
     stems = []
     for spec in figures:
-        rows = [row for run in run_dirs if (run / f'{spec.table}.csv').exists()
-                for row in read_table(run / f'{spec.table}.csv') if row['target'] in targets]
-        datasets = figure_data(spec, rows, targets, size)
+        datasets = figure_data(spec, tables[spec.table], legend, size)
         if required and not datasets:
             raise ValueError(f'no rows in {spec.table}.csv match {spec}')
         for suffix, data in datasets:
@@ -163,7 +184,8 @@ def main(argv: list[str]) -> int:
         description='Render the workload default figures, or one custom figure with --table.')
     parser.add_argument('runs', nargs='+', type=Path, help='run directories of one benchmark')
     parser.add_argument('--targets', type=lambda text: text.split(','),
-                        help='comma-separated legend order and filter; the first is the primary system')
+                        help='comma-separated legend order and filter: target names or full '
+                             'series labels (e.g. LakeBase/cp-r); the first is the primary system')
     parser.add_argument('--output', type=Path, help='figure directory (default: <first run>/figures)')
     parser.add_argument('--size', type=float, nargs=2, default=(3.5, 1.5),
                         metavar=('WIDTH', 'HEIGHT'), help='inches per figure')
@@ -192,7 +214,10 @@ def main(argv: list[str]) -> int:
         figures = [Figure(args.table, args.x, args.y, args.kind, args.series, args.split,
                           dict(item.split('=', 1) for item in args.where), args.xlabel,
                           args.ylabel, args.xscale, args.yscale, args.logx, args.logy, args.name)]
-    for stem in plot(args.runs, figures, targets=args.targets, output=args.output,
-                     size=tuple(args.size), vary=args.vary):
+    stems = plot(args.runs, figures, targets=args.targets, output=args.output,
+                 size=tuple(args.size), vary=args.vary)
+    if not stems:
+        raise ValueError(f'no figure rows in {", ".join(map(str, args.runs))}')
+    for stem in stems:
         print(f'{stem}.pdf')
     return 0

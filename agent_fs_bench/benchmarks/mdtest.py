@@ -274,4 +274,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     settings = dict(CONFIG)
     if parsed.smoke:
         settings.update(total_items=128, conc_levels=(1, 2), repeats=2)
-    return argparse.Namespace(**settings, **vars(parsed))
+    args = argparse.Namespace(**settings, **vars(parsed))
+    # A typo would run the wrong layout/subset under its own label, or no phase at all.
+    if (args.repeats < 1 or not args.layouts or not args.subsets or not args.conc_levels
+            or set(args.layouts) - {"private", "shared"} or set(args.subsets) - {"file", "dir"}):
+        raise BenchmarkError("layouts must be private/shared, subsets file/dir and "
+                             "process counts non-empty")
+    for processes in args.conc_levels:
+        if args.total_items % processes or args.total_items // processes < 2:
+            raise BenchmarkError("total_items must divide evenly into at least two items per process")
+    return args
