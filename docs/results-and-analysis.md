@@ -106,6 +106,9 @@ Plot kinds:
 - **mdtest:** one figure per operation and layout, e.g.
   `<stem>-file-create-private.pdf`; y axis in Kops/s. Selected targets must cover
   the same process counts. These are throughput samples, not per-op latency.
+- **mdtest-peak:** same curves, one per operation, layout and file size
+  (`<stem>-file-read-private-S1048576.pdf`); `--metric ops_per_s` (Kops/s) or
+  `--metric mib_per_s` (MiB/s, create/read with non-empty files only).
 
 Every box, line or curve accepts exactly one `(parameters, source_sha256)`
 identity. If a selection mixes identities, `plot` fails and lists the

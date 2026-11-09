@@ -115,6 +115,30 @@ class MdtestPlotTests(unittest.TestCase):
         figures = mdtest_plot_data(self.connection(), self.args)
         self.assertEqual(figures[0][1]['points']['ours'], [{'x': 1, 'values': [5.0]}])
 
+    def test_peak_sizes_stay_separate_and_bandwidth_skips_empty_files(self):
+        for target in self.args.targets:
+            for size in (0, 4096):
+                context = RunContext(
+                    'mdtest-peak', 'run-a', Target(target, Path('/mnt') / target),
+                    Path('/missing/work'), Path('/missing/results'),
+                    {'mdtest_version': '4.0.0', 'cache_state': 'c', 'completion': 'y'},
+                    'source', self.output,
+                )
+                metrics = {'concurrency': 2, 'ops': 64, 'elapsed_s': 1.0, 'ops_per_s': 64.0}
+                if size:
+                    metrics.update(bytes=64 * size, mib_per_s=0.25)
+                context.emit(f'file-create/private/S{size}/n32/P2', metrics, details={
+                    'operation': 'file-create', 'layout': 'private',
+                    'file_size_bytes': size, 'items_per_proc': 32})
+        self.args.benchmark = 'mdtest-peak'
+        connection = self.connection()
+        self.assertEqual([suffix for suffix, _ in mdtest_plot_data(connection, self.args)],
+                         ['file-create-private-S0', 'file-create-private-S4096'])
+        self.args.metric = 'mib_per_s'
+        figures = mdtest_plot_data(connection, self.args)
+        self.assertEqual([suffix for suffix, _ in figures], ['file-create-private-S4096'])
+        self.assertEqual(figures[0][1]['points']['ours'], [{'x': 2, 'values': [0.25]}])
+
 
 if __name__ == '__main__':
     unittest.main()
