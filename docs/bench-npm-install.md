@@ -21,7 +21,7 @@ private homes and logs live elsewhere.
 
 | Path | Purpose |
 | --- | --- |
-| `agent_fs_bench/benchmarks/npm_install.py` | stdlib workload module and `CONFIG`; `data/pnpm-bench*/` holds the fixture inputs |
+| `agent_fs_bench/benchmarks/npm_install.py` | stdlib workload module and `CONFIG`; `data/pnpm-bench/` holds the fixture inputs |
 | `<target>/agent-fs-bench/npm-install/<run-id>/<manager>-c<C>-r<batch>/task-<i>/` | one worker's project |
 | `<prep-dir>/agent-fs-bench/npm-install/<run-id>/<target>/` | `sources/`, `seeds/`, `templates/`, `batches/.../task-<i>/{source,home,tmp,xdg,config,data}` |
 | `results/npm-install/<run-id>/{manifest.json,batches.csv,tasks.csv}` | run manifest, batch rows and per-worker samples; logs: `results/npm-install/<run-id>/<target>/logs/` |
@@ -33,12 +33,9 @@ removed after the inventory unless `keep_node_modules`, and the benchmark root s
 
 ## Fixture
 
-`CONFIG["fixture"]` names one of the trees pnpm's own install benchmark uses: `pnpm-bench`
-(`pnpm11/benchmarks/fixture`, 84 deps + 4 devDeps) or `pnpm-bench-integrated`
-(`pnpm/tasks/integrated-benchmark/src/fixtures`, 109 deps, ships a `pnpm-workspace.yaml`). pnpm
-replays the committed `pnpm-lock.yaml` with `--frozen-lockfile`; the fixture workspace file is
-copied into every project (`storeDir` is overridden by `--store-dir`) and pins
-`supportedArchitectures` plus `enableGlobalVirtualStore: false` for the integrated tree.
+`CONFIG["fixture"]` names the tree pnpm's own install benchmark uses: `pnpm-bench`
+(`pnpm11/benchmarks/fixture`, 84 deps + 4 devDeps). pnpm replays the committed `pnpm-lock.yaml`
+with `--frozen-lockfile`; `storeDir` is overridden by `--store-dir`.
 
 npm cannot read a pnpm lockfile and these trees have peer ranges its resolver rejects, so each
 fixture carries a `package-lock.json` resolved with `--legacy-peer-deps`; seeding and timed installs

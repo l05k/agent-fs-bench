@@ -31,11 +31,10 @@ from agent_fs_bench.benchmarks.clone import fstype
 
 PNPM_IMPORT_METHOD = "copy"
 LOCAL_PREP_FILESYSTEMS = {"tmpfs", "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs"}
-# Upstream pnpm fixtures vendored under data/, so the benchmark can replay the
-# dependency trees pnpm's own install benchmark uses.
+# Upstream pnpm fixture vendored under data/, so the benchmark can replay the
+# dependency tree pnpm's own install benchmark uses.
 FIXTURES = {
     "pnpm-bench": "data/pnpm-bench",
-    "pnpm-bench-integrated": "data/pnpm-bench-integrated",
 }
 
 # All experiment settings are code-only. Change the version pins deliberately
@@ -249,15 +248,11 @@ def copy_fixture_manifest(
     fixture_dir: Path, destination_dir: Path, lockfile: str
 ) -> None:
     ensure_dir(destination_dir)
-    for name in ("package.json", lockfile, "pnpm-workspace.yaml"):
+    for name in ("package.json", lockfile):
         source = fixture_dir / name
-        destination = destination_dir / name
-        if source.is_file():
-            shutil.copy2(source, destination)
-        elif name == "pnpm-workspace.yaml":
-            destination.unlink(missing_ok=True)
-        else:
+        if not source.is_file():
             die(f"required fixture input is missing: {source}")
+        shutil.copy2(source, destination_dir / name)
 
 
 def seed_npm_fixture(
@@ -651,7 +646,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         lockfile = "package-lock.json" if manager == "npm" else "pnpm-lock.yaml"
         fingerprints[manager] = {
             name: hashlib.sha256((template / name).read_bytes()).hexdigest()
-            for name in ("package.json", lockfile, "pnpm-workspace.yaml")
+            for name in ("package.json", lockfile)
             if (template / name).is_file()
         }
         sources[manager], templates[manager] = source, template

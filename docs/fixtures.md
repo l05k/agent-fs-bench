@@ -26,7 +26,7 @@ uv run python tools/gen_mini_source_repo.py --force
 
 ## npm-install
 
-`data/pnpm-bench*` comes from [pnpm/pnpm](https://github.com/pnpm/pnpm) at
+`data/pnpm-bench` comes from [pnpm/pnpm](https://github.com/pnpm/pnpm) at
 `5bd38b19` (2026-11-03). The npm lockfile was generated from the same manifest
 with `npm install --package-lock-only --legacy-peer-deps --ignore-scripts --cache <tmp>`;
 it is not converted from the pnpm lockfile.
