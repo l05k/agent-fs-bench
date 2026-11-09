@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
 from agent_fs_bench.ssh import Host, load_hosts, ssh_argv
 
@@ -48,6 +49,17 @@ CONFIG = {
     "run_timeout_s": 1800,
     "keep_remote": False,
 }
+
+# One figure per phase: a box per host. Splitting by phase keeps every series
+# within the four-series figure limit regardless of inventory size.
+FIGURES = [
+    Figure("phases", "host", "ops_per_s", kind="box", split=("phase",),
+           xlabel="Host", ylabel="Throughput (Kops/s)", yscale=1000,
+           name="phases-throughput"),
+    Figure("latencies", "host", "latency_ns", kind="box", split=("phase",),
+           xlabel="Host", ylabel="Operation latency (ms)", yscale=1_000_000,
+           logy=True, name="latencies"),
+]
 
 
 class RemoteError(RuntimeError):
@@ -89,30 +101,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.parse_args(argv)
     return argparse.Namespace(**CONFIG)
-
-
-_POSITIVE_CONFIG_KEYS = (
-    "files_per_host",
-    "file_size_bytes",
-    "directories",
-    "shared_files_per_host",
-    "rounds",
-    "connect_timeout_s",
-    "command_timeout_s",
-    "ready_timeout_s",
-    "run_timeout_s",
-)
-_BOOLEAN_CONFIG_KEYS = ("fsync", "read_back", "cleanup_private", "keep_remote")
-
-
-def _validate_config(args: argparse.Namespace) -> None:
-    for key in _POSITIVE_CONFIG_KEYS:
-        value = getattr(args, key)
-        if type(value) is not int or value < 1:
-            raise ValueError(f"CONFIG[{key!r}] must be a positive integer")
-    for key in _BOOLEAN_CONFIG_KEYS:
-        if type(getattr(args, key)) is not bool:
-            raise ValueError(f"CONFIG[{key!r}] must be a boolean")
 
 
 def _safe_absolute(path: Path) -> None:
@@ -183,14 +171,6 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _latency_summary(latencies_ns: Sequence[int]) -> dict[str, float]:
-    if not latencies_ns:
-        return {
-            "p50_ms": 0.0,
-            "p95_ms": 0.0,
-            "p99_ms": 0.0,
-            "max_ms": 0.0,
-            "mean_ms": 0.0,
-        }
     ordered = sorted(latencies_ns)
 
     def percentile(fraction: float) -> float:
@@ -217,16 +197,14 @@ def _phase_metric(
     ops = len(latencies_ns)
     summary = _latency_summary(latencies_ns)
     return {
-        "round": round_number,
+        "repeat": round_number,
         "phase": phase,
         "latencies_ns": list(latencies_ns),
         "ops": ops,
         "elapsed_s": elapsed_s,
-        "ops_per_s": ops / elapsed_s if elapsed_s > 0 else 0.0,
+        "ops_per_s": ops / elapsed_s,
         "bytes": bytes_count,
-        "mib_per_s": (
-            bytes_count / (1024 * 1024) / elapsed_s if elapsed_s > 0 else 0.0
-        ),
+        "mib_per_s": bytes_count / (1024 * 1024) / elapsed_s,
         **summary,
     }
 
@@ -523,19 +501,16 @@ def _start_worker_session(
     ]
     argv = ssh_argv(host, plan.connect_timeout_s)
     argv.append(f"cd {shlex.quote(deployment['remote_dir'])} && exec " + shlex.join(remote_argv))
-    try:
-        process = subprocess.Popen(
-            argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-    except OSError as exc:
-        raise RemoteError(f"{host.name}: cannot start ssh worker: {exc}") from exc
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
     session = WorkerSession(host=host, process=process)
 
     def read_stdout() -> None:
@@ -717,8 +692,6 @@ def _validate_job(job: dict[str, Any]) -> tuple[Path, Path, Path]:
     _safe_absolute(target)
     _safe_absolute(root)
     run_id, name = job["run_id"], job["host_name"]
-    if not isinstance(run_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
-        raise WorkerError("invalid run identifier")
     if not isinstance(name, str) or not NAME_RE.fullmatch(name):
         raise WorkerError("invalid worker alias")
     if root != target / "agent-fs-bench" / "multi-host" / run_id:
@@ -820,26 +793,16 @@ def _drive_workers(plan: ExperimentPlan, sessions: Sequence[WorkerSession]) -> N
 
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
-    _validate_config(args)
-    _safe_absolute(ctx.target.path)
     worker_dir = Path(args.worker_dir)
     hosts_path = Path(args.hosts)
-    _safe_absolute(worker_dir)
     if worker_dir.is_relative_to(ctx.target.path):
         raise ValueError("worker-dir must be outside the measured target")
     hosts = load_hosts(hosts_path)
-    if not hosts:
-        raise ValueError("hosts TOML must contain a non-empty [[hosts]] list")
     workload = WorkloadConfig(**{key: getattr(args, key) for key in WorkloadConfig.__dataclass_fields__})
     plan = ExperimentPlan(hosts, workload, ctx.target.path, ctx.work_dir,
                           worker_dir / ctx.run_id / ctx.target.name, ctx.run_id,
                           os.urandom(24).hex(), args.connect_timeout_s, args.command_timeout_s,
                           args.ready_timeout_s, args.run_timeout_s)
-    ctx.parameters = {key: value for key, value in asdict(workload).items()
-                      if key != "cleanup_private"}
-    ctx.parameters["hosts"] = [host.name for host in hosts]
-    if not shutil.which("ssh"):
-        raise RemoteError("local ssh command not found")
     _parallel(plan, lambda host: _preflight_host(plan, host))
     sources = {str(path.relative_to(PROJECT_ROOT)): path.read_text(encoding="utf-8")
                for path in sorted((PROJECT_ROOT / "agent_fs_bench").rglob("*.py"))}
@@ -882,14 +845,26 @@ print('null')
     for session in sessions:
         result = session.result
         assert result is not None
-        for measurement in result["metrics"]:
-            numeric = {key: value for key, value in measurement.items()
-                       if key not in ("round", "phase", "latencies_ns")}
-            ctx.emit(f"{session.host.name}/{measurement['phase']}", numeric,
-                     repeat=measurement["round"], details={
-                         "latencies_ns": measurement["latencies_ns"],
-                         "shared_sentinel_verified": True,
-                     })
+        _emit_measurements(ctx, session.host.name, result["metrics"])
+
+
+def _emit_measurements(
+    ctx: RunContext, host_name: str, measurements: Sequence[dict[str, Any]]
+) -> None:
+    for measurement in measurements:
+        keys = {
+            "host": host_name,
+            "phase": measurement["phase"],
+            "repeat": measurement["repeat"],
+        }
+        ctx.emit(
+            "phases",
+            keys,
+            {key: value for key, value in measurement.items()
+             if key not in ("repeat", "phase", "latencies_ns")},
+        )
+        for sample, latency_ns in enumerate(measurement["latencies_ns"], 1):
+            ctx.emit("latencies", {**keys, "sample": sample}, {"latency_ns": latency_ns})
 
 
 if __name__ == "__main__":

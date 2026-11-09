@@ -9,22 +9,30 @@ run. As upstream, commit trees are not compared.
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
-import os
-import shlex
 import shutil
-import signal
-import subprocess
 import sys
 import time
 import traceback
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
 from .build_settings import read_compiler_version
+from .dev_workflow import (
+    WorkflowError,
+    elapsed_ms,
+    fixture_hashes,
+    git_text,
+    has_local_commit,
+    load_commands,
+    load_json,
+    require_filesystem,
+    run_command,
+    run_git,
+    run_shell,
+    tool_versions,
+)
 
 DEFAULT_FIXTURE_DIR = PROJECT_ROOT / "data" / "mini-dev-workflow"
 DEFAULT_SERIES = "series.json"
@@ -49,236 +57,12 @@ CONFIG = {
     "verbose": False,
 }
 
+FIGURES = [
+    Figure("steps", "kind", "ms", kind="box", xlabel="Step kind",
+           ylabel="Duration (s)", yscale=1000, name="step-duration"),
+]
+
 CORE_COMMANDS = ("git", "bash", "make", "grep", "sed", "python3")
-
-
-
-class WorkflowError(RuntimeError):
-    """A command, fixture check, or cleanup operation failed."""
-
-
-@dataclass
-class CommandResult:
-    ms: int
-    returncode: int
-    stdout: str
-    stderr: str
-
-
-def elapsed_ms(start_ns: int) -> int:
-    return (time.perf_counter_ns() - start_ns) // 1_000_000
-
-
-def tail(text: str, limit: int = 4000) -> str:
-    text = text.strip()
-    if len(text) <= limit:
-        return text
-    return "..." + text[-limit:]
-
-
-
-
-def terminate_process_group(
-    proc: subprocess.Popen[Any],
-    *,
-    isolated_group: bool,
-) -> None:
-    if proc.poll() is not None:
-        return
-    if isolated_group:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        except OSError:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                return
-    else:
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            return
-    try:
-        proc.communicate(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    if isolated_group:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        except OSError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                return
-    else:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            return
-    try:
-        proc.communicate(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
-
-
-def run_command(
-    argv: list[str],
-    *,
-    cwd: Path,
-    what: str,
-    verbose: bool = False,
-    capture_stdout: bool = False,
-    allow_codes: tuple[int, ...] = (0,),
-    extra_env: dict[str, str] | None = None,
-) -> CommandResult:
-    env = os.environ.copy()
-    env.update(
-        {
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_CONFIG_COUNT": "3",
-            "GIT_CONFIG_KEY_0": "core.hooksPath",
-            "GIT_CONFIG_VALUE_0": "/dev/null",
-            "GIT_CONFIG_KEY_1": "core.fsync",
-            "GIT_CONFIG_VALUE_1": "committed",
-            "GIT_CONFIG_KEY_2": "core.fsyncMethod",
-            "GIT_CONFIG_VALUE_2": "fsync",
-        }
-    )
-    if extra_env:
-        env.update(extra_env)
-
-    stdout = subprocess.PIPE if capture_stdout else (
-        None if verbose else subprocess.DEVNULL
-    )
-    stderr = None if verbose else subprocess.PIPE
-    stdin = subprocess.DEVNULL
-
-    start = time.perf_counter_ns()
-    isolated_group = True
-    try:
-        proc = subprocess.Popen(
-            argv,
-            cwd=cwd,
-            env=env,
-            stdin=stdin,
-            stdout=stdout,
-            stderr=stderr,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            start_new_session=isolated_group,
-        )
-    except OSError as exc:
-        raise WorkflowError(f"{what}: cannot start {argv[0]}: {exc}") from exc
-
-    try:
-        captured_stdout, captured_stderr = proc.communicate()
-    except BaseException:
-        terminate_process_group(proc, isolated_group=isolated_group)
-        raise
-
-    result = CommandResult(
-        ms=elapsed_ms(start),
-        returncode=proc.returncode,
-        stdout=captured_stdout or "",
-        stderr=captured_stderr or "",
-    )
-    if proc.returncode not in allow_codes:
-        details = []
-        if result.stdout:
-            details.append(f"stdout:\n{tail(result.stdout)}")
-        if result.stderr:
-            details.append(f"stderr:\n{tail(result.stderr)}")
-        suffix = "\n" + "\n".join(details) if details else ""
-        raise WorkflowError(
-            f"{what} failed with exit code {proc.returncode}: "
-            f"{shlex.join(argv)}{suffix}"
-        )
-    return result
-
-
-def run_shell(command: str, *, cwd: Path, what: str, verbose: bool) -> CommandResult:
-    return run_command(
-        ["bash", "--noprofile", "--norc", "-c", command],
-        cwd=cwd,
-        what=what,
-        verbose=verbose,
-        extra_env={"LC_ALL": "C"},
-    )
-
-
-def run_git(repo: Path, args: list[str], *, what: str, verbose: bool) -> CommandResult:
-    return run_command(
-        ["git", "-c", "core.hooksPath=/dev/null", *args],
-        cwd=repo,
-        what=what,
-        verbose=verbose,
-    )
-
-
-def git_text(
-    repo: Path,
-    args: list[str],
-    *,
-    what: str,
-    allow_codes: tuple[int, ...] = (0,),
-) -> str:
-    result = run_command(
-        ["git", "-c", "core.hooksPath=/dev/null", *args],
-        cwd=repo,
-        what=what,
-        capture_stdout=True,
-        allow_codes=allow_codes,
-    )
-    return result.stdout.strip()
-
-
-def load_json(path: Path) -> dict[str, Any]:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        raise WorkflowError(f"cannot read fixture {path}: {exc}") from exc
-    except json.JSONDecodeError as exc:
-        raise WorkflowError(f"cannot parse fixture {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise WorkflowError(f"fixture {path} must contain a JSON object")
-    return value
-
-
-def load_commands(path: Path) -> list[str]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise WorkflowError(f"cannot read command file {path}: {exc}") from exc
-
-    if "%%" in lines:
-        commands: list[str] = []
-        current: list[str] = []
-        for line in lines:
-            if line == "%%":
-                if current:
-                    commands.append("\n".join(current) + "\n")
-                    current = []
-                continue
-            if not current and line.lstrip().startswith("#"):
-                continue
-            current.append(line)
-        if current:
-            commands.append("\n".join(current) + "\n")
-        return commands
-
-    commands = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            commands.append(stripped + "\n")
-    return commands
-
 
 def require_linux() -> None:
     if sys.platform.startswith("linux"):
@@ -287,7 +71,6 @@ def require_linux() -> None:
         f"the mini-dev-workflow measures Linux filesystems and only runs on "
         f"Linux (current platform: {sys.platform})"
     )
-
 
 def validate_fixtures(fixture_dir: Path) -> dict[str, Any]:
     """Fail fast on missing fixtures before the worktree is created."""
@@ -330,59 +113,16 @@ def validate_fixtures(fixture_dir: Path) -> dict[str, Any]:
         )
     return series
 
-
 def missing_dependencies(*, require_fstype: bool = False) -> list[str]:
     missing = [name for name in CORE_COMMANDS if shutil.which(name) is None]
     if require_fstype and shutil.which("findmnt") is None:
         missing.append("findmnt")
     return missing
 
-
 def ensure_dependencies(*, require_fstype: bool = False) -> None:
     missing = missing_dependencies(require_fstype=require_fstype)
     if missing:
         raise WorkflowError("missing dependencies (install manually): " + ", ".join(missing))
-
-
-def detect_filesystem(path: Path) -> str | None:
-    findmnt = shutil.which("findmnt")
-    if not findmnt:
-        return None
-    proc = subprocess.run(
-        [findmnt, "-T", str(path), "-n", "-o", "FSTYPE"],
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    value = proc.stdout.strip()
-    return value or None
-
-
-def existing_ancestor(path: Path) -> Path:
-    probe = path
-    while not probe.exists() and probe != probe.parent:
-        probe = probe.parent
-    return probe
-
-
-def require_filesystem(path: Path, expected: str | None, label: str) -> None:
-    if not expected:
-        return
-    probe = existing_ancestor(path)
-    actual = detect_filesystem(probe)
-    if actual is None:
-        raise WorkflowError(
-            f"cannot determine filesystem for {label}; install findmnt or "
-            "remove the filesystem requirement"
-        )
-    if actual != expected:
-        raise WorkflowError(
-            f"{label} must be on {expected}, but {probe} is on {actual}"
-        )
-
 
 def default_source_repo(worktree: Path) -> Path:
     """Return the source repository path next to the worktree.
@@ -392,7 +132,6 @@ def default_source_repo(worktree: Path) -> Path:
     placed elsewhere is timed against the wrong filesystem.
     """
     return worktree.parent / f"{worktree.name}{SOURCE_REPO_SUFFIX}"
-
 
 def ensure_source_repo(source_repo: Path, fixture_dir: Path, *, verbose: bool) -> None:
     """Create a fresh source repository from the committed bundle."""
@@ -413,7 +152,6 @@ def ensure_source_repo(source_repo: Path, fixture_dir: Path, *, verbose: bool) -
         verbose=verbose,
     )
 
-
 def prepare_source_repo(
     source_repo: Path, fixture_dir: Path, *, verbose: bool
 ) -> int:
@@ -421,7 +159,6 @@ def prepare_source_repo(
     start = time.perf_counter_ns()
     ensure_source_repo(source_repo, fixture_dir, verbose=verbose)
     return elapsed_ms(start)
-
 
 def resolve_source_repo(source_repo: Path, *, verbose: bool) -> Path:
     """Validate the source repository and return the directory to run git in."""
@@ -449,9 +186,6 @@ def resolve_source_repo(source_repo: Path, *, verbose: bool) -> Path:
         verbose=verbose,
     )
     return source_repo
-
-
-
 
 def remove_worktree(
     source_repo: Path,
@@ -482,49 +216,19 @@ def remove_worktree(
     if errors:
         raise WorkflowError("worktree cleanup failed: " + "; ".join(errors))
 
-
-
-
-def has_local_commit(repo: Path, revision: str) -> bool:
-    # ``rev-parse --verify --quiet`` exits 1 for an unresolvable revision;
-    # ``cat-file -e`` exits 128, which would bypass the friendly error below.
-    result = run_command(
-        [
-            "git",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            f"{revision}^{{commit}}",
-        ],
-        cwd=repo,
-        what=f"checking for local commit {revision}",
-        capture_stdout=True,
-        allow_codes=(0, 1),
-    )
-    return result.stdout.strip() != ""
-
-
-
-
 def resolve_jobs(args: argparse.Namespace) -> int:
-    """Pin build parallelism.
-
-    Keep this harness's cap to avoid scheduling noise. CONFIG["jobs"] is
-    honoured up to that cap; the effective value is recorded in JSONL.
-    """
-    if type(args.jobs) is not int or args.jobs < 1:
-        raise WorkflowError("jobs must be a positive integer")
+    """Cap build parallelism so runs stay comparable."""
     return min(args.jobs, FIXED_JOBS)
 
-
-def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
+def run_workflow(
+    ctx: RunContext,
+    args: argparse.Namespace,
+    series: dict[str, Any],
+) -> dict[str, Any]:
     worktree = ctx.work_dir / "repo"
     fixture_dir = Path(args.fixture_dir).expanduser().absolute()
     source_repo = default_source_repo(worktree)
 
-    series = validate_fixtures(fixture_dir)
     base_commit = series["base_commit"]
     commits = series["commits"]
     commit_ids = [commit["id"] for commit in commits]
@@ -547,8 +251,8 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
     success = False
     error: str | None = None
     timed_start: int | None = None
-    timed_end: int | None = None
     worktree_ready = False
+    compiler_version: str | None = None
 
     try:
         if worktree.exists():
@@ -564,9 +268,10 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
             what="pruning stale worktree metadata",
             verbose=args.verbose,
         )
-        steps.append(
-            {"step": "worktree: prune", "ms": elapsed_ms(prune_start)}
-        )
+        steps.append({
+            "kind": "worktree", "name": "prune", "commit": "",
+            "ms": elapsed_ms(prune_start),
+        })
 
         add_start = time.perf_counter_ns()
         run_git(
@@ -575,10 +280,10 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
             what="creating the benchmark worktree",
             verbose=args.verbose,
         )
-        steps.append(
-            {"step": "worktree: add", "ms": elapsed_ms(add_start)}
-        )
-
+        steps.append({
+            "kind": "worktree", "name": "add", "commit": "",
+            "ms": elapsed_ms(add_start),
+        })
 
         initial = run_command(
             ["make", f"-j{jobs}"],
@@ -586,8 +291,9 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
             what="initial build",
             verbose=args.verbose,
         )
-        steps.append({"step": "initial-build: make", "ms": initial.ms})
-
+        steps.append({
+            "kind": "build", "name": "initial-build", "commit": "", "ms": initial.ms,
+        })
 
         for commit in commits:
             commit_id = commit["id"]
@@ -602,22 +308,21 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
                 category = phase.removesuffix("_commands")
                 load_start = time.perf_counter_ns()
                 loaded = load_commands(fixture_dir / filename)
-                steps.append(
-                    {
-                        "step": f"{category}-load: {commit_id}",
-                        "ms": elapsed_ms(load_start),
-                    }
-                )
-                for idx, command in enumerate(loaded, 1):
+                steps.append({
+                    "kind": "command", "name": f"{category}-load",
+                    "commit": commit_id, "ms": elapsed_ms(load_start),
+                })
+                for command in loaded:
                     result = run_shell(
                         command,
                         cwd=worktree,
-                        what=f"{category} command for {commit_id} #{idx}",
+                        what=f"{category} command for {commit_id}",
                         verbose=args.verbose,
                     )
-                    steps.append(
-                        {"step": f"{category}: {commit_id} #{idx}", "ms": result.ms}
-                    )
+                    steps.append({
+                        "kind": "command", "name": category,
+                        "commit": commit_id, "ms": result.ms,
+                    })
 
             incremental = run_command(
                 ["make", f"-j{jobs}"],
@@ -625,10 +330,10 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
                 what=f"incremental build for {commit_id}",
                 verbose=args.verbose,
             )
-            steps.append(
-                {"step": f"incremental-build: {commit_id}", "ms": incremental.ms}
-            )
-
+            steps.append({
+                "kind": "build", "name": "incremental-build",
+                "commit": commit_id, "ms": incremental.ms,
+            })
 
             status = run_git(
                 worktree,
@@ -636,7 +341,9 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
                 what=f"git status for {commit_id}",
                 verbose=args.verbose,
             )
-            steps.append({"step": f"git-status: {commit_id}", "ms": status.ms})
+            steps.append({
+                "kind": "git", "name": "status", "commit": commit_id, "ms": status.ms,
+            })
 
             diff = run_git(
                 worktree,
@@ -644,7 +351,9 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
                 what=f"git diff for {commit_id}",
                 verbose=args.verbose,
             )
-            steps.append({"step": f"git-diff: {commit_id}", "ms": diff.ms})
+            steps.append({
+                "kind": "git", "name": "diff", "commit": commit_id, "ms": diff.ms,
+            })
 
             add = run_git(
                 worktree,
@@ -652,7 +361,9 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
                 what=f"git add for {commit_id}",
                 verbose=args.verbose,
             )
-            steps.append({"step": f"git-add: {commit_id}", "ms": add.ms})
+            steps.append({
+                "kind": "git", "name": "add", "commit": commit_id, "ms": add.ms,
+            })
 
             commit_result = run_git(
                 worktree,
@@ -669,8 +380,10 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
                 what=f"git commit for {commit_id}",
                 verbose=args.verbose,
             )
-            steps.append({"step": f"git-commit: {commit_id}", "ms": commit_result.ms})
-
+            steps.append({
+                "kind": "git", "name": "commit", "commit": commit_id,
+                "ms": commit_result.ms,
+            })
 
         success = True
     except WorkflowError as exc:
@@ -691,9 +404,7 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
             workflow_ms = 0
         if success:
             try:
-                ctx.parameters.setdefault("tool_versions", {})["compiler"] = (
-                    read_compiler_version(worktree)
-                )
+                compiler_version = read_compiler_version(worktree)
             except (OSError, RuntimeError) as exc:
                 success = False
                 error = str(exc)
@@ -721,6 +432,7 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
         "success": success,
         "error": error,
         "base_commit": base_commit,
+        "compiler_version": compiler_version,
         "source_setup_ms": source_setup_ms,
         "preparation_ms": preparation_ms,
         "elapsed_ms": workflow_ms,
@@ -728,7 +440,6 @@ def run_workflow(ctx: RunContext, args: argparse.Namespace) -> dict[str, Any]:
         "cleanup_ms": cleanup_ms,
         "steps": steps,
     }
-
 
 def validate_source_repository(
     source_repo: Path,
@@ -759,7 +470,6 @@ def validate_source_repository(
             "source repository must be clean before a run:\n" + preview
         )
 
-
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -770,7 +480,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.parse_args(argv)
     return argparse.Namespace(**CONFIG)
 
-
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
     require_linux()
     ensure_dependencies(require_fstype=bool(args.require_fstype))
@@ -779,27 +488,25 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     names = {DEFAULT_SERIES, DEFAULT_BUNDLE}
     for commit in series["commits"]:
         names.update(commit[key] for key in ("search_commands", "read_commands", "edit_commands"))
-    hashes = {}
-    for name in sorted(names):
-        with (fixture_dir / name).open("rb") as stream:
-            hashes[name] = hashlib.file_digest(stream, "sha256").hexdigest()
-    tools = {}
-    for name in ("git", "make"):
-        tools[name] = run_command(
-            [name, "--version"], cwd=ctx.work_dir,
-            what=f"reading {name} version", capture_stdout=True,
-        ).stdout.strip().splitlines()[0]
-    ctx.parameters = {
+    ctx.info.update({
         "jobs": resolve_jobs(args),
-        "fixture_sha256": hashes,
-        "tool_versions": tools,
-    }
-    result = run_workflow(ctx, args)
-    ctx.parameters["base_commit"] = result.pop("base_commit")
+        "fixture_sha256": fixture_hashes(fixture_dir, names),
+        "tool_versions": tool_versions(ctx.work_dir),
+    })
+    result = run_workflow(ctx, args, series)
+    ctx.info["base_commit"] = result.pop("base_commit")
+    compiler = result.pop("compiler_version")
+    if compiler is not None:
+        ctx.info["tool_versions"]["compiler"] = compiler
     if not result.pop("success"):
         raise WorkflowError(result["error"] or "workflow failed")
     result.pop("error")
-    metrics = {key: result.pop(key) for key in (
-        "elapsed_ms", "preparation_ms", "cleanup_ms", "unattributed_ms", "source_setup_ms"
-    )}
-    ctx.emit("workflow", metrics, details=result)
+    ctx.emit("workflow", {}, {key: result.pop(key) for key in (
+        "elapsed_ms", "preparation_ms", "cleanup_ms", "unattributed_ms",
+        "source_setup_ms",
+    )})
+    for step, entry in enumerate(result.pop("steps"), 1):
+        ctx.emit("steps", {
+            "step": step, "name": entry["name"],
+            "kind": entry["kind"], "commit": entry["commit"],
+        }, {"ms": entry["ms"]})

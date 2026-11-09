@@ -23,7 +23,6 @@ DOWNLOAD_SHA256 = {
     "kvtest.c": "72ed2071ce76ff6033729cde69e0e61c8723748d1a1f35b9f8a865b5f7ab2424",
     "speedtest1.c": "bcb4a3123b60db648e748837f5c46092e23a3b35d970f7da5e62c42809f18185",
 }
-JMODE_CHOICES = ("delete", "truncate", "persist", "memory", "wal", "off")
 COMPILE_FLAGS = (
     "-O2",
     "-DSQLITE_THREADSAFE=1",
@@ -34,26 +33,8 @@ COMPILE_FLAGS = (
     "-pthread",
 )
 
-
 class BenchmarkError(RuntimeError):
     pass
-
-
-def normalize_journal_mode(mode: str) -> str:
-    if not isinstance(mode, str) or mode.lower() not in JMODE_CHOICES:
-        raise BenchmarkError(
-            f"invalid jmode {mode!r}; expected one of {', '.join(JMODE_CHOICES)}"
-        )
-    return mode.lower()
-
-
-def ensure_directory(path: Path, what: str) -> None:
-    """Create ``path`` with an actionable error when that is impossible."""
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise BenchmarkError(f"cannot create {what} {path}: {exc}") from exc
-
 
 def download(url: str, destination: Path, expected_sha256: str) -> None:
     """Verify fixed source content before atomically replacing the cache."""
@@ -64,15 +45,14 @@ def download(url: str, destination: Path, expected_sha256: str) -> None:
             partial.write_bytes(response.read())
         if file_sha256(partial) != expected_sha256:
             raise BenchmarkError(f"SHA-256 mismatch for {destination.name}")
-    except Exception as exc:
+    except BaseException:
         partial.unlink(missing_ok=True)
-        raise BenchmarkError(f"failed to download {url}: {exc}") from exc
+        raise
     partial.replace(destination)
-
 
 def ensure_sources(build_dir: Path, tool: str, force: bool) -> Dict[str, Path]:
     """Fetch the pinned amalgamation and official test program."""
-    ensure_directory(build_dir, "build directory")
+    build_dir.mkdir(parents=True, exist_ok=True)
     archive = build_dir / SQLITE_AMALGAMATION
     source = build_dir / f"{tool}.c"
     for destination, url in (
@@ -101,14 +81,11 @@ def ensure_sources(build_dir: Path, tool: str, force: bool) -> Dict[str, Path]:
             )
     return {tool: source, "sqlite3": amalgamation, "sqlite3_h": header}
 
-
 def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-
 def source_hashes(sources: Dict[str, Path]) -> Dict[str, str]:
     return {name: file_sha256(path) for name, path in sources.items()}
-
 
 def resolve_compiler() -> str:
     requested = os.environ.get("CC")
@@ -127,16 +104,10 @@ def resolve_compiler() -> str:
         "no C compiler found; set CC or install cc/gcc on the test machine"
     )
 
-
 def compiler_version(compiler: str) -> str:
-    try:
-        proc = subprocess.run(
-            [compiler, "--version"], capture_output=True, text=True
-        )
-    except OSError as exc:
-        raise BenchmarkError(
-            f"cannot run C compiler {compiler}: {exc}"
-        ) from exc
+    proc = subprocess.run(
+        [compiler, "--version"], capture_output=True, text=True
+    )
     output = (proc.stdout.strip() or proc.stderr.strip())
     if proc.returncode != 0 or not output:
         raise BenchmarkError(
@@ -145,7 +116,6 @@ def compiler_version(compiler: str) -> str:
             + (f":\n{output}" if output else "")
         )
     return output.splitlines()[0]
-
 
 def load_build_metadata(
     metadata_path: Path, binary: Path
@@ -208,7 +178,6 @@ def load_build_metadata(
         )
     return metadata
 
-
 def build(
     build_dir: Path, tool: str, sources: Dict[str, Path], force: bool
 ) -> Tuple[Path, Dict[str, Any]]:
@@ -240,12 +209,7 @@ def build(
         *COMPILE_FLAGS,
     ]
     try:
-        try:
-            proc = subprocess.run(command, capture_output=True, text=True)
-        except OSError as exc:
-            raise BenchmarkError(
-                f"cannot run C compiler {compiler}: {exc}"
-            ) from exc
+        proc = subprocess.run(command, capture_output=True, text=True)
         if proc.returncode != 0:
             raise BenchmarkError(
                 f"failed to compile {tool}:\n"
@@ -275,13 +239,10 @@ def build(
         )
         staged.replace(binary)
         metadata_tmp.replace(metadata_path)
-    except OSError as exc:
-        raise BenchmarkError(f"cannot save {tool} build: {exc}") from exc
     finally:
         staged.unlink(missing_ok=True)
         metadata_tmp.unlink(missing_ok=True)
     return binary, metadata
-
 
 def run_command(command: Sequence[str]) -> subprocess.CompletedProcess:
     proc = subprocess.run(command, capture_output=True, text=True)
@@ -292,7 +253,6 @@ def run_command(command: Sequence[str]) -> subprocess.CompletedProcess:
             + proc.stderr
         )
     return proc
-
 
 def remove_database(db_path: Path) -> None:
     for suffix in ("", "-wal", "-shm", "-journal"):

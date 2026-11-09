@@ -14,13 +14,21 @@ import subprocess
 import sys
 import tomllib
 
-from agent_fs_bench.results import PROJECT_ROOT, RunContext, canonical_json
+from agent_fs_bench.analysis import Figure
+from agent_fs_bench.results import PROJECT_ROOT, RunContext
 
 CONFIG = {
     "cases_file": PROJECT_ROOT / "local" / "agent-replay.toml",
     "repeats": 5,
 }
 REPLAY_ROOT = PROJECT_ROOT / "third_party" / "agent-mitm-replay"
+
+FIGURES = [
+    Figure("replays", "case", "elapsed_s", kind="box",
+           xlabel="Replay case", ylabel="Wall-clock time (s)", name="replay-time"),
+    Figure("phases", "phase", "seconds", kind="box", split=("case",),
+           xlabel="Harbor phase", ylabel="Phase time (s)", name="replay-phases"),
+]
 
 
 @dataclass(frozen=True)
@@ -39,10 +47,7 @@ class ReplayCase:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     argparse.ArgumentParser(description=__doc__).parse_args(argv)
-    args = argparse.Namespace(**CONFIG)
-    if args.repeats < 1:
-        raise ValueError("repeats must be positive")
-    return args
+    return argparse.Namespace(**CONFIG)
 
 
 def load_cases(config: Path) -> list[ReplayCase]:
@@ -71,20 +76,14 @@ def load_cases(config: Path) -> list[ReplayCase]:
             if any(destination.is_relative_to(other) or other.is_relative_to(destination)
                    for other in destinations):
                 raise ValueError(f"overlapping container mounts in {name}")
-            if not mount.source.is_dir():
-                raise ValueError(f"initial data directory does not exist: {mount.source}")
             destinations.append(destination)
         if not mounts:
             raise ValueError(f"replay case {name} needs at least one task-data mount")
         case = ReplayCase(name, local_path(entry["task"]),
                           local_path(entry["cassette"]), mounts)
-        if not (case.task / "task.toml").is_file():
-            raise ValueError(f"Harbor task.toml does not exist: {case.task}")
         if not (case.cassette / "validation.json").is_file():
             raise ValueError(f"validate cassette once before benchmarking: {case.cassette}")
         cases.append(case)
-    if not cases:
-        raise ValueError("at least one replay case is required")
     return cases
 
 
@@ -98,7 +97,8 @@ def fingerprint(root: Path, paths: list[Path] | None = None) -> str:
         metadata = path.lstat()
         relative = str(path.relative_to(root))
         mode = metadata.st_mode
-        digest.update(canonical_json([relative, mode]).encode() + b"\0")
+        digest.update(json.dumps([relative, mode], sort_keys=True,
+                                 separators=(",", ":"), ensure_ascii=False).encode() + b"\0")
         if stat.S_ISLNK(mode):
             digest.update(os.fsencode(os.readlink(path)))
         elif stat.S_ISREG(mode):
@@ -136,8 +136,7 @@ def check_storage(case: ReplayCase, target: Path) -> None:
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
     if sys.platform != "linux":
         raise RuntimeError("agent-replay measurements require Linux and a local Docker daemon")
-    cases_file = Path(args.cases_file).expanduser().resolve()
-    cases = load_cases(cases_file)
+    cases = load_cases(Path(args.cases_file).expanduser().resolve())
     executable = REPLAY_ROOT / ".venv" / "bin" / "agent-mitm-replay"
     if not executable.is_file():
         raise RuntimeError("initialize the submodule, then run uv sync --locked "
@@ -156,6 +155,8 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
                     ("pyproject.toml", "uv.lock", "uv.toml", ".python-version")]
     replay_paths += sorted((REPLAY_ROOT / "src").rglob("*.py"))
     replay_digest = fingerprint(REPLAY_ROOT, replay_paths)
+    ctx.info["replay"] = {"tool_versions": tool_versions, "source_sha256": replay_digest}
+    ctx.info["cases"] = {}
     for case in cases:
         cassette_paths = [case.cassette / name for name in
                           ("flows.mitm", "manifest.json", "commands.json", "task.toml", "validation.json")]
@@ -164,18 +165,13 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
             cassette_paths += [environment, *environment.rglob("*")]
         manifest = json.loads((case.cassette / "manifest.json").read_text())
         expected = {mount.container: fingerprint(mount.source) for mount in case.mounts}
-        ctx.parameters.clear()
-        ctx.parameters.update({
-            "cases_file": str(cases_file),
-            "repeats": args.repeats,
+        ctx.info["cases"][case.name] = {
             "model": manifest["model"],
-            "tool_versions": tool_versions,
-            "replay_source_sha256": replay_digest,
             "task_sha256": fingerprint(case.task),
             "cassette_sha256": fingerprint(case.cassette, cassette_paths),
             "mounts": [{"container": mount.container, "initial_sha256": expected[mount.container]}
                        for mount in case.mounts],
-        })
+        }
         work = ctx.work_dir / case.name
         results = ctx.result_dir / case.name
         work.mkdir()
@@ -200,8 +196,10 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
             summary = json.loads((output / "summary.json").read_text())
             if summary["mode"] != "replay" or summary["checked"] or not summary["measured"]:
                 raise ValueError(f"not a measured replay: {output}")
-            metrics = {"elapsed_s": summary["elapsed_sec"],
-                       "model_requests": summary["model_requests"]}
-            metrics.update({f"{phase}_s": seconds
-                            for phase, seconds in summary["phase_seconds"].items()})
-            ctx.emit(case.name, metrics, repeat=repeat)
+            ctx.emit("replays", {"case": case.name, "repeat": repeat},
+                     {"elapsed_s": summary["elapsed_sec"],
+                      "model_requests": summary["model_requests"]})
+            for phase, seconds in summary["phase_seconds"].items():
+                if seconds is not None:
+                    ctx.emit("phases", {"case": case.name, "repeat": repeat, "phase": phase},
+                             {"seconds": seconds})

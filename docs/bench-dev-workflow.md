@@ -65,8 +65,7 @@ repository path.
 Both require Linux, Python 3.12+, Git supporting worktrees and
 `core.fsync=committed`/`core.fsyncMethod=fsync`, Bash, Make, grep, sed, `python3`
 on PATH, and a working compiler/linker. Python dependencies are pinned by
-`uv.lock`: run `uv sync --locked` once, which also installs DuckDB for the
-default `summary.csv` export. Install system prerequisites yourself.
+`uv.lock`: run `uv sync --locked` once. Install system prerequisites yourself.
 `findmnt` is required when `CONFIG["require_fstype"]` is set.
 
 Mini needs a compiler selected by its Makefile, libc development files, and all
@@ -216,7 +215,7 @@ are not compared.
 
 Mini defaults to two build jobs via `CONFIG["jobs"]` and never exceeds two; a
 value of one is supported. The shipped fixture builds one C translation unit. A
-complete run records 27 timed step entries. Its
+complete run writes 27 rows to `steps.csv`. Its
 source repository remains after cleanup. `tools/gen_mini_source_repo.py` is
 fixture maintenance only, not a runtime helper; it rebuilds
 `data/mini-dev-workflow/source-repo`, rewrites `series.json`, and exports the
@@ -227,33 +226,27 @@ Its fixture path is fixed in that tool, and its only option is `--force`:
 python3 tools/gen_mini_source_repo.py --force
 ```
 
-## JSONL output
+## Tables and figures
 
-The sole raw result is
-`results/<benchmark>/<run-id>/results.jsonl`.
-Each successful target emits **one `case="workflow"` measurement**, not a row
-per dependent step. No workload-specific `result.json`, summary, manifest, or
-schema-version field is generated. The common runner derives `summary.csv`
-only after every selected target succeeds. A failed target emits no successful
-measurement; any earlier targets' completed JSONL rows remain available.
+Every successful target writes one row to `workflow` and one row per measured
+step to `steps`. Tables live next to the manifest in
+`results/<benchmark>/<run-id>/`; a run's targets share them, and the `target`
+column identifies each row.
 
-Targets run sequentially. A failing target reports its error, aborts the run,
-and prevents later targets from being attempted; no measurement is emitted for
-the failed target and no `summary.csv` is written. `summary.csv` is produced
-only after **every selected target has completed successfully** and the JSONL
-file has closed. An export failure returns a nonzero status but keeps the
-completed JSONL; measurements are not rerun.
+| table | key columns | metric columns |
+| --- | --- | --- |
+| `workflow` | — | `elapsed_ms`, `preparation_ms`, `cleanup_ms`, `unattributed_ms`; mini also `source_setup_ms` |
+| `steps` | `step` (1-based order), `name`, `kind`, `commit` | `ms` |
 
-The common envelope includes benchmark, run ID, target, case, repeat,
-parameters, a harness source fingerprint, metrics and details. Parameters
-include only the necessary experiment inputs:
+`kind` groups steps for figures: `config`, `build`, `command`, `git` and
+`verify` for the kernel workload; `worktree`, `build`, `command` and `git` for
+mini. `name` is the concrete operation (`initial-build`, `search-load`,
+`search`, `git-commit`, ...). `commit` holds the fixture commit for
+commit-specific steps and is empty otherwise. Neither table has a pooled
+sample index, so the runner writes no `summary/<table>.csv` for them.
 
-- `jobs`: the effective build parallelism;
-- `base_commit`: the resolved fixture base commit;
-- `fixture_sha256`: SHA-256 hashes of the fixture series, command files and
-  config/bundle inputs;
-- `tool_versions`: concise Git, Make and actual compiler versions.
-
+The manifest records the run configuration and per-target facts: resolved
+`jobs`, `fixture_sha256`, `base_commit`, and Git, Make and compiler versions.
 The compiler version is read through the makefile-selected `$(CC)`, not a
 Python guess based on environment `CC`. Collection is outside workload and
 cleanup timers. No full fixture body, kernel config, inherited build-variable
@@ -261,20 +254,20 @@ dictionary, resolved make variables, host, or environment record is stored.
 Runs aggregate globally; environment consistency is the operator's
 responsibility.
 
-Numeric metrics are:
+Durations are integer milliseconds floored from a monotonic nanosecond clock.
+Compare measured totals separately from preparation and cleanup; do not treat
+dependent steps as independent samples. Fresh directories remove stale-owner
+recovery and cross-run checkout reuse, but do not make reads cold.
 
-- `elapsed_ms`: total measured workflow interval, excluding setup/preparation
-  and cleanup;
-- `preparation_ms` and `cleanup_ms`: separately measured lifecycle phases;
-- `unattributed_ms`: `max(0, elapsed_ms - sum(step ms))`;
-- mini only: `source_setup_ms` for the bundle clone.
+The default figure is `figures/step-duration.pdf` (with `.png` and a
+standalone `.py` script): a box plot of step durations by `kind`, one box per
+target, drawn 3.5 in wide. Re-render default or custom figures from finished
+runs with `python -m agent_fs_bench plot <run-dir>...`.
 
-`details` retains only the complete ordered `steps` array (`step`, `ms`) and
-kernel `tree_assertions` (`commit`, `tree`, `ok`). Durations are integer
-milliseconds floored from a monotonic nanosecond clock. Compare measured totals
-separately from preparation and cleanup; do not treat dependent steps as
-independent samples. Fresh directories remove stale-owner recovery and cross-run
-checkout reuse, but do not make reads cold.
+Targets run sequentially. A failing target reports its error and aborts the
+run; it emits no `workflow` or `steps` rows, later targets are not attempted,
+and no figures are rendered. Rows from earlier successful targets remain in
+the run directory.
 
 ## Durability, limitations and provenance
 

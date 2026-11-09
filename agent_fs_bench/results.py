@@ -1,26 +1,16 @@
-"""One self-contained JSONL record per measurement, without format versions."""
+"""Per-run results: manifest.json plus one flat CSV per record kind."""
 
+import csv
 from dataclasses import dataclass, field
 import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 from .targets import Target
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-
-def json_default(value: Any) -> str:
-    if isinstance(value, Path):
-        return str(value)
-    raise TypeError(f'not JSON serializable: {type(value).__name__}')
-
-
-def canonical_json(value: Any) -> str:
-    return json.dumps(value, default=json_default, sort_keys=True,
-                      ensure_ascii=False, allow_nan=False, separators=(',', ':'))
 
 
 def source_digest() -> str:
@@ -39,6 +29,44 @@ def source_digest() -> str:
     return digest.hexdigest()
 
 
+def write_json(path: Path, value: Any) -> None:
+    path.write_text(json.dumps(value, indent=2, ensure_ascii=False, default=str) + '\n',
+                    encoding='utf-8')
+
+
+def read_table(path: Path) -> list[dict[str, str]]:
+    with path.open(newline='', encoding='utf-8') as handle:
+        return list(csv.DictReader(handle))
+
+
+class Tables:
+    """Append-only `<table>.csv` files; a table's first row fixes its columns."""
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.schemas: dict[str, dict[str, list[str]]] = {}
+        self._files: dict[str, tuple[Any, csv.DictWriter]] = {}
+
+    def write(self, table: str, keys: dict[str, Any], metrics: dict[str, Any]) -> None:
+        schema = {'keys': list(keys), 'metrics': list(metrics)}
+        if table not in self.schemas:
+            handle = (self.directory / f'{table}.csv').open('x', newline='', encoding='utf-8')
+            writer = csv.DictWriter(handle, fieldnames=schema['keys'] + schema['metrics'])
+            writer.writeheader()
+            self.schemas[table] = schema
+            self._files[table] = (handle, writer)
+        elif self.schemas[table] != schema:
+            raise ValueError(f'{table}: columns {schema} differ from {self.schemas[table]}')
+        handle, writer = self._files[table]
+        writer.writerow({name: int(value) if isinstance(value, bool) else value
+                         for name, value in {**keys, **metrics}.items()})
+        handle.flush()
+
+    def close(self) -> None:
+        for handle, _ in self._files.values():
+            handle.close()
+
+
 @dataclass
 class RunContext:
     benchmark: str
@@ -46,29 +74,17 @@ class RunContext:
     target: Target
     work_dir: Path
     result_dir: Path
-    parameters: dict[str, Any]
-    source_sha256: str
-    output: TextIO = field(repr=False)
-    records: int = 0
+    tables: Tables
+    info: dict[str, Any] = field(default_factory=dict)
+    rows: int = 0
 
-    def emit(self, case: str, metrics: dict[str, int | float], *,
-             repeat: int = 1, details: dict[str, Any] | None = None) -> None:
-        if not metrics or any(isinstance(value, bool)
-                              or not isinstance(value, (int, float))
-                              or not math.isfinite(value)
-                              for value in metrics.values()):
-            raise ValueError('metrics must contain finite numeric measurements')
-        row = {
-            'benchmark': self.benchmark,
-            'run_id': self.run_id,
-            'target': {'name': self.target.name, 'path': str(self.target.path)},
-            'case': case,
-            'repeat': repeat,
-            'parameters': self.parameters,
-            'source_sha256': self.source_sha256,
-            'metrics': metrics,
-            'details': details or {},
-        }
-        self.output.write(canonical_json(row) + '\n')
-        self.output.flush()
-        self.records += 1
+    def emit(self, table: str, keys: dict[str, Any], metrics: dict[str, int | float | None]) -> None:
+        """Append one row; `target` is prepended to keys, None metrics stay empty."""
+        if not any(value is not None for value in metrics.values()) or any(
+                value is not None and (isinstance(value, bool)
+                                       or not isinstance(value, (int, float))
+                                       or not math.isfinite(value))
+                for value in metrics.values()):
+            raise ValueError(f'{table}: metrics must be finite numbers or None: {metrics}')
+        self.tables.write(table, {'target': self.target.name, **keys}, metrics)
+        self.rows += 1

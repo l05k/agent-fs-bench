@@ -1,518 +1,198 @@
-"""Offline DuckDB queries and plotting over portable JSONL measurements."""
+"""Per-run summaries and paper figures from the flat CSV tables."""
 
 import argparse
 import csv
-import glob
+from dataclasses import dataclass, field
+import importlib
 import json
 from pathlib import Path
-import sys
-from typing import TextIO
+import re
+import statistics
 
-from .results import canonical_json
+from . import figure
+from .results import read_table
 
-COLUMNS = {
-    'benchmark': 'VARCHAR', 'run_id': 'VARCHAR',
-    'target': 'JSON', 'case': 'VARCHAR', 'repeat': 'BIGINT',
-    'parameters': 'JSON', 'source_sha256': 'VARCHAR',
-    'metrics': 'JSON', 'details': 'JSON',
-}
-METRICS_SQL = '''
-SELECT benchmark, run_id, target->>'name' AS target,
-       target->>'path' AS target_path, "case", repeat, parameters,
-       COALESCE(parameter_canonical.canonical, CAST(parameters AS VARCHAR)) AS parameters_canonical,
-       source_sha256, details,
-       item.key AS metric, CAST(item.value AS DOUBLE) AS value
-FROM measurements
-LEFT JOIN parameter_canonical
-       ON CAST(measurements.parameters AS VARCHAR) = parameter_canonical.raw
-CROSS JOIN json_each(measurements.metrics) AS item
-'''
-SUMMARY_SQL = '''
-WITH series AS (
-    SELECT benchmark, run_id, "case", metric, value,
-           parameters_canonical, source_sha256,
-           CASE WHEN benchmark = 'clone'
-                THEN target || '/' || (details->>'copier')
-                ELSE target END AS target
-    FROM metrics
-)
-SELECT target, "case", metric, count(*) AS samples, avg(value) AS mean,
-       median(value) AS median, min(value) AS minimum, max(value) AS maximum,
-       stddev_samp(value) AS stddev, benchmark,
-       string_agg(DISTINCT run_id, ';' ORDER BY run_id) AS run_ids,
-       parameters_canonical AS parameters, source_sha256
-FROM series
-GROUP BY benchmark, target, "case", metric, parameters_canonical, source_sha256
-ORDER BY benchmark, "case", metric, target, parameters_canonical, source_sha256
-'''
+# Index columns a summary pools over; every other key column is a dimension.
+POOLED = ('repeat', 'sample')
 
-MIB = 1024 * 1024
-# Per-request samples are pooled; other metrics are one batch value per repeat.
-CLONE_RAW_METRICS = frozenset({'latency_s', 'copy_s', 'fsync_s'})
-# Each sweep varies only its numeric x dimension; the workload payload stays fixed.
-CLONE_GROUPS = (
-    {'suffix': 'bytes', 'experiment': 'bytes', 'kind': None,
-     'x_metric': 'total_bytes', 'x_scale': MIB, 'xlabel': 'Total bytes (MiB)'},
-    {'suffix': 'files', 'experiment': 'files', 'kind': None,
-     'x_metric': 'total_files', 'x_scale': 1, 'xlabel': 'Total files'},
-    {'suffix': 'concurrency-large', 'experiment': 'concurrency', 'kind': 'large',
-     'x_metric': 'concurrency', 'x_scale': 1, 'xlabel': 'Concurrency'},
-    {'suffix': 'concurrency-small', 'experiment': 'concurrency', 'kind': 'small',
-     'x_metric': 'concurrency', 'x_scale': 1, 'xlabel': 'Concurrency'},
-)
-CLONE_LOG_X = frozenset({'bytes', 'files'})
-CLONE_YLABELS = {
-    'latency_s': 'Clone latency (s)',
-    'copy_s': 'Copy / clone time (s)',
-    'fsync_s': 'Sync time (s)',
-    'clones_s': 'Throughput (clones/s)',
-    'wall_s': 'Batch time (s)',
-}
 
-def canonical_parameter_text(value) -> str:
-    """Canonicalize one JSON value so key order never changes the grouping key."""
-    return canonical_json(json.loads(value))
+@dataclass
+class Figure:
+    """One figure, or one per distinct `split` value, drawn from `<table>.csv`.
 
-def parameters_argument(text: str) -> str:
-    try:
-        return canonical_parameter_text(text)
-    except (TypeError, ValueError):
-        raise argparse.ArgumentTypeError(
-            'expected JSON, for example \'{"fixture": "pnpm-bench", "concurrency": 4}\'') from None
+    `line` draws the median and IQR of all pooled rows at each numeric x;
+    `box` draws one box per x category. Series are joined `series` columns,
+    ordered by target, so the primary (first) target leads the legend.
+    """
+    table: str
+    x: str
+    y: str
+    kind: str = 'line'
+    series: tuple[str, ...] = ('target',)
+    split: tuple[str, ...] = ()
+    where: dict = field(default_factory=dict)
+    xlabel: str | None = None
+    ylabel: str | None = None
+    xscale: float = 1.0  # divides raw values, e.g. 1024 * 1024 for MiB
+    yscale: float = 1.0
+    logx: bool = False
+    logy: bool = False
+    name: str | None = None  # file stem; default <table>-<y>
 
-MDTEST_OPERATIONS = {
-    'file-create': 'File create', 'file-stat': 'File stat',
-    'file-open': 'File open/close', 'file-read': 'File read', 'file-unlink': 'File unlink',
-    'dir-mkdir': 'Directory mkdir', 'dir-stat': 'Directory stat',
-    'dir-rename': 'Directory rename', 'dir-rmdir': 'Directory rmdir',
-}
-# Plot conditions that must match across every series of one figure.
-MDTEST_CONDITIONS = {
-    'mdtest': ('total_items', 'mdtest_version', 'cache_state', 'completion'),
-    'mdtest-peak': ('mdtest_version', 'cache_state', 'completion'),
-}
 
-def connect(inputs: list[str], database: Path | None = None):
-    import duckdb
+def workload(benchmark: str):
+    return importlib.import_module(f'agent_fs_bench.benchmarks.{benchmark.replace("-", "_")}')
 
-    files = sorted({str(Path(path).resolve()) for pattern in inputs
-                    for path in glob.glob(pattern, recursive=True)})
-    if not files:
-        raise ValueError('no JSONL files match the input paths')
-    connection = duckdb.connect(str(database) if database else ':memory:')
-    connection.read_json(files, format='newline_delimited', columns=COLUMNS,
-                         maximum_object_size=134217728).create_view('input_records')
-    # DuckDB keeps JSON object key order, so canonicalize distinct parameter
-    # documents in Python once and join them back; this needs no UDF extras.
-    documents = connection.execute(
-        'SELECT DISTINCT CAST(parameters AS VARCHAR) FROM input_records').fetchall()
-    connection.execute('CREATE TEMP TABLE parameter_canonical (raw VARCHAR, canonical VARCHAR)')
-    if documents:
-        connection.executemany(
-            'INSERT INTO parameter_canonical VALUES (?, ?)',
-            [(raw, None if raw is None else canonical_parameter_text(raw))
-             for (raw,) in documents])
-    if database:
-        connection.execute('CREATE OR REPLACE TABLE measurements AS SELECT * FROM input_records')
-        connection.execute('DROP VIEW input_records')
-        connection.execute('DROP TABLE IF EXISTS metrics')
-        connection.execute('CREATE TABLE metrics AS ' + METRICS_SQL)
-    else:
-        connection.execute('CREATE VIEW measurements AS SELECT * FROM input_records')
-        connection.execute('CREATE VIEW metrics AS ' + METRICS_SQL)
-    return connection
 
-def write_csv(cursor, handle: TextIO) -> int:
-    """Write query columns and rows using the same CSV format in every entry point."""
-    writer = csv.writer(handle)
-    writer.writerow([column[0] for column in cursor.description])
-    rows = cursor.fetchall()
-    writer.writerows(rows)
-    return len(rows)
+def summarize(run_dir: Path) -> None:
+    """Write summary/<table>.csv: n and each metric's median per target and dimensions.
 
-def export_summary(jsonl: Path, output: Path) -> int:
-    """Write the standard target/case/metric/identity summary; return its row count."""
-    connection = connect([str(jsonl)])
-    try:
-        cursor = connection.execute(SUMMARY_SQL)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        with output.open('w', newline='', encoding='utf-8') as handle:
-            return write_csv(cursor, handle)
-    finally:
-        connection.close()
+    Only tables with a `repeat` or `sample` column are summarized; others
+    already hold one row per group.
+    """
+    manifest = json.loads((run_dir / 'manifest.json').read_text(encoding='utf-8'))
+    for table, schema in manifest['tables'].items():
+        dimensions = [key for key in schema['keys'] if key not in POOLED]
+        if dimensions == schema['keys']:
+            continue
+        groups: dict[tuple, list[dict]] = {}
+        for row in read_table(run_dir / f'{table}.csv'):
+            groups.setdefault(tuple(row[key] for key in dimensions), []).append(row)
+        (run_dir / 'summary').mkdir(exist_ok=True)
+        with (run_dir / 'summary' / f'{table}.csv').open('w', newline='', encoding='utf-8') as handle:
+            writer = csv.writer(handle)
+            writer.writerow([*dimensions, 'n', *schema['metrics']])
+            for key, rows in groups.items():
+                writer.writerow([*key, len(rows),
+                                 *(_median(rows, metric) for metric in schema['metrics'])])
 
-def main(command: str, argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog=f'agent-fs-bench {command}')
-    parser.add_argument('inputs', nargs='+', help='JSONL files or quoted glob patterns')
-    if command == 'analyze':
-        parser.add_argument('--sql', default=SUMMARY_SQL,
-                            help='SQL over measurements (nested JSON) or metrics (numeric rows)')
-        parser.add_argument('--database', type=Path, help='Rebuild a local DuckDB analysis database')
-        parser.add_argument('--output', type=Path, help='Write query CSV instead of stdout')
-    else:
-        parser.add_argument('--benchmark', required=True)
-        parser.add_argument('--metric', required=True, help='Metric name, including its unit')
-        parser.add_argument('--cases', type=lambda text: text.split(','),
-                            help='Comma-separated x-axis order; also selects cases (default: all, sorted)')
-        parser.add_argument('--targets', type=lambda text: text.split(','),
-                            help='Comma-separated legend order; the first is the primary system')
-        parser.add_argument('--parameters', type=parameters_argument,
-                            help='Plot only rows whose parameters canonicalize to exactly this JSON')
-        parser.add_argument('--source-sha256',
-                            type=lambda text: [value.strip() for value in text.split(',')
-                                               if value.strip()],
-                            help='Comma-separated source fingerprints; plot only matching rows')
-        parser.add_argument('--ylabel', help='Y-axis label (default: metric name)')
-        parser.add_argument('--size', type=float, nargs=2, default=(3.5, 1.5),
-                            metavar=('WIDTH', 'HEIGHT'), help='Figure size in inches')
-        parser.add_argument('--output', type=Path, required=True,
-                            help='Output stem; writes <stem>.pdf, <stem>.png and self-contained <stem>.py')
-    args = parser.parse_args(argv)
-    connection = connect(args.inputs, getattr(args, 'database', None))
-    try:
-        if command == 'plot':
-            plot(connection, args)
-        else:
-            cursor = connection.execute(args.sql)
-            handle = args.output.open('w', newline='', encoding='utf-8') if args.output else sys.stdout
-            try:
-                write_csv(cursor, handle)
-            finally:
-                if args.output:
-                    handle.close()
-    finally:
-        connection.close()
-    return 0
 
-def filter_identities(rows: list, wanted_parameters: str | None,
-                      wanted_sources: list[str] | None, identity) -> list:
-    """Keep rows whose (parameters, source) identity matches the plot selectors."""
-    if wanted_sources is not None and not wanted_sources:
-        raise ValueError('--source-sha256 needs at least one fingerprint')
-    kept = []
+def _median(rows: list[dict], metric: str) -> int | float | str:
+    values = [float(row[metric]) for row in rows if row[metric] != '']
+    if not values:
+        return ''
+    value = statistics.median(values)
+    return int(value) if value.is_integer() else float(f'{value:.6g}')
+
+
+def _cell(value) -> str:
+    """Render a `where` value the way Tables writes it."""
+    return str(int(value) if isinstance(value, bool) else value)
+
+
+def figure_data(spec: Figure, rows: list[dict], targets: list[str],
+                size: tuple[float, float]) -> list[tuple[str, dict]]:
+    """Group rows into one dataset per split value: series × x → raw y samples."""
+    groups: dict[tuple, dict] = {}
     for row in rows:
-        parameters, source = identity(row)
-        if wanted_parameters is not None and parameters != wanted_parameters:
+        if row[spec.y] == '' or any(row[key] != _cell(value) for key, value in spec.where.items()):
             continue
-        if wanted_sources and source not in wanted_sources:
-            continue
-        kept.append(row)
-    return kept
-
-def selection_detail(wanted_parameters: str | None, wanted_sources: list[str] | None) -> str:
-    """Describe the active identity filters for a no-match error."""
-    filters = []
-    if wanted_parameters is not None:
-        filters.append(f'parameters={wanted_parameters}')
-    if wanted_sources:
-        filters.append('source_sha256=' + ','.join(wanted_sources))
-    return f' for {"; ".join(filters)}' if filters else ''
-
-def describe_identities(identities: set[tuple[str, str]]) -> str:
-    """List distinct identities so an ambiguity error names every candidate."""
-    return '; '.join(f'parameters={parameters} source_sha256={source}'
-                     for parameters, source in sorted(identities))
-
-def plot(connection, args: argparse.Namespace) -> None:
-    """Render selected measurements, refusing to merge configurations within a case."""
-    from . import figure
-
-    if args.benchmark == 'clone':
-        plot_clone(connection, args)
-        return
-    if args.benchmark in MDTEST_CONDITIONS:
-        for suffix, data in mdtest_plot_data(connection, args):
-            stem = args.output.with_name(f'{args.output.name}-{suffix}')
-            stem.parent.mkdir(parents=True, exist_ok=True)
-            write_script(stem, data, 'render_line')
-            figure.render_line(data, stem)
-        return
-
-    rows = connection.execute('''
-        SELECT target, "case", parameters_canonical, source_sha256,
-               list(value ORDER BY run_id, repeat)
-        FROM metrics WHERE benchmark = ? AND metric = ?
-        GROUP BY target, "case", parameters_canonical, source_sha256
-        ORDER BY "case", target, source_sha256, parameters_canonical
-    ''', [args.benchmark, args.metric]).fetchall()
-    wanted_parameters = getattr(args, 'parameters', None)
-    wanted_sources = getattr(args, 'source_sha256', None)
-    rows = filter_identities(rows, wanted_parameters, wanted_sources,
-                             lambda row: (row[2], row[3]))
-    if not rows:
-        raise ValueError('no measurements match the plot selection'
-                         + selection_detail(wanted_parameters, wanted_sources))
-    found_targets = sorted({target for target, _, _, _, _ in rows})
-    found_cases = sorted({case for _, case, _, _, _ in rows})
-    targets = args.targets or found_targets
-    cases = args.cases or found_cases
-    for kind, wanted, found in (('targets', targets, found_targets), ('cases', cases, found_cases)):
-        missing = [name for name in wanted if name not in found]
-        if missing:
-            raise ValueError(f'no measurements for {kind}: {", ".join(missing)}')
-    # Validate the selected cases and targets before checking identity so rows
-    # excluded by --targets/--cases can never trigger an ambiguity error.
-    selected = [row for row in rows if row[0] in targets and row[1] in cases]
-    identities: dict[str, set[tuple[str, str]]] = {}
-    for _, case, parameters, source, _ in selected:
-        identities.setdefault(case, set()).add((parameters, source))
-    for case in cases:
-        found = identities.get(case, set())
-        if len(found) > 1:
-            raise ValueError(
-                f'case {case!r} mixes {len(found)} configurations: '
-                f'{describe_identities(found)}; '
-                'plot one with --parameters <json> and/or --source-sha256 <hash>[,<hash>]')
-    samples = {target: {} for target in targets}
-    for target, case, _, _, group in selected:
-        samples[target][case] = group
-    data = {
-        'cases': cases, 'targets': targets, 'samples': samples,
-        'ylabel': args.ylabel or args.metric, 'size': list(args.size),
-    }
-    stem = args.output
-    stem.parent.mkdir(parents=True, exist_ok=True)
-    write_script(stem, data, 'render')
-    figure.render(data, stem)
+        group = groups.setdefault(tuple(row[key] for key in spec.split), {'x': {}, 'series': {}})
+        x = float(row[spec.x]) / spec.xscale if spec.kind == 'line' else row[spec.x]
+        group['x'].setdefault(x, None)
+        rank, points = group['series'].setdefault(
+            '/'.join(row[key] for key in spec.series), (targets.index(row['target']), {}))
+        points.setdefault(x, []).append(float(row[spec.y]) / spec.yscale)
+    datasets = []
+    for split, group in groups.items():
+        # Stable sort: target order first, then first appearance within a target.
+        names = sorted(group['series'], key=lambda name: group['series'][name][0])
+        xs = sorted(group['x']) if spec.kind == 'line' else list(group['x'])
+        datasets.append((''.join('-' + re.sub(r'[^A-Za-z0-9.]+', '_', value) for value in split), {
+            'kind': spec.kind, 'series': names, 'x': xs,
+            'values': {name: [group['series'][name][1].get(x, []) for x in xs] for name in names},
+            'xlabel': spec.xlabel or spec.x, 'ylabel': spec.ylabel or spec.y,
+            'title': ', '.join(split), 'logx': spec.logx, 'logy': spec.logy, 'size': list(size),
+        }))
+    return datasets
 
 
-def write_script(stem: Path, data: dict, renderer: str) -> None:
-    """Export the shared style plus raw data as a standalone figure script."""
-    from . import figure
+def plot(run_dirs: list[Path], figures: list[Figure] | None = None, *,
+         targets: list[str] | None = None, output: Path | None = None,
+         size: tuple[float, float] = (3.5, 1.5), vary: tuple[str, ...] = ()) -> list[Path]:
+    """Render `figures` (default: the workload's FIGURES) and return the written stems.
 
-    script = stem.with_name(stem.name + '.py')
-    script.write_text(
+    Several runs of one benchmark pool their rows only if their configs match,
+    apart from keys in `vary` (e.g. one mount-scale run per client count).
+    """
+    manifests = [json.loads((run / 'manifest.json').read_text(encoding='utf-8')) for run in run_dirs]
+    first = manifests[0]
+    for run, manifest in zip(run_dirs[1:], manifests[1:]):
+        if manifest['benchmark'] != first['benchmark']:
+            raise ValueError(f'{run}: benchmark {manifest["benchmark"]} is not {first["benchmark"]}')
+        differ = sorted(key for key in first['config'].keys() | manifest['config'].keys()
+                        if key not in vary
+                        and first['config'].get(key) != manifest['config'].get(key))
+        if differ:
+            raise ValueError(f'{run}: config differs from {run_dirs[0]} in {", ".join(differ)}; '
+                             'pass --vary KEY,... only if the figure separates them')
+    targets = targets or list(dict.fromkeys(
+        target['name'] for manifest in manifests for target in manifest['targets']))
+    required = figures is not None
+    if figures is None:
+        figures = getattr(workload(first['benchmark']), 'FIGURES', [])
+    output = output or run_dirs[0] / 'figures'
+    stems = []
+    for spec in figures:
+        rows = [row for run in run_dirs if (run / f'{spec.table}.csv').exists()
+                for row in read_table(run / f'{spec.table}.csv') if row['target'] in targets]
+        datasets = figure_data(spec, rows, targets, size)
+        if required and not datasets:
+            raise ValueError(f'no rows in {spec.table}.csv match {spec}')
+        for suffix, data in datasets:
+            output.mkdir(parents=True, exist_ok=True)
+            stem = output / ((spec.name or f'{spec.table}-{spec.y}') + suffix)
+            write_script(stem, data)
+            figure.render(data, stem)
+            stems.append(stem)
+    return stems
+
+
+def write_script(stem: Path, data: dict) -> None:
+    """Export the shared style plus this figure's raw data as a standalone script."""
+    stem.with_name(stem.name + '.py').write_text(
         Path(figure.__file__).read_text(encoding='utf-8')
         + f'\n\nDATA = {data!r}\n\nif __name__ == "__main__":\n'
-        + f'    {renderer}(DATA, Path(__file__).with_suffix(""))\n',
+        + '    render(DATA, Path(__file__).with_suffix(""))\n',
         encoding='utf-8')
 
 
-def plot_clone(connection, args: argparse.Namespace) -> None:
-    from . import figure
-
-    figures = clone_plot_data(connection, args)
-    if not figures:
-        raise ValueError('no clone measurements match the plot selection')
-    stem = args.output
-    stem.parent.mkdir(parents=True, exist_ok=True)
-    for suffix, data in figures:
-        output = stem.with_name(f'{stem.name}-{suffix}')
-        write_script(output, data, 'render_line')
-        figure.render_line(data, output)
-
-
-def clone_plot_data(connection, args: argparse.Namespace) -> list[tuple[str, dict]]:
-    """Build one line-figure dataset per clone sweep present in the selection."""
-    rows = connection.execute('''
-        SELECT target->>'name', "case",
-               parameter_canonical.canonical, source_sha256,
-               metrics::VARCHAR, details::VARCHAR
-        FROM measurements
-        LEFT JOIN parameter_canonical
-               ON CAST(measurements.parameters AS VARCHAR) = parameter_canonical.raw
-        WHERE benchmark = 'clone'
-        ORDER BY run_id, repeat, target->>'name', "case"
-    ''').fetchall()
-    records = []
-    for target, case, parameters, source, metrics_text, details_text in rows:
-        metrics = json.loads(metrics_text)
-        if args.metric not in metrics:
-            continue
-        details = json.loads(details_text)
-        details['series'] = f"{target}/{details['copier']}"
-        records.append((case, parameters, source, metrics, details))
-    wanted_parameters = getattr(args, 'parameters', None)
-    wanted_sources = getattr(args, 'source_sha256', None)
-    records = filter_identities(records, wanted_parameters, wanted_sources,
-                                lambda record: (record[1], record[2]))
-    if not records:
-        raise ValueError('no clone measurements match the plot selection'
-                         + selection_detail(wanted_parameters, wanted_sources))
-
-    found_cases = sorted({case for case, _, _, _, _ in records})
-    found_series = sorted({details['series'] for _, _, _, _, details in records})
-    series = args.targets or found_series
-    cases = args.cases or found_cases
-    for kind, wanted, found in (('targets', series, found_series), ('cases', cases, found_cases)):
-        missing = [name for name in wanted if name not in found]
-        if missing:
-            raise ValueError(f'no measurements for {kind}: {", ".join(missing)}')
-    selected = [record for record in records
-                if record[0] in cases and record[4]['series'] in series]
-
-    figures = []
-    for group in CLONE_GROUPS:
-        rows = [record for record in selected
-                if record[4]['experiment'] == group['experiment']
-                and (group['kind'] is None or record[4]['kind'] == group['kind'])]
-        if not rows:
-            continue
-        # A sweep's x axis must vary only the workload dimension; one figure
-        # never pools different parameters or sources.
-        identities = {(parameters, source) for _, parameters, source, _, _ in rows}
-        if len(identities) > 1:
-            raise ValueError(
-                f'clone {group["suffix"]} sweep mixes {len(identities)} configurations: '
-                f'{describe_identities(identities)}; '
-                'plot one with --parameters <json> and/or --source-sha256 <hash>[,<hash>]')
-        figures.append((group['suffix'], clone_line_data(
-            group, [(metrics, details) for _, _, _, metrics, details in rows], series, args)))
-    return figures
-
-
-def clone_line_data(group: dict, rows: list, series: list[str],
-                    args: argparse.Namespace) -> dict:
-    """Validate sweep comparability and pool raw request samples per series and x."""
-    payloads = [(metrics['total_bytes'], metrics['total_files']) for metrics, _ in rows]
-    if group['experiment'] == 'bytes':
-        comparability = {files for _, files in payloads}
-        description = 'total file counts'
-    elif group['experiment'] == 'files':
-        comparability = {total_bytes / files for total_bytes, files in payloads}
-        description = 'file sizes'
-    else:
-        comparability = set(payloads)
-        description = 'payload sizes'
-    if len(comparability) != 1:
-        raise ValueError(f'clone {group["suffix"]} sweep mixes incompatible '
-                         f'{description}: {len(comparability)} variants')
-
-    present = {details['series'] for _, details in rows}
-    missing = [name for name in series if name not in present]
-    if missing:
-        raise ValueError(f'no clone {group["suffix"]} measurements for targets: '
-                         f'{", ".join(missing)}')
-
-    points = {name: {} for name in series}
-    for metrics, details in rows:
-        x = metrics[group['x_metric']] / group['x_scale']
-        if args.metric in CLONE_RAW_METRICS:
-            requests = details['requests']
-            if not all(args.metric in request for request in requests):
-                raise ValueError(f'clone request samples do not contain {args.metric}')
-            values = [request[args.metric] for request in requests]
-        else:
-            values = [metrics[args.metric]]
-        points[details['series']].setdefault(x, []).extend(values)
-
-    expected = set(points[series[0]])
-    for name in series[1:]:
-        if set(points[name]) != expected:
-            raise ValueError(f'clone {group["suffix"]} series do not cover the same x values: '
-                             f'{name} differs from {series[0]}')
-
-    values = [value for name in series for group_values in points[name].values()
-              for value in group_values]
-    ordered = {name: [{'x': x, 'values': sorted(points[name][x])}
-                      for x in sorted(points[name])] for name in series}
-    data = {
-        'series': series,
-        'points': ordered,
-        'xlabel': group['xlabel'],
-        'ylabel': args.ylabel or CLONE_YLABELS.get(args.metric, args.metric),
-        'logx': group['suffix'] in CLONE_LOG_X,
-        'logy': args.metric in CLONE_RAW_METRICS and min(values) > 0,
-        'size': list(args.size),
-    }
-    return data
-
-
-def mdtest_plot_data(connection, args: argparse.Namespace) -> list[tuple[str, dict]]:
-    """Compare mdtest throughput at matching process counts.
-
-    mdtest groups by operation/layout; mdtest-peak also by file size, and
-    supports mib_per_s for its data-moving create/read phases.
-    """
-    benchmark = getattr(args, 'benchmark', 'mdtest')
-    allowed = ('ops_per_s', 'mib_per_s') if benchmark == 'mdtest-peak' else ('ops_per_s',)
-    if args.metric not in allowed:
-        raise ValueError(f'{benchmark} concurrency figures require --metric {" or ".join(allowed)}')
-    rows = connection.execute('''
-        SELECT target->>'name', "case",
-               parameter_canonical.canonical, source_sha256,
-               parameters::VARCHAR, metrics::VARCHAR, details::VARCHAR
-        FROM measurements
-        LEFT JOIN parameter_canonical
-               ON CAST(measurements.parameters AS VARCHAR) = parameter_canonical.raw
-        WHERE benchmark = ?
-        ORDER BY run_id, repeat, target->>'name', "case"
-    ''', [benchmark]).fetchall()
-    wanted_parameters = getattr(args, 'parameters', None)
-    wanted_sources = getattr(args, 'source_sha256', None)
-    rows = filter_identities(rows, wanted_parameters, wanted_sources,
-                             lambda row: (row[2], row[3]))
-    if not rows:
-        raise ValueError(f'no {benchmark} measurements match the plot selection'
-                         + selection_detail(wanted_parameters, wanted_sources))
-    targets = args.targets or sorted({row[0] for row in rows})
-    cases = args.cases or sorted({row[1] for row in rows})
-    for kind, wanted, found in (
-        ('targets', targets, {row[0] for row in rows}),
-        ('cases', cases, {row[1] for row in rows}),
-    ):
-        missing = set(wanted) - found
-        if missing:
-            raise ValueError(f'no {benchmark} measurements for {kind}: {", ".join(sorted(missing))}')
-    selected = [(row[0], (row[2], row[3]), json.loads(row[4]),
-                 json.loads(row[5]), json.loads(row[6]))
-                for row in rows if row[0] in targets and row[1] in cases]
-    groups: dict[tuple, list] = {}
-    for entry in selected:
-        details, metrics = entry[4], entry[3]
-        if args.metric not in metrics:
-            continue
-        key = (list(MDTEST_OPERATIONS).index(details['operation']), details['operation'],
-               details['layout'], details.get('file_size_bytes'))
-        groups.setdefault(key, []).append(entry)
-    figures = []
-    for (_, operation, layout, size), group in sorted(groups.items(), key=lambda item: (
-            item[0][0], item[0][2], -1 if item[0][3] is None else item[0][3])):
-        suffix = f'{operation}-{layout}' + ('' if size is None else f'-S{size}')
-        conditions = {
-            tuple(json.dumps(parameters.get(key), sort_keys=True)
-                  for key in MDTEST_CONDITIONS[benchmark])
-            for _, _, parameters, _, _ in group
-        }
-        if len(conditions) != 1:
-            raise ValueError(f'{benchmark} {suffix} mixes incompatible experiment conditions')
-        identities = {identity for _, identity, _, _, _ in group}
-        if len(identities) > 1:
-            raise ValueError(
-                f'{benchmark} {suffix} mixes {len(identities)} configurations: '
-                f'{describe_identities(identities)}; '
-                'plot one with --parameters <json> and/or --source-sha256 <hash>[,<hash>]')
-        points = {target: {} for target in targets}
-        for target, _, _, metrics, _ in group:
-            value = metrics[args.metric]
-            points[target].setdefault(metrics['concurrency'], []).append(
-                value / 1000 if args.metric == 'ops_per_s' else value)
-        missing = [target for target in targets if not points[target]]
-        if missing:
-            raise ValueError(f'no {benchmark} {suffix} measurements for targets: {", ".join(missing)}')
-        expected = set(points[targets[0]])
-        if any(set(points[target]) != expected for target in targets):
-            raise ValueError(f'{benchmark} {suffix} targets must cover the same x values')
-        title = f'{MDTEST_OPERATIONS[operation]} ({layout})'
-        if size is not None:
-            title = f'{MDTEST_OPERATIONS[operation]} {size_label(size)} ({layout})'
-        figures.append((suffix, {
-            'series': targets,
-            'points': {target: [{'x': x, 'values': sorted(points[target][x])}
-                                for x in sorted(points[target])] for target in targets},
-            'title': title,
-            'xlabel': 'Client processes',
-            'ylabel': args.ylabel or ('Throughput (Kops/s)' if args.metric == 'ops_per_s'
-                                      else 'Bandwidth (MiB/s)'),
-            'logx': True, 'logy': False, 'size': list(args.size),
-        }))
-    if not figures:
-        raise ValueError(f'no {benchmark} {args.metric} measurements match the plot selection')
-    return figures
-
-
-def size_label(size: int) -> str:
-    for unit, scale in (('MiB', 1 << 20), ('KiB', 1 << 10)):
-        if size >= scale and size % scale == 0:
-            return f'{size // scale} {unit}'
-    return f'{size} B'
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog='agent-fs-bench plot',
+        description='Render the workload default figures, or one custom figure with --table.')
+    parser.add_argument('runs', nargs='+', type=Path, help='run directories of one benchmark')
+    parser.add_argument('--targets', type=lambda text: text.split(','),
+                        help='comma-separated legend order and filter; the first is the primary system')
+    parser.add_argument('--output', type=Path, help='figure directory (default: <first run>/figures)')
+    parser.add_argument('--size', type=float, nargs=2, default=(3.5, 1.5),
+                        metavar=('WIDTH', 'HEIGHT'), help='inches per figure')
+    parser.add_argument('--vary', type=lambda text: tuple(text.split(',')), default=(),
+                        help='comma-separated config keys allowed to differ between pooled runs')
+    custom = parser.add_argument_group('custom figure')
+    custom.add_argument('--table', help='CSV table name, e.g. phases')
+    custom.add_argument('--x')
+    custom.add_argument('--y')
+    custom.add_argument('--kind', choices=('line', 'box'), default='line')
+    custom.add_argument('--series', type=lambda text: tuple(text.split(',')), default=('target',))
+    custom.add_argument('--split', type=lambda text: tuple(text.split(',')), default=())
+    custom.add_argument('--where', action='append', default=[], metavar='COLUMN=VALUE')
+    custom.add_argument('--xlabel')
+    custom.add_argument('--ylabel')
+    custom.add_argument('--xscale', type=float, default=1.0)
+    custom.add_argument('--yscale', type=float, default=1.0)
+    custom.add_argument('--logx', action='store_true')
+    custom.add_argument('--logy', action='store_true')
+    custom.add_argument('--name', help='file stem (default: <table>-<y>)')
+    args = parser.parse_args(argv)
+    figures = None
+    if args.table:
+        if not (args.x and args.y):
+            parser.error('--table needs --x and --y')
+        figures = [Figure(args.table, args.x, args.y, args.kind, args.series, args.split,
+                          dict(item.split('=', 1) for item in args.where), args.xlabel,
+                          args.ylabel, args.xscale, args.yscale, args.logx, args.logy, args.name)]
+    for stem in plot(args.runs, figures, targets=args.targets, output=args.output,
+                     size=tuple(args.size), vary=args.vary):
+        print(f'{stem}.pdf')
+    return 0

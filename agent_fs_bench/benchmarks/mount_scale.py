@@ -13,6 +13,7 @@ import shutil
 import sys
 import time
 
+from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
 from agent_fs_bench.ssh import load_hosts, openmpi_agent
 from .mount_scale_mdtest import Mdtest, Rank
@@ -35,6 +36,24 @@ CONFIG = {
     'resource_sample_s': 0.1,
 }
 
+FIGURES = [
+    Figure('phases', 'clients', 'ops_per_s', split=('topology', 'phase'),
+           xlabel='Client processes', ylabel='Throughput (Kops/s)', yscale=1000,
+           logx=True, name='throughput'),
+    Figure('mounts', 'clients', 'controller_dispatch_elapsed_s', split=('topology', 'action'),
+           xlabel='Client processes', ylabel='Controller dispatch time (s)',
+           logx=True, name='mount-dispatch'),
+    Figure('resources', 'clients', 'used_bytes_delta', where={'state': 'mounted-idle'},
+           split=('topology',), xlabel='Client processes', ylabel='Memory delta (MiB)',
+           yscale=1024 * 1024, logx=True, name='memory-delta'),
+]
+
+_LEVELS = ('used_bytes', 'cached_bytes', 'dirty_bytes', 'slab_bytes',
+           'slab_reclaimable_bytes', 'slab_unreclaimable_bytes', 'mount_entries')
+_INTERVAL = ('sample_elapsed_s', 'cpu_busy_s', 'cpu_busy_cores', 'cpu_busy_percent')
+_DELTAS = ('used_bytes', 'slab_bytes', 'slab_unreclaimable_bytes', 'mount_entries')
+_PEAKS = ('used_bytes', 'cached_bytes', 'dirty_bytes', 'slab_bytes',
+          'slab_reclaimable_bytes', 'slab_unreclaimable_bytes')
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -47,7 +66,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         values.update(clients=2, files=32, repeats=1, idle_sample_s=0.1)
     return argparse.Namespace(**values, directory_smoke=options.directory_smoke)
 
-
 def _validate(args: argparse.Namespace) -> None:
     if platform.system() != 'Linux':
         raise ValueError('mount-scale requires a Linux controller and Open MPI')
@@ -56,15 +74,6 @@ def _validate(args: argparse.Namespace) -> None:
         if available < 2:
             raise ValueError('--directory-smoke requires at least 2 available logical CPUs '
                              f'in the CPU affinity set; found {available}')
-    for name in ('directories', 'files', 'file_size_bytes', 'repeats', 'connect_timeout_s'):
-        if type(getattr(args, name)) is not int or getattr(args, name) < 1:
-            raise ValueError(f'CONFIG[{name!r}] must be a positive integer')
-    if args.clients is not None and (type(args.clients) is not int or args.clients < 1):
-        raise ValueError('clients must be None (all available CPUs) or one positive integer')
-    for name in ('idle_sample_s', 'resource_sample_s', 'command_timeout_s'):
-        if getattr(args, name) <= 0:
-            raise ValueError(f'CONFIG[{name!r}] must be positive')
-
 
 def _worker_job(ctx: RunContext, args: argparse.Namespace, name: str,
                 data_root: Path, token: str) -> dict:
@@ -79,24 +88,67 @@ def _worker_job(ctx: RunContext, args: argparse.Namespace, name: str,
         'command_timeout_s': args.command_timeout_s,
     }
 
+def _resource_metrics(sample: dict, state: str, baseline: dict) -> dict:
+    """One fixed column set for every state; inapplicable values stay empty."""
+    metrics = {key: sample[key] if state != 'workload' else None for key in _LEVELS}
+    metrics.update({key: sample[key] for key in _INTERVAL})
+    metrics.update({
+        key + '_delta': (sample[key] - baseline[key]
+                         if state in ('mounted-idle', 'released-idle') else None)
+        for key in _DELTAS
+    })
+    for key in _PEAKS:
+        metrics['peak_' + key] = sample.get('peak_' + key)
+        metrics['peak_' + key + '_delta'] = sample.get('peak_' + key + '_delta')
+    return metrics
 
-def _emit_host(ctx: RunContext, case: str, worker: Worker, repeat: int,
+def _emit_host(ctx: RunContext, topology: str, clients: int, host: str, repeat: int,
                baseline: dict, mounted: dict, released: dict, workload: dict,
                mount: dict | None, unmount: dict | None) -> None:
-    prefix = f'{case}/hosts/{worker.name}'
-    if mount is not None and unmount is not None:
-        for label, sample in (('mount', mount), ('unmount', unmount)):
-            metrics = {key: value for key, value in sample.items() if key != 'agent_elapsed_s'}
-            ctx.emit(prefix + '/' + label, metrics, repeat=repeat,
-                     details={'agent_elapsed_s': sample['agent_elapsed_s']})
-    ctx.emit(prefix + '/resources/baseline', baseline, repeat=repeat)
-    for label, sample in (('mounted-idle', mounted), ('released-idle', released)):
-        metrics = dict(sample)
-        for key in ('used_bytes', 'slab_bytes', 'slab_unreclaimable_bytes', 'mount_entries'):
-            metrics[key + '_delta'] = sample[key] - baseline[key]
-        ctx.emit(prefix + '/resources/' + label, metrics, repeat=repeat)
-    ctx.emit(prefix + '/resources/workload', workload, repeat=repeat)
+    for action, sample in (('mount', mount), ('unmount', unmount)):
+        if sample is None:
+            continue
+        ctx.emit('lifecycle',
+                 {'topology': topology, 'clients': clients, 'host': host,
+                  'action': action, 'repeat': repeat},
+                 {'elapsed_s': sample['mount_elapsed_s' if action == 'mount'
+                                    else 'unmount_elapsed_s'],
+                  'measured_mounts': sample.get('measured_mounts'),
+                  'remaining_mounts': sample.get('remaining_mounts')})
+        for index, elapsed in enumerate(sample['agent_elapsed_s']):
+            ctx.emit('agents',
+                     {'topology': topology, 'clients': clients, 'host': host,
+                      'action': action, 'repeat': repeat, 'sample': index},
+                     {'elapsed_s': elapsed})
+    for state, sample in (('baseline', baseline), ('mounted-idle', mounted),
+                          ('released-idle', released), ('workload', workload)):
+        ctx.emit('resources',
+                 {'topology': topology, 'clients': clients, 'host': host,
+                  'state': state, 'repeat': repeat},
+                 _resource_metrics(sample, state, baseline))
 
+def _emit_phases(ctx: RunContext, topology: str, clients: int, repeat: int,
+                 phases: list, mapping: list[dict], file_size_bytes: int) -> None:
+    for phase in phases:
+        rate = phase.operations / phase.elapsed_s
+        created = phase.name.endswith(('/create', '/read'))
+        byte_count = phase.operations * file_size_bytes if created else None
+        ctx.emit('phases',
+                 {'topology': topology, 'clients': clients, 'phase': phase.name,
+                  'repeat': repeat},
+                 {'ops': phase.operations, 'elapsed_s': phase.elapsed_s,
+                  'ops_per_s': rate, 'ops_per_s_per_client': rate / clients,
+                  'rank_mean_us_per_op':
+                      sum(phase.rank_elapsed_s) / phase.operations * 1e6,
+                  'bytes': byte_count,
+                  'mib_per_s': (byte_count / phase.elapsed_s / (1024 * 1024)
+                                if byte_count is not None else None)})
+        for index, elapsed in enumerate(phase.rank_elapsed_s):
+            ctx.emit('ranks',
+                     {'topology': topology, 'clients': clients, 'phase': phase.name,
+                      'repeat': repeat, 'sample': index,
+                      'host': mapping[index]['host'], 'cpu': mapping[index]['cpu']},
+                     {'elapsed_s': elapsed})
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
     _validate(args)
@@ -163,20 +215,12 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         for path in shared:
             path.mkdir()
         engine.prepare(shared, args.files, args.file_size_bytes, ctx.result_dir / 'prepare')
-        ctx.parameters = {
-            'topology': topology, 'directories_per_agent': args.directories,
-            'clients': count, 'requested_clients': args.clients,
-            'files_per_directory_per_agent': args.files,
-            'file_size_bytes': args.file_size_bytes, 'repeats': args.repeats,
-            'cache': 'shared-preread-every-client; private-create-then-read', 'fsync': False,
-            'idle_sample_s': args.idle_sample_s, 'resource_sample_s': args.resource_sample_s,
-            'placement_policy': 'local-first; inventory-order; one-rank-per-affinity-cpu',
-            'hosts': [{'name': worker.name, **worker.info,
-                       'assigned_cpus': list(allocation.cpus)}
-                      for worker, allocation in zip(workers, allocations)],
-        }
+        ctx.info['hosts'] = [{'name': worker.name, **worker.info,
+                              'assigned_cpus': list(allocation.cpus)}
+                             for worker, allocation in zip(workers, allocations)]
         if profile is not None:
-            ctx.parameters['mount_profile_sha256'] = hashlib.sha256(args.profiles.read_bytes()).hexdigest()
+            ctx.info['mount_profile_sha256'] = hashlib.sha256(
+                args.profiles.read_bytes()).hexdigest()
         for repeat in range(1, args.repeats + 1):
             name = f'N{count}-R{repeat}'
             print(f'  {topology} {name}, K={args.directories}, hosts={len(workers)}', flush=True)
@@ -202,9 +246,9 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
                         workspace=Path(client['workspace']),
                         shared=tuple(Path(path) for path in client['shared']),
                     ))
-                    mapping.append({'rank': len(mapping), 'host': worker.name, 'cpu': cpu})
-            ctx.parameters['planned_rank_placement'] = mapping
+                    mapping.append({'host': worker.name, 'cpu': cpu})
             mount = unmount = None
+            mount_dispatch_s = unmount_dispatch_s = None
             if profile is not None:
                 started = time.perf_counter()
                 mount = parallel(workers, 'mount')
@@ -212,55 +256,42 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
             mounted = parallel(workers, 'idle')
             engine.warm(ranks, args.files, args.file_size_bytes, diagnostics / 'warm')
             parallel(workers, 'sample-start')
-            phases, placements = engine.measure(ranks, args.files, args.file_size_bytes,
-                                                diagnostics / 'measured')
-            ctx.parameters['rank_placement'] = {
-                job: [{'rank': proof['index'], 'host': mapping[proof['index']]['host'],
-                       'hostname': proof['hostname'], 'cpu': proof['cpu'],
-                       'affinity': proof['affinity']} for proof in proofs]
-                for job, proofs in placements.items()
-            }
+            phases = engine.measure(ranks, args.files, args.file_size_bytes,
+                                    diagnostics / 'measured')[0]
             workload = parallel(workers, 'sample-stop')
             if profile is not None:
                 started = time.perf_counter()
                 unmount = parallel(workers, 'unmount')
                 unmount_dispatch_s = time.perf_counter() - started
             released = parallel(workers, 'idle')
-            ctx.parameters.update(engine.metadata)
-            case = f'{topology}/N{count}'
             if mount is not None and unmount is not None:
                 # Dispatch includes SSH control latency and mount verification. It is
                 # intentionally not presented as pure mount command time.
-                ctx.emit(case + '/mount', {
-                    'controller_dispatch_elapsed_s': mount_dispatch_s,
-                    'measured_mounts': sum(row['measured_mounts'] for row in mount),
-                }, repeat=repeat)
-                ctx.emit(case + '/unmount', {
-                    'controller_dispatch_elapsed_s': unmount_dispatch_s,
-                    'remaining_mounts': sum(row['remaining_mounts'] for row in unmount),
-                }, repeat=repeat)
+                ctx.emit('mounts',
+                         {'topology': topology, 'clients': count,
+                          'action': 'mount', 'repeat': repeat},
+                         {'controller_dispatch_elapsed_s': mount_dispatch_s,
+                          'measured_mounts': sum(row['measured_mounts'] for row in mount),
+                          'remaining_mounts': None})
+                ctx.emit('mounts',
+                         {'topology': topology, 'clients': count,
+                          'action': 'unmount', 'repeat': repeat},
+                         {'controller_dispatch_elapsed_s': unmount_dispatch_s,
+                          'measured_mounts': None,
+                          'remaining_mounts': sum(row['remaining_mounts'] for row in unmount)})
             for index, worker in enumerate(workers):
-                _emit_host(ctx, case, worker, repeat, setups[index]['baseline'], mounted[index],
+                _emit_host(ctx, topology, count, worker.name, repeat,
+                           setups[index]['baseline'], mounted[index],
                            released[index], workload[index],
                            None if mount is None else mount[index],
                            None if unmount is None else unmount[index])
-            for phase in phases:
-                rate = phase.operations / phase.elapsed_s
-                metrics = {
-                    'ops': phase.operations, 'elapsed_s': phase.elapsed_s,
-                    'ops_per_s': rate, 'ops_per_s_per_client': rate / count,
-                    'rank_mean_us_per_op': sum(phase.rank_elapsed_s) / phase.operations * 1e6,
-                }
-                if phase.name.endswith(('/create', '/read')):
-                    metrics['bytes'] = phase.operations * args.file_size_bytes
-                    metrics['mib_per_s'] = metrics['bytes'] / phase.elapsed_s / (1024 * 1024)
-                ctx.emit(case + '/' + phase.name, metrics, repeat=repeat,
-                         details={'rank_elapsed_s': phase.rank_elapsed_s})
+            _emit_phases(ctx, topology, count, repeat, phases, mapping, args.file_size_bytes)
             parallel(workers, 'cleanup')
             shutil.rmtree(data_root / name)
         for worker in workers:
             worker.collect()
         shutil.rmtree(data_root)
+        ctx.info.update(engine.metadata)
         success = True
     except BaseException:
         print(f'mount-scale failed; inspect each host under {ctx.work_dir} '

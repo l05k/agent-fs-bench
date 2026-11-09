@@ -50,12 +50,8 @@ CONFIG["commands"] = {
 
 All other targets use `cp-r`. Running both operations on LakeBase separates
 native-clone benefits from ordinary filesystem access performance. Use exact
-registered target names, or the directory basenames when using `--dirs`.
-Before creating a run, every `target_copiers` key is checked against the complete
-registered target catalog (or all `--dirs` basenames), case-sensitively. An
-unknown key is an error, never an implicit switch to `cp-r`. This check precedes
-`--target` filtering: valid overrides for unselected targets are allowed, and
-only selected copiers need installed executables.
+registered target names, or the directory basenames when using `--dirs`; only
+selected copiers need installed executables.
 
 A command must return only when the copied tree is complete and available to
 filesystem operations; a command that only submits an asynchronous job is not
@@ -78,7 +74,7 @@ selection, command templates, layout, and retention:
 - File sweep: 8 and 32 files, each 4 KiB.
 - Concurrency: 1 and 4 complete requests, using a four-file 4 MiB directory and
   a 32-file 4 KiB directory.
-- Two repeats: eight cases and 16 JSONL rows per copier, 28 actual requests.
+- Two repeats: 16 rows in `batches.csv` and 28 in `requests.csv` per copier.
 
 At most 4 MiB of source payload and 16 MiB of destination payload are present
 in a smoke case. The conservative free-space check includes a 256 MiB margin.
@@ -126,84 +122,79 @@ NAS or server caches. Call the state `source-preread-every-repeat`, not cold or
 guaranteed fully warm. Use datasets that fit the intended warm-working-set
 scenario; client memory and remote caches remain experimental conditions.
 
-## Results and interpretation
+## Results
 
-The common runner writes `results/clone/<run-id>/results.jsonl` and derives
-`summary.csv` after all targets succeed. One row is one workload × copier ×
-repeat. The raw `target` still identifies the filesystem; `details.copier`
-identifies the operation. `case` is workload-only:
+The runner writes `results/clone/<run-id>/`:
 
-```text
-<bytes|files|concurrency>/N<files>_S<file-size-bytes>/C<requests>
-```
+- `manifest.json`: configuration and per-target facts, including the filesystem
+  type and copier executable SHA-256 digests.
+- `batches.csv`: one row per target × copier × workload × repeat.
+- `requests.csv`: one row per individual request within a batch.
+- `summary/batches.csv`, `summary/requests.csv`: `n` and median metrics per
+  target × dimension.
+- `figures/`: default figures, described below.
+
+| Table | Key columns | Metric columns |
+| --- | --- | --- |
+| `batches` | `target`, `copier`, `experiment`, `kind`, `files`, `file_size_bytes`, `total_bytes`, `concurrency`, `repeat` | `wall_s`, `clones_s` |
+| `requests` | the `batches` keys plus `sample` | `copy_s`, `fsync_s`, `latency_s` |
+
+`experiment` is `bytes`, `files` or `concurrency`; `kind` is `large` or `small`.
+`files` and `file_size_bytes` describe one complete directory request,
+`total_bytes` is their product, and `concurrency` is the number of simultaneous
+requests in the batch. `repeat` is 1-based; `sample` indexes the request within
+its batch. The first row fixes a table's columns.
 
 Metrics:
 
 | Metric | Meaning |
 | --- | --- |
-| `total_bytes`, `total_files` | Payload of **one** complete directory request. |
-| `concurrency` | Requests in this batch. |
 | `wall_s` | Barrier release through last completion; excludes worker creation/shutdown. |
 | `clones_s` | Completed directories / batch wall time. Finite-batch throughput, not a steady-state offered-load test. |
-| `latency_s` | Median request command-plus-sync latency in this batch. |
-| `copy_s`, `fsync_s` | Independent medians of request command and sync phases; do not add these medians to reconstruct batch time. |
+| `latency_s` | One request's command-plus-sync latency. |
+| `copy_s`, `fsync_s` | One request's command and sync phases; they sum to its `latency_s`. |
 
-`details.requests` retains every request's unrounded `copy_s`, `fsync_s` and
-`latency_s`. Each individual request's phases sum to its latency. Per-request
-latency starts immediately before command execution; batch time also includes
-barrier wake-up/scheduling. `details` also records experiment, workload kind,
-copier and filesystem type. `parameters` records resolved command templates,
-executable SHA-256 digests, layout/scales, repetitions, cache and completion
-contract. Source hashes identify the checkout but do not replace archiving it.
+`summary/batches.csv` has one row per target × copier × workload with `n`
+repeats; `summary/requests.csv` pools every request sample across repeats. Use
+request-level summaries for latency and batch-level summaries for wall time and
+throughput. Per-request latency starts immediately before command execution;
+batch time also includes barrier wake-up/scheduling. Do not interpret MiB/s as
+physical bandwidth for CoW clone; the primary metrics are latency and
+directories per second.
 
-Summary series are `target/copier`, e.g. `LakeBase/lakebase`, `LakeBase/cp-r`,
-`NFS/cp-r`; operations cannot merge into one filesystem row. Summary latency
-statistics summarize **per-batch medians**. Paper phase/latency figures instead
-pool original request samples. Do not interpret MiB/s as physical bandwidth
-for CoW clone; the primary metrics are latency and directories per second.
+A `target/copier` pair identifies a series, e.g. `LakeBase/lakebase`,
+`LakeBase/cp-r`, `NFS/cp-r`; operations cannot merge into one filesystem row.
+The `plot` command pools several runs only when their manifest configurations
+match. This is a clean cutover from the old sharded format: remeasure old clone
+runs instead of combining their rows with new results.
 
-The shared summary still merges selected cross-run samples without separating
-arbitrary configuration or host changes. Keep input selections comparable.
-This is a clean cutover from the old sharded format: remeasure old clone runs;
-do not combine their case names or statistics with new results.
+## Default figures
 
-## Paper figures
+Every run renders the module's `FIGURES` into `figures/` as vector PDF, 600 dpi
+PNG, and a standalone Python script with the raw samples:
 
-The existing plot CLI automatically generates numeric-x line figures for
-clone. `--parameters` and `--source-sha256` keep only rows with that identity,
-and a sweep whose rows mix configurations fails with the identities it found
-instead of drawing them together. The selected metric produces only groups
-present in its input: `<stem>-bytes`, `<stem>-files`, `<stem>-concurrency-large`,
-`<stem>-concurrency-small`, each as vector PDF, 600 dpi PNG and standalone Python
-with the raw samples. Numeric x points are sorted; `--cases` filters workloads
-rather than rearranging a numeric sweep. `--targets` selects/orders exact
-`target/copier` series; put the paper's primary system first.
+| Figure | Table | x | y | Filter |
+| --- | --- | --- | --- | --- |
+| `latency-bytes` | `requests` | `total_bytes` (MiB) | `latency_s` | `experiment=bytes`, log-log |
+| `latency-files` | `requests` | `files` | `latency_s` | `experiment=files`, log-log |
+| `latency-concurrency-large` | `requests` | `concurrency` | `latency_s` | `experiment=concurrency`, `kind=large`, log-log |
+| `latency-concurrency-small` | `requests` | `concurrency` | `latency_s` | `experiment=concurrency`, `kind=small`, log-log |
+| `throughput-large` | `batches` | `concurrency` | `clones_s` | `experiment=concurrency`, `kind=large` |
+| `throughput-small` | `batches` | `concurrency` | `clones_s` | `experiment=concurrency`, `kind=small` |
+
+Lines show medians with IQR error bars. Series are `target/copier`, ordered by
+target; pass `--targets` to select and order them, putting the paper's primary
+system first. Re-render with:
 
 ```sh
-uv run --group analysis python -m agent_fs_bench plot \
-  'results/clone/<run-id>/results.jsonl' \
-  --benchmark clone --metric latency_s \
-  --targets LakeBase/lakebase,LakeBase/cp-r,NFS/cp-r \
-  --output results/clone-latency
-
-uv run --group analysis python -m agent_fs_bench plot \
-  'results/clone/<run-id>/results.jsonl' \
-  --benchmark clone --metric clones_s \
-  --targets LakeBase/lakebase,LakeBase/cp-r,NFS/cp-r \
-  --output results/clone-throughput
+uv run python -m agent_fs_bench plot results/clone/<run-id>
 ```
 
 Recommended main comparisons: byte/file sensitivity using `latency_s`, and
-large/small concurrency using `clones_s` together with `latency_s`. Lines show
-medians and IQR error bars. Phase metrics pool `details.requests`; throughput
-uses one batch value per repeat. Size/count axes are logarithmic; positive
-latency/phase axes are logarithmic. Selected series must cover identical x
-values; incompatible fixed payloads in a sweep fail instead of plotting a
-misleading comparison, and so do differing parameter or source identities.
-Other provenance differences, such as mount options, are not automatically
-validated. Tiny smoke samples do not support tail-latency claims.
+large/small concurrency using `clones_s` together with `latency_s`. Tiny smoke
+samples do not support tail-latency claims.
 
 Style reuses the project Arial 9pt palette, filled markers, boxed axes, top
 legend and no internal grids. Default single-column size is 3.5 × 1.5 inches;
-use the existing `--size` only if a specific paper layout requires it. Standalone
-scripts regenerate PDF/PNG without JSONL or the installed benchmark package.
+use `--size` only if a specific paper layout requires it. Standalone scripts
+regenerate PDF/PNG without the installed benchmark package.

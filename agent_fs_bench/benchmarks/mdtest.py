@@ -19,9 +19,9 @@ Before a case emits anything, mdtest's launch banner must report the pinned
 version, exactly ``P`` total tasks and one node. mdtest's known zero-byte read
 notice is expected and any other warning fails the case; a nonzero exit fails
 immediately, with no retry. stdout/stderr stay in ``ctx.result_dir`` and the CSV
-is deleted once parsed, leaving JSONL as the only measurement record. Each case
-gets a fresh directory under ``ctx.work_dir``, removed after success and kept
-after a failure for diagnosis.
+is deleted once parsed, leaving the ``phases`` table as the measurement record.
+Each case gets a fresh directory under ``ctx.work_dir``, removed after success
+and kept after a failure for diagnosis.
 
 Only --smoke is exposed on the workload CLI; edit CONFIG for a deliberate
 experiment. Targets are mounted externally.
@@ -42,6 +42,7 @@ import subprocess
 import time
 from typing import Any, Sequence
 
+from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import RunContext
 
 MDTEST_VERSION = "4.0.0"
@@ -75,6 +76,11 @@ BANNER = re.compile(
     r"mdtest-(\S+) was launched with (\d+) total task\(s\) on (\d+) node\(s\)"
 )
 ZERO_READ_WARNING = "Read bytes is 0, thus, a read test will actually just open/close"
+
+FIGURES = [
+    Figure('phases', 'procs', 'ops_per_s', split=('operation', 'layout'),
+           xlabel='Client processes', ylabel='Throughput (Kops/s)', yscale=1000, logx=True),
+]
 
 class BenchmarkError(RuntimeError):
     pass
@@ -198,26 +204,16 @@ def build_plan(args: argparse.Namespace) -> list[Case]:
     ]
 
 def run_case(ctx: RunContext, args: argparse.Namespace, case: Case) -> None:
-    items, remainder = divmod(args.total_items, case.concurrency)
-    if remainder or items < 1:
-        raise BenchmarkError(
-            f"{case.name}: total_items {args.total_items} must be divisible "
-            f"by concurrency {case.concurrency}"
-        )
+    items = args.total_items // case.concurrency
     directory = ctx.work_dir / case.name
     log_path = ctx.result_dir / f"{case.name}.log"
     csv_path = ctx.result_dir / f"{case.name}.csv"
     directory.mkdir()
     command = mdtest_command(args, case, items, directory, csv_path)
     log(f"[{ctx.target.name}] {case.name}: {items} items/process")
-    try:
-        completed = subprocess.run(
-            command, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        )
-    except OSError as error:
-        raise BenchmarkError(
-            f"{case.name}: cannot launch {shlex.join(command)}: {error}"
-        ) from error
+    completed = subprocess.run(
+        command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
     log_path.write_text(
         f"$ {shlex.join(command)}\n{completed.stdout}{completed.stderr}",
         encoding="utf-8",
@@ -236,15 +232,14 @@ def run_case(ctx: RunContext, args: argparse.Namespace, case: Case) -> None:
     phases = read_phases(csv_path, case.subset, args.total_items)
     for operation, ops, elapsed, rate in phases:
         ctx.emit(
-            f"{operation}/{case.layout}/N{args.total_items}/P{case.concurrency}",
+            "phases",
             {
-                "concurrency": case.concurrency,
-                "ops": ops,
-                "elapsed_s": elapsed,
-                "ops_per_s": rate,
+                "operation": operation,
+                "layout": case.layout,
+                "procs": case.concurrency,
+                "repeat": case.repeat,
             },
-            repeat=case.repeat,
-            details={"operation": operation, "layout": case.layout},
+            {"ops": ops, "elapsed_s": elapsed, "ops_per_s": rate},
         )
     log(f"[{ctx.target.name}] {case.name}: " + ", ".join(
         f"{operation} {rate:.1f} ops/s" for operation, _ops, _elapsed, rate in phases
@@ -261,14 +256,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         raise BenchmarkError(f"MPI launcher not found: {CONFIG['mpi_command'][0]}")
     with Path(args.mdtest_bin).open('rb') as binary:
         executable_sha256 = hashlib.file_digest(binary, 'sha256').hexdigest()
-    ctx.parameters.clear()
-    ctx.parameters.update(
-        total_items=args.total_items,
-        conc_levels=list(args.conc_levels),
-        layouts=list(args.layouts),
-        subsets=list(args.subsets),
-        repeats=args.repeats,
-        smoke=args.smoke,
+    ctx.info.update(
         mdtest_version=MDTEST_VERSION,
         cache_state=CACHE_STATE,
         completion=COMPLETION,
@@ -286,14 +274,4 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     settings = dict(CONFIG)
     if parsed.smoke:
         settings.update(total_items=128, conc_levels=(1, 2), repeats=2)
-    args = argparse.Namespace(**settings, **vars(parsed))
-    if args.repeats < 1 or not args.conc_levels:
-        raise BenchmarkError("repeats and process counts must be positive")
-    for processes in args.conc_levels:
-        if processes < 1 or args.total_items % processes or args.total_items // processes < 2:
-            raise BenchmarkError("total_items must divide evenly into at least two items per process")
-    if not args.layouts or set(args.layouts) - {"private", "shared"}:
-        raise BenchmarkError("layouts must select private and/or shared")
-    if not args.subsets or set(args.subsets) - {"file", "dir"}:
-        raise BenchmarkError("subsets must select file and/or dir")
-    return args
+    return argparse.Namespace(**settings, **vars(parsed))

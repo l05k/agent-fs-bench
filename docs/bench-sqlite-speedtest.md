@@ -27,8 +27,9 @@ Mount targets externally. There are no workload flags; change `CONFIG` in
 | `force_download` | `False` | Refresh sources and rebuild when True |
 
 Each invocation runs all official main stages in order. Several write stages use
-one transaction for many statements; this is not one commit per statement. Cases
-include the scale, page/cache size, journal/sync settings and `C1`. Sorting helper
+one transaction for many statements; this is not one commit per statement. Rows
+carry the scale, page/cache size and journal/sync settings as key columns.
+Sorting helper
 threads are fixed to zero, mmap stays disabled, and exclusive locking is not
 requested. `--threads` would control sorting workers, not concurrent clients;
 `--multithread` would select SQLite's threading mode, not launch SQL clients.
@@ -47,11 +48,17 @@ patched and the system/Python SQLite library is not the measured engine.
 
 ## Results and timing boundaries
 
-A default case prefix is `main/delete/full/S100/P4096/K2000/C1`:
+The run writes two flat tables:
 
-- `<prefix>/test-100` through the official main stages: `metrics.elapsed_s`,
-  with the official stage description in `details`.
-- `<prefix>/total`: `metrics.official_total_s` and `metrics.wall_s`.
+| Table | Key columns | Metric columns |
+| --- | --- | --- |
+| `stages` | `jmode`, `sync` (`full`/`off`), `size`, `page_size`, `cache_size_kib`, `stage` (official stage ID), `description`, `repeat` | `elapsed_s` |
+| `totals` | `jmode`, `sync`, `size`, `page_size`, `cache_size_kib`, `repeat` | `official_total_s`, `wall_s` |
+
+`summary/stages.csv` and `summary/totals.csv` pool repeats per target and
+setting and report `n` and each metric's median. The manifest's
+`targets[].info` holds the pinned SQLite version, compiler version and
+source/binary hashes.
 
 `official_total_s` is speedtest1's printed TOTAL: the sum of its stage timers.
 `wall_s` covers process launch through exit, including connection setup, work
@@ -70,8 +77,10 @@ but its presence is not a crash-consistency or successful-commit proof.
 
 Databases remain under
 `<target>/agent-fs-bench/sqlite-speedtest/<run-id>/repeat-N/speedtest.sqlite`.
-Portable JSONL and the derived CSV use the common `results/sqlite-speedtest/`
-layout. Source and binary fingerprints identify the actual official build.
+The default figures are a box plot of `official_total_s` per target (x = journal
+mode) and a line of median `elapsed_s` by stage ID with target series;
+`uv run python -m agent_fs_bench plot <run-dir>...` re-renders them. Source and
+binary fingerprints identify the actual official build.
 
 ## NAS comparison and paper figures
 
@@ -88,17 +97,19 @@ SQLite cache smaller than the DB does not establish cold client/server caches.
 Different server hardware means an end-to-end NAS comparison, not isolated
 filesystem-software overhead.
 
-Recommended paper views:
+Default paper views:
 
-1. Stage elapsed time for fixed IDs 100 (insert), 150 (index), 240 (update),
-   410 (integer-PK lookup), 200 (VACUUM), with NAS targets as series. Run the
-   complete suite; select stages only for display. Keep their different SQL and
-   transaction semantics explicit instead of deriving one mixed ops/s number.
-2. `kvtest` amortized microseconds/update versus fixed BLOB size, with separate
+1. `totals` box plot of `official_total_s` per target: complete-suite time.
+2. `stages` line plot of median `elapsed_s` by stage ID, with NAS targets as
+   series. Run the complete suite; select stages only for display with
+   `plot --table stages --x stage --y elapsed_s --where stage=240 ...`. Keep
+   their different SQL and transaction semantics explicit instead of deriving
+   one mixed ops/s number.
+3. `kvtest` amortized microseconds/update versus fixed BLOB size, with separate
    autocommit and batch panels. Do not derive transaction p95/p99 from run means.
 
-Reuse the existing grouped box plots and paper style; each sample is a complete
-run's stage time, not an individual SQL latency. Select only compatible runs:
-summary grouping intentionally does not split by source hash or machine. No
-same-database concurrency curve is claimed. Stock `kvtest` can report failed
-commits as successful work under contention; do not parallelize it on one DB.
+Each sample is a complete run's stage time, not an individual SQL latency.
+Select only compatible runs: `plot` refuses run directories whose configs
+differ. No same-database concurrency curve is claimed. Stock `kvtest` can report
+failed commits as successful work under contention; do not parallelize it on
+one DB.

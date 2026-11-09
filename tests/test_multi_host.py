@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from agent_fs_bench.benchmarks import multi_host
+from agent_fs_bench.results import RunContext, Tables, Target, read_table
 
 
 class WorkerMeasurementTests(unittest.TestCase):
@@ -29,22 +30,46 @@ class WorkerMeasurementTests(unittest.TestCase):
                     {'host_name': 'worker', 'workload': asdict(workload)},
                     (root, hosts / 'worker', shared),
                 )
+
+            tables_dir = root / 'tables'
+            tables_dir.mkdir()
+            tables = Tables(tables_dir)
+            ctx = RunContext('multi-host', 'run', Target('fs', root),
+                             root / 'work', root / 'res', tables)
+            multi_host._emit_measurements(ctx, 'worker', result['metrics'])
+            tables.close()
+
             counts = {
                 'private_create': 3, 'private_fsync': 5, 'private_read': 3,
                 'private_stat': 3, 'private_rename': 3,
                 'shared_create': 2, 'shared_fsync': 3, 'shared_read': 2,
                 'shared_stat': 2, 'shared_delete': 2,
             }
-            rows = {(row['round'], row['phase']): row for row in result['metrics']}
-            self.assertEqual(set(rows), {(r, phase) for r in (1, 2) for phase in counts})
-            for (_, phase), row in rows.items():
-                samples = row['latencies_ns']
-                self.assertEqual(row['ops'], counts[phase])
-                self.assertEqual(len(samples), counts[phase])
-                self.assertAlmostEqual(row['mean_ms'], statistics.fmean(samples) / 1_000_000)
-                self.assertAlmostEqual(row['ops_per_s'], counts[phase] / row['elapsed_s'])
-                expected_bytes = 32 * counts[phase] if phase.endswith(('create', 'read')) else 0
-                self.assertEqual(row['bytes'], expected_bytes)
+            phases = read_table(tables_dir / 'phases.csv')
+            samples = read_table(tables_dir / 'latencies.csv')
+            self.assertEqual(len(phases), 2 * len(counts))
+            self.assertEqual(len(samples), 2 * sum(counts.values()))
+
+            phase_rows = {(int(row['repeat']), row['phase']): row for row in phases}
+            self.assertEqual(set(phase_rows),
+                             {(repeat, phase) for repeat in (1, 2) for phase in counts})
+            sample_rows: dict[tuple[int, str], list[int]] = {}
+            for row in samples:
+                self.assertEqual(row['host'], 'worker')
+                sample_rows.setdefault((int(row['repeat']), row['phase']), []).append(
+                    int(row['latency_ns']))
+            for group, latencies in sample_rows.items():
+                self.assertEqual(len(latencies), counts[group[1]])
+                row = phase_rows[group]
+                self.assertEqual(row['host'], 'worker')
+                self.assertEqual(int(row['ops']), counts[group[1]])
+                self.assertAlmostEqual(float(row['mean_ms']),
+                                       statistics.fmean(latencies) / 1_000_000)
+                self.assertAlmostEqual(float(row['ops_per_s']),
+                                       counts[group[1]] / float(row['elapsed_s']))
+                expected_bytes = 32 * counts[group[1]] if group[1].endswith(('create', 'read')) else 0
+                self.assertEqual(int(row['bytes']), expected_bytes)
+
             renamed = sorted((hosts / 'worker').rglob('*.renamed'))
             self.assertEqual(len(renamed), 6)
             self.assertTrue(all(path.read_bytes() == multi_host._payload('worker', 32)

@@ -1,10 +1,13 @@
 import argparse
+import shlex
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import agent_fs_bench.benchmarks.clone as clone
 from agent_fs_bench.benchmarks.clone import (
     BenchmarkError,
     Copier,
@@ -17,6 +20,7 @@ from agent_fs_bench.benchmarks.clone import (
     validate_copier,
     verify_tree,
 )
+from agent_fs_bench.results import RunContext, Tables, Target, read_table
 
 CP_R = Copier('cp-r', ('cp', '-r', '{src}', '{dst}'))
 CP_RL = Copier('cp-rl', ('cp', '-rl', '{src}', '{dst}'))
@@ -182,6 +186,51 @@ class DatasetShapeTests(unittest.TestCase):
             sum(1 for size in inventories[0].values() if size is None),
             5,  # '.', three populated data directories, one empty directory
         )
+
+
+@unittest.skipUnless(shutil.which('cp'), 'cp is required for copier tests')
+class RunTablesTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.work = self.root / 'work'
+        self.work.mkdir()
+
+    def test_run_uses_target_copier_and_emits_batches_and_requests(self):
+        args = argparse.Namespace(**clone.CONFIG)
+        args.stage = 'bytes'
+        args.repeats = 1
+        args.byte_totals = (4096,)
+        args.byte_files = 1
+        args.copiers = ['cp-r']
+        args.target_copiers = {'fs': ['tree-copy']}
+        args.commands = {
+            'cp-r': 'cp -r {src} {dst}',
+            'tree-copy': shlex.join([
+                sys.executable, '-c',
+                'import shutil, sys; shutil.copytree(sys.argv[1], sys.argv[2])',
+                '{src}', '{dst}',
+            ]),
+        }
+        tables = Tables(self.root)
+        ctx = RunContext('clone', 'run', Target('fs', self.root), self.work,
+                         self.root / 'res', tables)
+        with mock.patch.object(clone, 'fstype', return_value='testfs'):
+            clone.run(ctx, args)
+        tables.close()
+
+        batches = read_table(self.root / 'batches.csv')
+        requests = read_table(self.root / 'requests.csv')
+        self.assertEqual([row['copier'] for row in batches], ['tree-copy'])
+        self.assertEqual([row['copier'] for row in requests], ['tree-copy'])
+        self.assertEqual(batches[0]['experiment'], 'bytes')
+        self.assertEqual(batches[0]['files'], '1')
+        self.assertEqual(batches[0]['file_size_bytes'], '4096')
+        self.assertEqual(batches[0]['total_bytes'], '4096')
+        self.assertEqual(requests[0]['sample'], '1')
+        self.assertEqual(ctx.info['fstype'], 'testfs')
+        self.assertEqual(list(ctx.info['copier_sha256']), ['tree-copy'])
 
 
 if __name__ == '__main__':

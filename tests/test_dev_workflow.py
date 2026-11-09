@@ -11,7 +11,7 @@ from unittest import mock
 
 from agent_fs_bench.benchmarks import dev_workflow, mini_dev_workflow
 from agent_fs_bench.benchmarks.build_settings import read_compiler_version
-from agent_fs_bench.results import PROJECT_ROOT, RunContext
+from agent_fs_bench.results import PROJECT_ROOT, RunContext, Tables, read_table
 from agent_fs_bench.targets import Target
 
 BUILD_VARIABLES = (
@@ -22,7 +22,6 @@ BUILD_VARIABLES = (
     'KCFLAGS', 'KAFLAGS', 'KCONFIG_CONFIG', 'KBUILD_OUTPUT',
     'BUILD_OBSERVATIONS',
 )
-
 
 class KernelConfigFixtureTests(unittest.TestCase):
     def test_shipped_config_selects_64_bit_x86_with_overlayfs(self):
@@ -36,7 +35,6 @@ class KernelConfigFixtureTests(unittest.TestCase):
         self.assertIn('CONFIG_OVERLAY_FS=y', lines)
         self.assertNotIn('# CONFIG_64BIT is not set', lines)
         self.assertNotIn('CONFIG_X86_32=y', lines)
-
 
 class WorkflowRecordingTests(unittest.TestCase):
     def setUp(self):
@@ -56,8 +54,9 @@ class WorkflowRecordingTests(unittest.TestCase):
     def context(self, name):
         work = self.root / name
         work.mkdir()
-        return RunContext(name, 'run', Target('local', self.root), work, work,
-                          {}, 'source', io.StringIO())
+        tables = Tables(work)
+        self.addCleanup(tables.close)
+        return RunContext(name, 'run', Target('local', self.root), work, work, tables)
 
     def compiler_version(self, command='cc'):
         output = subprocess.run([command, '--version'], capture_output=True, text=True,
@@ -124,18 +123,21 @@ class WorkflowRecordingTests(unittest.TestCase):
         args.fixture_dir, args.linux_url, args.jobs = str(fixture), str(source), 1
         ctx = self.context('kernel')
         # Platform and installed kernel prerequisites are not under test; the
-        # checkout, make/compiler, replay, cleanup and JSONL are real.
+        # checkout, make/compiler, replay and cleanup are real.
         with mock.patch.object(dev_workflow, 'require_linux'), \
                 mock.patch.object(dev_workflow, 'ensure_dependencies'), \
                 contextlib.redirect_stderr(io.StringIO()):
             dev_workflow.run(ctx, args)
-        record = json.loads(ctx.output.getvalue())
         self.assertEqual(observations.read_text().splitlines(), ['before:7', 'after:7'])
-        self.assertEqual(record['parameters']['base_commit'], base)
-        self.assertEqual(record['parameters']['tool_versions']['compiler'],
-                         self.compiler_version())
-        self.assertEqual(len(record['details']['tree_assertions']), 1)
-        self.assertTrue(record['details']['tree_assertions'][0]['ok'])
+        self.assertEqual(ctx.info['base_commit'], base)
+        self.assertEqual(ctx.info['jobs'], 1)
+        self.assertEqual(ctx.info['tool_versions']['compiler'], self.compiler_version())
+        workflow = read_table(ctx.result_dir / 'workflow.csv')
+        self.assertEqual(len(workflow), 1)
+        self.assertEqual(workflow[0]['target'], 'local')
+        steps = read_table(ctx.result_dir / 'steps.csv')
+        self.assertIn('verify', {row['kind'] for row in steps})
+        self.assertIn('command', {row['kind'] for row in steps})
         self.assertEqual(self.git(ctx.work_dir / 'repo', 'status', '--porcelain'), '')
 
     def test_mini_records_compiler_selected_by_make(self):
@@ -144,12 +146,15 @@ class WorkflowRecordingTests(unittest.TestCase):
         with mock.patch.object(mini_dev_workflow, 'require_linux'), \
                 contextlib.redirect_stderr(io.StringIO()):
             mini_dev_workflow.run(ctx, mini_dev_workflow.parse_args([]))
-        record = json.loads(ctx.output.getvalue())
-        self.assertEqual(record['parameters']['tool_versions']['compiler'],
-                         self.compiler_version())
+        self.assertEqual(ctx.info['jobs'], 2)
+        self.assertEqual(ctx.info['tool_versions']['compiler'], self.compiler_version())
         source = ctx.work_dir / 'repo-source'
         self.assertFalse((ctx.work_dir / 'repo').exists())
         self.assertEqual(len(self.git(source, 'worktree', 'list', '--porcelain').split('worktree ')), 2)
+        workflow = read_table(ctx.result_dir / 'workflow.csv')[0]
+        self.assertIn('source_setup_ms', workflow)
+        steps = read_table(ctx.result_dir / 'steps.csv')
+        self.assertEqual({row['kind'] for row in steps}, {'worktree', 'build', 'command', 'git'})
 
     def test_make_probe_preserves_recursive_make_selection(self):
         root = self.root / 'recursive'
@@ -165,7 +170,6 @@ class WorkflowRecordingTests(unittest.TestCase):
         )
         os.environ.update(CC='/missing/environment-compiler')
         self.assertEqual(read_compiler_version(root), self.compiler_version())
-
 
 if __name__ == '__main__':
     unittest.main()

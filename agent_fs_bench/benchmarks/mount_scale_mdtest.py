@@ -130,9 +130,6 @@ def _executable(binary: str) -> Path:
     return path
 
 def _options(files: int, size: int) -> tuple[str, ...]:
-    for name, value, minimum in (('files', files, 1), ('size', size, 0)):
-        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-            raise ValueError(f'{name} must be an integer >= {minimum}')
     return ('-F', '-n', str(files), '-w', str(size), '-e', str(size), '-i', '1',
             '--warningAsErrors')
 
@@ -158,16 +155,7 @@ class Mdtest:
     """Run upstream mdtest 4.0.0 file phases and report their upstream timings."""
 
     def __init__(self, binary: str, launcher: Sequence[str], timeout_s: float) -> None:
-        if isinstance(launcher, str):
-            raise ValueError('launcher must be an argv sequence, not a string')
-        self._launcher = tuple(str(part) for part in launcher)
-        if not self._launcher or any(not part for part in self._launcher):
-            raise ValueError('launcher must be a non-empty argv')
-        if ':' in self._launcher:
-            raise ValueError('launcher must not contain the MPMD separator ":"')
-        if (isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float))
-                or not timeout_s > 0.0):
-            raise ValueError('timeout_s must be a positive number')
+        self._launcher = tuple(launcher)
         self._timeout_s = float(timeout_s)
         self._binary = _executable(binary)
         self._sha256 = _sha256(self._binary)
@@ -484,18 +472,8 @@ class Mdtest:
         cpus: dict[tuple[str, int], int] = {}
         spaces: dict[tuple[str, str], int] = {}
         for index, rank in enumerate(values):
-            if not isinstance(rank, Rank):
-                raise ValueError(f'rank {index} must be a Rank')
             _plain(rank.host, f'rank {index} host')
             _plain(rank.hostname, f'rank {index} hostname')
-            _plain(rank.python, f'rank {index} python')
-            _absolute(rank.package_root, f'rank {index} package_root')
-            _absolute(rank.binary, f'rank {index} binary')
-            _absolute(rank.workspace, f'rank {index} workspace')
-            for path in rank.shared:
-                _absolute(path, f'rank {index} shared path')
-            if isinstance(rank.cpu, bool) or not isinstance(rank.cpu, int) or rank.cpu < 0:
-                raise ValueError(f'rank {index} CPU must be a non-negative integer')
             if hosts.setdefault(rank.host, rank.hostname) != rank.hostname:
                 raise ValueError(
                     f'host token {rank.host} names both {hosts[rank.host]} and '
@@ -533,7 +511,7 @@ class Mdtest:
         paths = []
         for value in values:
             path = Path(value).expanduser()
-            if not path.is_absolute() or '@' in str(path):
+            if not path.is_absolute():
                 raise ValueError(f'invalid {what}: {path}')
             path = path.resolve()
             if not path.is_dir():
@@ -595,8 +573,6 @@ def _wrapper(values: dict[str, Any], command: Sequence[str]) -> None:
     if not command:
         raise ValueError('rank wrapper needs the mdtest command after "--"')
     index, cpu = int(values['index']), int(values['cpu'])
-    if index < 0 or cpu < 0:
-        raise ValueError('rank index and CPU must be non-negative')
     declared = os.environ.get('OMPI_COMM_WORLD_RANK')
     if declared is None or declared.strip() != str(index):
         raise RuntimeError(

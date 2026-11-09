@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import time
 
+from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
 
 from . import sqlite_tools
@@ -35,18 +36,25 @@ STAGE_PATTERN = re.compile(
 )
 TOTAL_PATTERN = re.compile(r"^[ \t]*TOTAL\.+[ \t]+(\d+\.\d+)s[ \t]*\r?$", re.MULTILINE)
 
+FIGURES = [
+    Figure(
+        "totals", "jmode", "official_total_s", kind="box",
+        xlabel="Journal mode", ylabel="Speedtest1 total time (s)",
+        name="speedtest-total",
+    ),
+    Figure(
+        "stages", "stage", "elapsed_s",
+        xlabel="Stage ID", ylabel="Stage elapsed time (s)",
+        name="speedtest-stages",
+    ),
+]
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.parse_args(argv)
     args = argparse.Namespace(**CONFIG)
-    args.jmode = sqlite_tools.normalize_journal_mode(args.jmode)
-    if args.size < 1 or args.cache_size < 1 or args.repeats < 1:
-        raise sqlite_tools.BenchmarkError("size, cache_size and repeats must be positive")
-    if args.page_size not in (512, 1024, 2048, 4096, 8192, 16384, 32768, 65536):
-        raise sqlite_tools.BenchmarkError("page_size must be a power of two from 512 to 65536")
+    args.jmode = args.jmode.lower()
     return args
-
 
 def parse_speedtest_output(text: str) -> dict:
     version = VERSION_PATTERN.search(text)
@@ -64,32 +72,26 @@ def parse_speedtest_output(text: str) -> dict:
         raise sqlite_tools.BenchmarkError("speedtest1 TOTAL does not match its stage timings")
     return {"sqlite_version": version.group(1), "stages": stages, "official_total_s": total_s}
 
-
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
     build_dir = Path(args.build_dir or (PROJECT_ROOT / "build" / "sqlite-speedtest"))
     build_dir = build_dir.expanduser().resolve()
     sources = sqlite_tools.ensure_sources(build_dir, "speedtest1", args.force_download)
     binary, provenance = sqlite_tools.build(build_dir, "speedtest1", sources, args.force_download)
-    sync = "off" if args.nosync else "full"
-    case = (
-        f"main/{args.jmode}/{sync}/S{args.size}/P{args.page_size}"
-        f"/K{args.cache_size}/C1"
+
+    ctx.info.update(
+        sqlite_version=sqlite_tools.SQLITE_VERSION,
+        compiler=provenance["compiler_version"],
+        source_sha256=provenance["source_sha256"],
+        binary_sha256=provenance["binary_sha256"],
     )
-    ctx.parameters.clear()
-    ctx.parameters.update({
-        "testset": "main",
-        "size": args.size,
-        "cache_size_kib": args.cache_size,
-        "page_size": args.page_size,
+
+    keys = {
         "jmode": args.jmode,
-        "nosync": args.nosync,
-        "sort_threads": 0,
-        "mmap_bytes": 0,
-        "repeats": args.repeats,
-        "tool_versions": {"compiler": provenance["compiler_version"]},
-        "source_sha256": provenance["source_sha256"],
-        "binary_sha256": provenance["binary_sha256"],
-    })
+        "sync": "off" if args.nosync else "full",
+        "size": args.size,
+        "page_size": args.page_size,
+        "cache_size_kib": args.cache_size,
+    }
     for repeat in range(1, args.repeats + 1):
         # Each complete suite starts from a new database; caches are not evicted.
         directory = ctx.work_dir / f"repeat-{repeat}"
@@ -108,14 +110,19 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         parsed = parse_speedtest_output(process.stdout)
         if parsed["sqlite_version"] != sqlite_tools.SQLITE_VERSION:
             raise sqlite_tools.BenchmarkError("speedtest1 reported a different SQLite version")
-        ctx.parameters["tool_versions"]["sqlite"] = parsed["sqlite_version"]
         for stage in parsed["stages"]:
             ctx.emit(
-                f"{case}/test-{stage['id']}", {"elapsed_s": stage["elapsed_s"]},
-                repeat=repeat, details={"description": stage["description"]},
+                "stages",
+                {
+                    **keys,
+                    "stage": stage["id"],
+                    "description": stage["description"],
+                    "repeat": repeat,
+                },
+                {"elapsed_s": stage["elapsed_s"]},
             )
         ctx.emit(
-            f"{case}/total",
+            "totals",
+            {**keys, "repeat": repeat},
             {"official_total_s": parsed["official_total_s"], "wall_s": wall_s},
-            repeat=repeat,
         )

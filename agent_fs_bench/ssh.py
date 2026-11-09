@@ -84,10 +84,6 @@ def openmpi_agent(hosts_path: Path, connect_timeout_s: int = 15) -> str:
     on spaces, without quote processing, so every token must be a literal
     whitespace- and colon-free word.
     """
-    if type(connect_timeout_s) is not int or connect_timeout_s < 1:
-        raise ValueError("connect_timeout_s must be a positive integer")
-    if not sys.executable:
-        raise ValueError("controller Python executable is unknown")
     tokens = [
         sys.executable,
         str(Path(__file__).resolve()),

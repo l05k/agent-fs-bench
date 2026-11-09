@@ -1,5 +1,4 @@
 import hashlib
-import io
 import json
 import os
 import shutil
@@ -10,19 +9,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from agent_fs_bench.analysis import SUMMARY_SQL, connect
 from agent_fs_bench.benchmarks import kvtest, sqlite_tools
-from agent_fs_bench.results import RunContext
+from agent_fs_bench.results import RunContext, Tables, read_table
 from agent_fs_bench.targets import Target
-
-
 
 def available_compiler():
     requested = os.environ.get("CC")
     if requested:
         return shutil.which(requested)
     return shutil.which("cc") or shutil.which("gcc")
-
 
 def write_sources(root):
     sources = {
@@ -39,7 +34,6 @@ def write_sources(root):
         "int main(void) { return kv_helper(); }\n"
     )
     return sources
-
 
 @unittest.skipUnless(available_compiler(), "C compiler not available")
 class BuildProvenanceTests(unittest.TestCase):
@@ -208,7 +202,6 @@ class BuildProvenanceTests(unittest.TestCase):
             )
             self.assertFalse((root / "kvtest.tmp").exists())
 
-
 KVTEST_RUN_STDOUT = (
     "SQLite version: 3.54.1\n"
     "--count 2000 --max-id 2000 --random\n"
@@ -230,7 +223,6 @@ KVTEST_STAT_STDOUT = (
     f"Freelist-count:     {0:8d}\n"
     "Integrity-check:    ok\n"
 )
-
 
 class OutputParsingTests(unittest.TestCase):
     def test_parses_official_output_and_reports_measured_fields(self):
@@ -305,7 +297,6 @@ class OutputParsingTests(unittest.TestCase):
         ):
             kvtest.parse_integrity_check(text)
 
-
 class MeasurementBoundaryTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -324,7 +315,8 @@ class MeasurementBoundaryTests(unittest.TestCase):
             sqlite_tools, "build", return_value=(self.root / "kvtest", provenance),
         ))
 
-    def run_measurement(self, output, *, integrity_ok=True):
+    def run_measurement(self, tables, args=None, *, integrity_ok=True):
+        args = args or self.args
         completed_repeats = 0
         checks_after_repeat = []
 
@@ -336,8 +328,6 @@ class MeasurementBoundaryTests(unittest.TestCase):
             elif operation == "run":
                 completed_repeats += 1
                 text = KVTEST_RUN_STDOUT
-                if "--integrity-check" in command:
-                    checks_after_repeat.append(completed_repeats)
             elif operation == "stat":
                 checks_after_repeat.append(completed_repeats)
                 text = KVTEST_STAT_STDOUT
@@ -348,100 +338,64 @@ class MeasurementBoundaryTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, text, "")
 
         context = RunContext(
-            "kvtest", "boundary", Target("fs", self.root), self.root,
-            self.root, {}, "source", output,
+            "kvtest", "boundary", Target("fs", self.root),
+            self.root / "work", self.root / "results", tables,
         )
         with mock.patch.object(sqlite_tools, "run_command", side_effect=execute):
             if integrity_ok:
-                kvtest.run(context, self.args)
+                kvtest.run(context, args)
             else:
                 with self.assertRaises(sqlite_tools.BenchmarkError):
-                    kvtest.run(context, self.args)
-        self.assertEqual(completed_repeats, self.args.repeats)
-        self.assertEqual(checks_after_repeat, [self.args.repeats])
+                    kvtest.run(context, args)
+        self.assertEqual(completed_repeats, args.repeats)
+        self.assertEqual(checks_after_repeat, [args.repeats])
+        return context
 
     def test_validation_follows_all_repeats_and_gates_every_sample(self):
         for integrity_ok in (True, False):
             with self.subTest(integrity_ok=integrity_ok):
-                output = io.StringIO()
-                self.run_measurement(output, integrity_ok=integrity_ok)
-                rows = [json.loads(line) for line in output.getvalue().splitlines()]
+                directory = self.root / f"tables-{integrity_ok}"
+                directory.mkdir()
+                tables = Tables(directory)
+                context = self.run_measurement(tables, integrity_ok=integrity_ok)
+                tables.close()
+                path = directory / "repeats.csv"
                 if integrity_ok:
-                    self.assertEqual([row["repeat"] for row in rows], [1, 2])
-                    self.assertTrue(all(row["details"]["integrity_check"] == "ok" for row in rows))
+                    rows = read_table(path)
+                    self.assertEqual([int(row["repeat"]) for row in rows], [1, 2])
+                    self.assertEqual(context.info["sqlite_version"], "3.54.1")
+                    self.assertEqual(context.info["compiler"], "test compiler")
+                    self.assertEqual(context.info["source_sha256"], {})
+                    self.assertEqual(context.info["binary_sha256"], "test binary")
+                    self.assertEqual(context.info["observed"], {
+                        "journal_mode": "wal",
+                        "cache_size": -1000,
+                        "page_size": 4096,
+                    })
                 else:
-                    self.assertEqual(rows, [])
+                    self.assertFalse(path.exists())
 
-    def test_experiment_variants_keep_separate_summary_groups(self):
+    def test_experiment_variants_keep_separate_rows(self):
         variants = (
             {}, {"jmode": "persist"}, {"nosync": True}, {"size": 4096},
             {"variance": 1024}, {"count": 1000}, {"cache_size": 2000},
             {"mmap": 4096}, {"multitrans": False},
         )
         baseline = vars(self.args).copy()
-        output = io.StringIO()
+        directory = self.root / "variants"
+        directory.mkdir()
+        tables = Tables(directory)
         for changes in variants:
-            self.args = SimpleNamespace(**(baseline | changes))
-            self.run_measurement(output)
-        rows = [json.loads(line) for line in output.getvalue().splitlines()]
-        for row in rows:
-            transaction = "autocommit" if row["parameters"]["multitrans"] else "batch"
-            self.assertTrue(row["case"].startswith("overwrite/"))
-            self.assertTrue(row["case"].endswith(f"/{transaction}/C1"))
-        jsonl = self.root / "results.jsonl"
-        jsonl.write_text(output.getvalue(), encoding="utf-8")
-        connection = connect([str(jsonl)])
-        self.addCleanup(connection.close)
-        groups = [row for row in connection.execute(SUMMARY_SQL).fetchall()
-                  if row[2] == "total_elapsed_s"]
-        self.assertEqual(len(groups), len(variants))
-        self.assertTrue(all(row[3] == 2 for row in groups))
-
-
-class JmodeValidationTests(unittest.TestCase):
-    def test_all_allowed_modes_normalize_from_config(self):
-        for mode in sqlite_tools.JMODE_CHOICES:
-            for configured in (mode, mode.upper(), mode.capitalize()):
-                with self.subTest(configured=configured), \
-                        mock.patch.dict(kvtest.CONFIG, {"jmode": configured}):
-                    self.assertEqual(kvtest.parse_args([]).jmode, mode)
-
-    def test_invalid_mode_is_rejected_by_parse_args(self):
-        for configured in ("wla", "WLA"):
-            with self.subTest(configured=configured), \
-                    mock.patch.dict(kvtest.CONFIG, {"jmode": configured}):
-                with self.assertRaisesRegex(sqlite_tools.BenchmarkError,
-                                            "invalid jmode"):
-                    kvtest.parse_args([])
-
-    def test_run_does_not_emit_for_invalid_mode(self):
-        output = io.StringIO()
-        context = RunContext("kvtest", "invalid", Target("fs", Path("/mnt/fs")),
-                             Path("/missing/work"), Path("/missing/results"), {}, "source", output)
-        args = SimpleNamespace(jmode="wla", build_dir=None)
-        with self.assertRaises(sqlite_tools.BenchmarkError):
-            kvtest.run(context, args)
-        self.assertEqual(output.getvalue(), "")
-
-    def test_direct_measure_rejects_invalid_mode_before_side_effects(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            args = SimpleNamespace(
-                jmode="wla",
-                build_dir=root / "build",
-                force_download=False,
-                target_dir=root / "target",
-            )
-            with mock.patch.object(sqlite_tools, "ensure_sources") as ensure_sources:
-                with self.assertRaisesRegex(sqlite_tools.BenchmarkError,
-                                            "invalid jmode"):
-                    kvtest.measure(args)
-            ensure_sources.assert_not_called()
-            self.assertFalse((root / "build").exists())
-            self.assertFalse((root / "target").exists())
-
-
-
+            self.run_measurement(tables, SimpleNamespace(**(baseline | changes)))
+        tables.close()
+        rows = read_table(directory / "repeats.csv")
+        self.assertEqual(len(rows), len(variants) * self.args.repeats)
+        settings = {
+            (row["jmode"], row["sync"], row["transaction"], row["payload_bytes"],
+             row["variance_bytes"], row["count"], row["cache_size_kib"], row["mmap_bytes"])
+            for row in rows
+        }
+        self.assertEqual(len(settings), len(variants))
 
 if __name__ == "__main__":
     unittest.main()
