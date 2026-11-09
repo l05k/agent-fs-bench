@@ -31,11 +31,10 @@ from agent_fs_bench.benchmarks.clone import fstype
 
 PNPM_IMPORT_METHOD = "copy"
 LOCAL_PREP_FILESYSTEMS = {"tmpfs", "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs"}
-# Upstream pnpm fixtures vendored under data/, so the benchmark can replay the
-# dependency trees pnpm's own install benchmark uses.
+# Upstream pnpm fixture vendored under data/, so the benchmark can replay the
+# dependency tree pnpm's own install benchmark uses.
 FIXTURES = {
     "pnpm-bench": "data/pnpm-bench",
-    "pnpm-bench-integrated": "data/pnpm-bench-integrated",
 }
 
 # All experiment settings are code-only. Change the version pins deliberately
@@ -191,24 +190,30 @@ def ignore_args(ignore_scripts: bool) -> list[str]:
 
 
 def concurrency_env(manager: str, concurrency: int) -> dict[str, str]:
-    """Pool-width pins, not package fan-out or total process thread limits."""
+    """Pin the pool that materializes files, not package fan-out.
+
+    npm uses its libuv pool. pnpm 12 is a Rust binary and sizes its global
+    Rayon pool from ``RAYON_NUM_THREADS``; the link phase runs on that pool on
+    Linux. pnpm's ``child-concurrency``, ``network-concurrency`` and
+    ``workspace-concurrency`` govern lifecycle scripts, registry requests and
+    workspace tasks, none of which the timed install exercises.
+    """
     if concurrency == 0:
         return {}
     if manager == "npm":
         return {"UV_THREADPOOL_SIZE": str(concurrency)}
-    return {
-        "RAYON_NUM_THREADS": str(concurrency),
-        "PNPM_MACOS_LINK_THREADS": str(concurrency),
-    }
+    return {"RAYON_NUM_THREADS": str(concurrency)}
 
 
 def manager_env(manager: str, concurrency: int, sandbox: Path) -> dict[str, str]:
     """Use private local HOME/TMP and explicit package manager configuration."""
     env = os.environ.copy()
+    # The pnpm worker-pool names are JS-era (pnpm 10/11); pnpm 12 ignores them,
+    # but they stay scrubbed so an inherited value can never reach a manager.
     for name in list(env):
         if name.lower().startswith("npm_config_") or name in {
             "NODE_ENV", "NODE_OPTIONS", "UV_THREADPOOL_SIZE", "RAYON_NUM_THREADS",
-            "PNPM_MACOS_LINK_THREADS", "PNPM_MAX_WORKERS", "PNPM_WORKERS",
+            "PNPM_MAX_WORKERS", "PNPM_WORKERS",
         }:
             del env[name]
     env.update(concurrency_env(manager, concurrency))
@@ -249,15 +254,11 @@ def copy_fixture_manifest(
     fixture_dir: Path, destination_dir: Path, lockfile: str
 ) -> None:
     ensure_dir(destination_dir)
-    for name in ("package.json", lockfile, "pnpm-workspace.yaml"):
+    for name in ("package.json", lockfile):
         source = fixture_dir / name
-        destination = destination_dir / name
-        if source.is_file():
-            shutil.copy2(source, destination)
-        elif name == "pnpm-workspace.yaml":
-            destination.unlink(missing_ok=True)
-        else:
+        if not source.is_file():
             die(f"required fixture input is missing: {source}")
+        shutil.copy2(source, destination_dir / name)
 
 
 def seed_npm_fixture(
@@ -269,12 +270,12 @@ def seed_npm_fixture(
     ignore_scripts: bool,
     concurrency: int,
 ) -> None:
-    """Seed the npm cache from a fixture's manifest and npm lockfile.
+    """Seed the npm cache from the fixture's manifest and npm lockfile.
 
     The vendored fixture ships pnpm's lockfile plus an npm lockfile resolved
-    from the same manifest (`--legacy-peer-deps`, which these trees need: e.g.
+    from the same manifest (`--legacy-peer-deps`, which this tree needs: e.g.
     `eslint@9` against `@typescript-eslint/parser@7`). The committed npm
-    lockfile is required; missing fixtures are never re-resolved.
+    lockfile is required; a missing one is never re-resolved.
     """
     ensure_dir(seed_dir)
     shutil.copy2(fixture_dir / "package.json", seed_dir / "package.json")
@@ -651,7 +652,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         lockfile = "package-lock.json" if manager == "npm" else "pnpm-lock.yaml"
         fingerprints[manager] = {
             name: hashlib.sha256((template / name).read_bytes()).hexdigest()
-            for name in ("package.json", lockfile, "pnpm-workspace.yaml")
+            for name in ("package.json", lockfile)
             if (template / name).is_file()
         }
         sources[manager], templates[manager] = source, template

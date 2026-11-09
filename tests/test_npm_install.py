@@ -73,6 +73,25 @@ class DurabilityTests(unittest.TestCase):
             # belong to the measured completion latency, not just fsync syscalls.
             self.assertEqual(elapsed, 1.0)
 
+
+class ConcurrencyEnvTests(unittest.TestCase):
+    def test_each_manager_pins_its_own_pool(self):
+        self.assertEqual(bench.concurrency_env('npm', 4), {'UV_THREADPOOL_SIZE': '4'})
+        self.assertEqual(bench.concurrency_env('pnpm', 4), {'RAYON_NUM_THREADS': '4'})
+
+    def test_zero_keeps_tool_defaults(self):
+        self.assertEqual(bench.concurrency_env('npm', 0), {})
+        self.assertEqual(bench.concurrency_env('pnpm', 0), {})
+
+    def test_manager_env_replaces_an_inherited_pool(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {'RAYON_NUM_THREADS': '99', 'UV_THREADPOOL_SIZE': '99'}
+        ):
+            env = bench.manager_env('pnpm', 4, Path(directory))
+        self.assertEqual(env['RAYON_NUM_THREADS'], '4')
+        self.assertNotIn('UV_THREADPOOL_SIZE', env)
+
+
 class InstallBatchTests(unittest.TestCase):
     def test_independent_install_workers_overlap_and_report_durable_completion(self):
         with tempfile.TemporaryDirectory() as directory:
