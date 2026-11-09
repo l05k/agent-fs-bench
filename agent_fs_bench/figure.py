@@ -188,6 +188,11 @@ def render(data: dict, stem: Path) -> None:
             break
         legend.remove()
 
+    # Two-line y label when one line is taller than the figure (e.g. a long --ylabel).
+    if axes.yaxis.label.get_window_extent(renderer).height > (height - 2 * MARGIN) * figure.dpi:
+        axes.set_ylabel(_wrap(data['ylabel']))
+        figure.canvas.draw()
+
     # Inch-based layout: measure decorations, then place axes and legend exactly.
     # Category labels that collide at the final width are wrapped, then rotated.
     dpi = figure.dpi
