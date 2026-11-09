@@ -124,9 +124,13 @@ all workers through one barrier. Workers are separate Python processes, each tim
 install and flush; none shares a cache, store, home or project.
 
 The pin reaches the pool each manager uses for filesystem work: npm gets `UV_THREADPOOL_SIZE`, pnpm
-gets `RAYON_NUM_THREADS` on Linux. It is not a manager-wide limit, and its effect is not comparable
-across managers: npm has no install-wide limit — Arborist fans packages out to pacote — and its
-libuv pool is shared with work such as zlib.
+gets `RAYON_NUM_THREADS`. pnpm 12 is a Rust binary, and its link phase runs on the global Rayon pool
+on Linux, so `RAYON_NUM_THREADS` sets the number of workers materializing package files. It is not a
+manager-wide limit, and its effect is not comparable across managers: npm has no install-wide limit —
+Arborist fans packages out to pacote — and its libuv pool is shared with work such as zlib. pnpm's
+documented `child-concurrency`, `network-concurrency` and `workspace-concurrency` are not used here:
+they bound lifecycle scripts, registry requests and workspace tasks, while the timed install is
+`--ignore-scripts`, `--offline` and a single project.
 
 ## Workload and timing
 

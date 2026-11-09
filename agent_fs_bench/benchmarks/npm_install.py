@@ -190,15 +190,19 @@ def ignore_args(ignore_scripts: bool) -> list[str]:
 
 
 def concurrency_env(manager: str, concurrency: int) -> dict[str, str]:
-    """Pool-width pins, not package fan-out or total process thread limits."""
+    """Pin the pool that materializes files, not package fan-out.
+
+    npm uses its libuv pool. pnpm 12 is a Rust binary and sizes its global
+    Rayon pool from ``RAYON_NUM_THREADS``; the link phase runs on that pool on
+    Linux. pnpm's ``child-concurrency``, ``network-concurrency`` and
+    ``workspace-concurrency`` govern lifecycle scripts, registry requests and
+    workspace tasks, none of which the timed install exercises.
+    """
     if concurrency == 0:
         return {}
     if manager == "npm":
         return {"UV_THREADPOOL_SIZE": str(concurrency)}
-    return {
-        "RAYON_NUM_THREADS": str(concurrency),
-        "PNPM_MACOS_LINK_THREADS": str(concurrency),
-    }
+    return {"RAYON_NUM_THREADS": str(concurrency)}
 
 
 def manager_env(manager: str, concurrency: int, sandbox: Path) -> dict[str, str]:
@@ -207,7 +211,6 @@ def manager_env(manager: str, concurrency: int, sandbox: Path) -> dict[str, str]
     for name in list(env):
         if name.lower().startswith("npm_config_") or name in {
             "NODE_ENV", "NODE_OPTIONS", "UV_THREADPOOL_SIZE", "RAYON_NUM_THREADS",
-            "PNPM_MACOS_LINK_THREADS", "PNPM_MAX_WORKERS", "PNPM_WORKERS",
         }:
             del env[name]
     env.update(concurrency_env(manager, concurrency))
