@@ -35,12 +35,13 @@ removed after the inventory unless `keep_node_modules`, and the benchmark root s
 
 `CONFIG["fixture"]` names the tree pnpm's own install benchmark uses: `pnpm-bench`
 (`pnpm11/benchmarks/fixture`, 84 deps + 4 devDeps). pnpm replays the committed `pnpm-lock.yaml`
-with `--frozen-lockfile`; `storeDir` is overridden by `--store-dir`.
+with `--frozen-lockfile`; store and cache locations come only from the `--store-dir` and
+`--cache-dir` arguments.
 
-npm cannot read a pnpm lockfile and these trees have peer ranges its resolver rejects, so each
-fixture carries a `package-lock.json` resolved with `--legacy-peer-deps`; seeding and timed installs
-both run `npm ci` with that flag. Seeding is the only online phase, all timed installs are
-`--offline`, and fixture selection is code-only.
+npm cannot read a pnpm lockfile and this tree has peer ranges its resolver rejects, so the fixture
+carries a `package-lock.json` resolved with `--legacy-peer-deps`; seeding and timed installs both
+run `npm ci` with that flag. Seeding is the only online phase, all timed installs are `--offline`,
+and fixture selection is code-only.
 
 ## Configuration
 

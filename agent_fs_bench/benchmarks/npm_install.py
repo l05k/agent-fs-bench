@@ -208,9 +208,12 @@ def concurrency_env(manager: str, concurrency: int) -> dict[str, str]:
 def manager_env(manager: str, concurrency: int, sandbox: Path) -> dict[str, str]:
     """Use private local HOME/TMP and explicit package manager configuration."""
     env = os.environ.copy()
+    # The pnpm worker-pool names are JS-era (pnpm 10/11); pnpm 12 ignores them,
+    # but they stay scrubbed so an inherited value can never reach a manager.
     for name in list(env):
         if name.lower().startswith("npm_config_") or name in {
             "NODE_ENV", "NODE_OPTIONS", "UV_THREADPOOL_SIZE", "RAYON_NUM_THREADS",
+            "PNPM_MAX_WORKERS", "PNPM_WORKERS",
         }:
             del env[name]
     env.update(concurrency_env(manager, concurrency))
@@ -267,12 +270,12 @@ def seed_npm_fixture(
     ignore_scripts: bool,
     concurrency: int,
 ) -> None:
-    """Seed the npm cache from a fixture's manifest and npm lockfile.
+    """Seed the npm cache from the fixture's manifest and npm lockfile.
 
     The vendored fixture ships pnpm's lockfile plus an npm lockfile resolved
-    from the same manifest (`--legacy-peer-deps`, which these trees need: e.g.
+    from the same manifest (`--legacy-peer-deps`, which this tree needs: e.g.
     `eslint@9` against `@typescript-eslint/parser@7`). The committed npm
-    lockfile is required; missing fixtures are never re-resolved.
+    lockfile is required; a missing one is never re-resolved.
     """
     ensure_dir(seed_dir)
     shutil.copy2(fixture_dir / "package.json", seed_dir / "package.json")
