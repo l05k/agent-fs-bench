@@ -20,6 +20,7 @@ BENCHMARKS = {
     'multi-host': 'multi_host',
     'mount-scale': 'mount_scale',
     'mdtest': 'mdtest',
+    'mdtest-peak': 'mdtest_peak',
     'agent-replay': 'agent_replay',
 }
 RESULTS_DIR = PROJECT_ROOT / 'results'

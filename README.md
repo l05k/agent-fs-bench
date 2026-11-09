@@ -61,13 +61,14 @@ Targets run sequentially. Working data goes to
 | `multi-host` | Concurrent private-tree ops and directory contention from several SSH hosts | [multi-host](docs/bench-multi-host-nas.md) |
 | `mount-scale` | N independent clients (local cores first, then SSH hosts); Open MPI mdtest and mount lifecycle | [mount scale](docs/bench-mount-scale.md) |
 | `mdtest` | Single-client POSIX metadata throughput; process-count sweep | [mdtest](docs/bench-mdtest.md) |
+| `mdtest-peak` | Single-client peak sweep to 2× CPUs: file create/stat/read/unlink ops/s and MiB/s for 0 B–1 MiB files | [mdtest peak](docs/bench-mdtest-peak.md) |
 | `agent-replay` | Real Harbor/Docker tasks driven by accepted model-response cassettes | [agent replay](docs/bench-agent-replay.md) |
 
 ```sh
 uv run python -m agent_fs_bench run <command> --dirs /mnt/fs-a
 ```
 
-The only workload flags are `clone --smoke`, `mdtest --smoke` and
+The only workload flags are `clone --smoke`, `mdtest --smoke`, `mdtest-peak --smoke` and
 `mount-scale --directory-smoke` (pass them after `--`). All other settings
 (scale, repeats, concurrency, PRAGMAs, tool versions, paths) live in the `CONFIG`
 dict at the top of each module in `agent_fs_bench/benchmarks/`. Changing an
