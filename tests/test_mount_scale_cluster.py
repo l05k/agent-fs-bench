@@ -17,8 +17,8 @@ class WorkerDataTests(unittest.TestCase):
             (data / '.owner').write_text('another-volume')
             lifecycle = Lifecycle({'directory_smoke': True, 'data_root': str(data),
                                    'work_dir': str(work), 'name': 'local', 'token': 'expected'})
-            with self.assertRaisesRegex(RuntimeError, 'same run sentinel'):
-                lifecycle.setup(repeat=1, clients=2, total_clients=2)
+            with self.assertRaisesRegex(AssertionError, 'run sentinel'):
+                lifecycle.setup({'repeat': 1, 'clients': 2, 'total_clients': 2})
             self.assertFalse((data / 'N2-R1').exists())
 
 

@@ -27,7 +27,7 @@ must be observed at the actual writer, not inferred from this benchmark.
 
 ```sh
 uv run python -m agent_fs_bench run kvtest --mode local --dirs /mnt/fs-a
-# Smoke test: two tasks, two repeats and 200 writes; needs two logical CPUs.
+# Smoke test: two tasks, two repeats and 200 writes.
 uv run python -m agent_fs_bench run kvtest --mode local --dirs /mnt/fs-a -- --smoke
 ```
 
@@ -40,7 +40,7 @@ Experiment settings are the `CONFIG` mapping at the top of
 `agent_fs_bench/benchmarks/kvtest.py`. Change that code for an ablation; do not
 commit private settings. Defaults: `count=2000`, `size=2048`, `variance=0`,
 `cache_size=1000` KiB, `jmode=delete`, `multitrans=True`, `repeats=5`, `mmap=0`,
-`nosync=False`, `tasks=1`, `cpus_per_task=1`, `oversubscribe=1`.
+`nosync=False`, `tasks=1`.
 FULL synchronization is pinned at build time; kvtest does not print a
 connection-level readback. `nosync=True` explicitly requests OFF and is not part
 of the NAS baseline. `build_dir` and `force_download` manage the build cache and
@@ -48,18 +48,17 @@ are not experiment parameters.
 
 `tasks` is the external concurrency: that many independent kvtest instances,
 each with its own database. Each instance is a single connection and the
-workload is single-threaded, so `cpus_per_task` stays 1. N is one value per run,
-never swept inside a run; obtain a curve by pooling several runs with
-`plot --vary tasks`. `oversubscribe` above 1 reuses CPU groups and is not part
-of the default baseline.
+workload is single-threaded. N is one value per run, never swept inside a
+run; obtain a curve by pooling several runs with `plot --vary tasks`. Tasks
+above a machine's CPU count share CPUs, which is not part of the default
+baseline.
 
 For transaction-granularity sensitivity, run fixed sizes such as 1024, 4096 and
 16384 bytes with `variance=0`, separately for `multitrans=True` and False. Each
 row carries journal/sync mode, size, variance, count, cache, mmap, transaction
 mode, `tasks`, repeat, task `sample` and node `host` as key columns, so these
-settings do not collapse into the same summary group. Each task uses its own
-database; no database has concurrent users, so this is not a same-database
-concurrency benchmark.
+settings keep separate rows. Each task uses its own database; no database has
+concurrent users, so this is not a same-database concurrency benchmark.
 
 On each machine, the node leader (the first task on that machine) downloads the
 SQLite 3.54.1 amalgamation and `kvtest.c` into `build/kvtest/` in that machine's
@@ -86,7 +85,7 @@ between machines.
 Later runs reuse the binary only when it is newer than `kvtest.c`, `sqlite3.c`
 and `sqlite3.h`, and its metadata matches the binary hash, current source hashes
 and compile flags. Reuse does not resolve or run any compiler, so a host that only
-consumes an existing cache does not need one; the per-node manifest info records
+consumes an existing cache does not need one; the per-node `config.json` info records
 the cached compiler's `--version` line and the source/binary hashes, not the
 current `CC`. If an
 up-to-date binary has missing or incomplete metadata, or metadata that does not
@@ -116,8 +115,8 @@ rollback mode is not an unconditional power-loss durability guarantee; see
 Deploy the same checkout with the shared Python package and use Python 3.12+ on
 every machine. `uv sync --locked` installs the standard library dependencies and
 Matplotlib in each machine's environment. Every task reports through task 0 as
-the run proceeds; a failure raised by any task stops the run before summaries
-and figures are written. No single-file helper generation or separate script
+the run proceeds; a failure raised by any task stops the run and writes no
+further rows. No single-file helper generation or separate script
 deployment is supported.
 Each machine that runs tasks needs network access for the first source download
 and a C compiler (`CC`, `cc` or `gcc`) for the first build; a valid cached build
@@ -150,9 +149,9 @@ The run writes one flat table:
 | --- | --- | --- |
 | `repeats` | `jmode`, `sync` (`full`/`off`), `transaction` (`autocommit`/`batch`), `payload_bytes`, `variance_bytes`, `count`, `cache_size_kib`, `mmap_bytes`, `tasks`, `repeat`, `sample` (task index), `host` (node) | `microseconds_per_write`, `write_rate_mb_s`, `total_elapsed_s` |
 
-`summary/repeats.csv` pools repeats per target, setting and task host and
-reports `n` and each metric's median. The manifest's `targets[].info` holds the
-pinned SQLite version, the final `integrity_check` result, and `observed`: per
+Figures show the median and IQR of the raw rows, pooling repeats per target,
+setting and task host. `config.json`'s `targets[].info` holds the pinned SQLite
+version, the final `integrity_check` result, and `observed`: per
 repeat and task, the values kvtest read back from SQLite (`journal_mode`,
 `cache_size` as the raw PRAGMA value, negative meaning KiB, and `page_size` in
 bytes). Each node leader's compiler version, source/binary hashes and SQLite
@@ -174,8 +173,8 @@ and the run stops.
 
 The default figure is a box plot of `microseconds_per_write` with `tasks` on x,
 one box per concurrency level and target, split into one figure per transaction
-mode. `uv run python -m agent_fs_bench plot <run-dir>...` re-renders the figures
-for finished runs; pool runs with different `tasks` using `--vary tasks`, and
+mode. `uv run python -m agent_fs_bench plot <run-dir>...` draws it for finished
+runs; pool runs with different `tasks` using `--vary tasks`, and
 runs with different `multitrans` values using `--vary multitrans`.
 
 The official SQL update loop does not reliably reject failed commits under lock
@@ -384,14 +383,12 @@ corpus to all OpenClaw usage or call metadata-only calibration a faithful replay
                              per-task database retained on the target
 build/kvtest/                per-machine sources, compiled binary (git-ignored),
                              and kvtest-build.json build provenance
-results/kvtest/<run-id>/manifest.json
+results/kvtest/<run-id>/config.json
                              config, source hash and per-target info
 results/kvtest/<run-id>/repeats.csv
                              one row per repeat and task
-results/kvtest/<run-id>/summary/repeats.csv
-                             n and metric medians per target, setting and host
 results/kvtest/<run-id>/figures/
-                             default box plot
+                             default box plot, written by `plot`
 ```
 
 In DELETE mode the rollback journal may exist during a write transaction and is
@@ -399,7 +396,7 @@ deleted by a successful commit; normal completion leaves `kvtest.sqlite`, not a
 persistent journal file.
 
 Source revision, compiler and workload requests must match when comparing runs;
-the manifest records the source/binary hashes and SQLite version per node, and
+`config.json` records the source/binary hashes and SQLite version per node, and
 the observed values per repeat and task.
 `microseconds_per_write` amortizes connection setup and final close/checkpoint;
 it is not a distribution of individually sampled write latencies.

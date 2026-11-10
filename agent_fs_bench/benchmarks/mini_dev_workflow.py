@@ -21,7 +21,6 @@ from agent_fs_bench.results import PROJECT_ROOT, RunContext
 from .build_settings import read_compiler_version
 from .dev_workflow import (
     WorkflowError,
-    check_build_parallelism,
     elapsed_ms,
     fixture_hashes,
     git_text,
@@ -45,8 +44,7 @@ DEFAULT_BUNDLE = "source-repo.bundle"
 # the filesystem under test, so the source repository sits next to the worktree.
 SOURCE_REPO_SUFFIX = "-source"
 
-# Keep this harness's configured parallelism; upstream invokes plain make.
-# Both "jobs" and "cpus_per_task" are capped here for a deliberate experiment.
+# The harness's fixed build parallelism; upstream invokes plain make.
 FIXED_JOBS = 2
 
 WORKFLOW_METRICS = (
@@ -61,10 +59,7 @@ CONFIG = {
     "fixture_dir": str(DEFAULT_FIXTURE_DIR),
     "require_fstype": None,
     "tasks": 1,
-    # Must equal "jobs": one pinned CPU per make job.
-    "cpus_per_task": FIXED_JOBS,
     "jobs": FIXED_JOBS,
-    "oversubscribe": 1,
     "verbose": False,
 }
 
@@ -206,32 +201,10 @@ def remove_worktree(
     worktree: Path,
     verbose: bool,
 ) -> None:
-    errors: list[str] = []
-    if worktree.exists():
-        try:
-            run_git(
-                source_repo,
-                ["worktree", "remove", "--force", str(worktree)],
-                what="removing the benchmark worktree",
-                verbose=verbose,
-            )
-        except WorkflowError as exc:
-            errors.append(str(exc))
-    try:
-        run_git(
-            source_repo,
-            ["worktree", "prune"],
-            what="pruning stale worktree metadata",
-            verbose=verbose,
-        )
-    except WorkflowError as exc:
-        errors.append(str(exc))
-    if errors:
-        raise WorkflowError("worktree cleanup failed: " + "; ".join(errors))
-
-def resolve_jobs(jobs: int) -> int:
-    """Cap build parallelism so runs stay comparable."""
-    return min(jobs, FIXED_JOBS)
+    run_git(source_repo, ["worktree", "remove", "--force", str(worktree)],
+            what="removing the benchmark worktree", verbose=verbose)
+    run_git(source_repo, ["worktree", "prune"], what="pruning stale worktree metadata",
+            verbose=verbose)
 
 def prepare_worktree(
     task_dir: Path,
@@ -276,137 +249,136 @@ def run_workflow(
 
     steps: list[dict[str, Any]] = []
     timed_start = time.perf_counter_ns()
-    try:
-        prune_start = time.perf_counter_ns()
-        run_git(
-            source_repo,
-            ["worktree", "prune"],
-            what="pruning stale worktree metadata",
-            verbose=args.verbose,
-        )
-        steps.append({
-            "kind": "worktree", "name": "prune", "commit": "",
-            "ms": elapsed_ms(prune_start),
-        })
+    # Timed workflow; a failure stops the run and leaves the worktree for inspection.
+    prune_start = time.perf_counter_ns()
+    run_git(
+        source_repo,
+        ["worktree", "prune"],
+        what="pruning stale worktree metadata",
+        verbose=args.verbose,
+    )
+    steps.append({
+        "kind": "worktree", "name": "prune", "commit": "",
+        "ms": elapsed_ms(prune_start),
+    })
 
-        add_start = time.perf_counter_ns()
-        run_git(
-            source_repo,
-            ["worktree", "add", "--detach", str(worktree), base_commit],
-            what="creating the benchmark worktree",
-            verbose=args.verbose,
-        )
-        steps.append({
-            "kind": "worktree", "name": "add", "commit": "",
-            "ms": elapsed_ms(add_start),
-        })
+    add_start = time.perf_counter_ns()
+    run_git(
+        source_repo,
+        ["worktree", "add", "--detach", str(worktree), base_commit],
+        what="creating the benchmark worktree",
+        verbose=args.verbose,
+    )
+    steps.append({
+        "kind": "worktree", "name": "add", "commit": "",
+        "ms": elapsed_ms(add_start),
+    })
 
-        initial = run_command(
+    initial = run_command(
+        ["make", f"-j{jobs}"],
+        cwd=worktree,
+        what="initial build",
+        verbose=args.verbose,
+    )
+    steps.append({
+        "kind": "build", "name": "initial-build", "commit": "", "ms": initial.ms,
+    })
+
+    for commit in commits:
+        commit_id = commit["id"]
+        message = commit["message"]
+        files = commit["files"]
+
+        commands: list[tuple[str, str]] = []
+        for command_file in ("search_commands", "read_commands", "edit_commands"):
+            commands.append((command_file, commit[command_file]))
+
+        for phase, filename in commands:
+            category = phase.removesuffix("_commands")
+            load_start = time.perf_counter_ns()
+            loaded = load_commands(fixture_dir / filename)
+            steps.append({
+                "kind": "command", "name": f"{category}-load",
+                "commit": commit_id, "ms": elapsed_ms(load_start),
+            })
+            for command in loaded:
+                result = run_shell(
+                    command,
+                    cwd=worktree,
+                    what=f"{category} command for {commit_id}",
+                    verbose=args.verbose,
+                )
+                steps.append({
+                    "kind": "command", "name": category,
+                    "commit": commit_id, "ms": result.ms,
+                })
+
+        incremental = run_command(
             ["make", f"-j{jobs}"],
             cwd=worktree,
-            what="initial build",
+            what=f"incremental build for {commit_id}",
             verbose=args.verbose,
         )
         steps.append({
-            "kind": "build", "name": "initial-build", "commit": "", "ms": initial.ms,
+            "kind": "build", "name": "incremental-build",
+            "commit": commit_id, "ms": incremental.ms,
         })
 
-        for commit in commits:
-            commit_id = commit["id"]
-            message = commit["message"]
-            files = commit["files"]
+        status = run_git(
+            worktree,
+            ["status", "--short"],
+            what=f"git status for {commit_id}",
+            verbose=args.verbose,
+        )
+        steps.append({
+            "kind": "git", "name": "status", "commit": commit_id, "ms": status.ms,
+        })
 
-            commands: list[tuple[str, str]] = []
-            for command_file in ("search_commands", "read_commands", "edit_commands"):
-                commands.append((command_file, commit[command_file]))
+        diff = run_git(
+            worktree,
+            ["diff", "--stat", "--", *files],
+            what=f"git diff for {commit_id}",
+            verbose=args.verbose,
+        )
+        steps.append({
+            "kind": "git", "name": "diff", "commit": commit_id, "ms": diff.ms,
+        })
 
-            for phase, filename in commands:
-                category = phase.removesuffix("_commands")
-                load_start = time.perf_counter_ns()
-                loaded = load_commands(fixture_dir / filename)
-                steps.append({
-                    "kind": "command", "name": f"{category}-load",
-                    "commit": commit_id, "ms": elapsed_ms(load_start),
-                })
-                for command in loaded:
-                    result = run_shell(
-                        command,
-                        cwd=worktree,
-                        what=f"{category} command for {commit_id}",
-                        verbose=args.verbose,
-                    )
-                    steps.append({
-                        "kind": "command", "name": category,
-                        "commit": commit_id, "ms": result.ms,
-                    })
+        add = run_git(
+            worktree,
+            ["add", "--", *files],
+            what=f"git add for {commit_id}",
+            verbose=args.verbose,
+        )
+        steps.append({
+            "kind": "git", "name": "add", "commit": commit_id, "ms": add.ms,
+        })
 
-            incremental = run_command(
-                ["make", f"-j{jobs}"],
-                cwd=worktree,
-                what=f"incremental build for {commit_id}",
-                verbose=args.verbose,
-            )
-            steps.append({
-                "kind": "build", "name": "incremental-build",
-                "commit": commit_id, "ms": incremental.ms,
-            })
+        commit_result = run_git(
+            worktree,
+            [
+                "-c",
+                "user.name=Filesystem Bench",
+                "-c",
+                "user.email=bench@example.invalid",
+                "commit",
+                "--no-gpg-sign",
+                "-m",
+                message,
+            ],
+            what=f"git commit for {commit_id}",
+            verbose=args.verbose,
+        )
+        steps.append({
+            "kind": "git", "name": "commit", "commit": commit_id,
+            "ms": commit_result.ms,
+        })
 
-            status = run_git(
-                worktree,
-                ["status", "--short"],
-                what=f"git status for {commit_id}",
-                verbose=args.verbose,
-            )
-            steps.append({
-                "kind": "git", "name": "status", "commit": commit_id, "ms": status.ms,
-            })
-
-            diff = run_git(
-                worktree,
-                ["diff", "--stat", "--", *files],
-                what=f"git diff for {commit_id}",
-                verbose=args.verbose,
-            )
-            steps.append({
-                "kind": "git", "name": "diff", "commit": commit_id, "ms": diff.ms,
-            })
-
-            add = run_git(
-                worktree,
-                ["add", "--", *files],
-                what=f"git add for {commit_id}",
-                verbose=args.verbose,
-            )
-            steps.append({
-                "kind": "git", "name": "add", "commit": commit_id, "ms": add.ms,
-            })
-
-            commit_result = run_git(
-                worktree,
-                [
-                    "-c",
-                    "user.name=Filesystem Bench",
-                    "-c",
-                    "user.email=bench@example.invalid",
-                    "commit",
-                    "--no-gpg-sign",
-                    "-m",
-                    message,
-                ],
-                what=f"git commit for {commit_id}",
-                verbose=args.verbose,
-            )
-            steps.append({
-                "kind": "git", "name": "commit", "commit": commit_id,
-                "ms": commit_result.ms,
-            })
-
-        workflow_ms = elapsed_ms(timed_start)
-        compiler_version = read_compiler_version(worktree)
-    finally:
-        cleanup_start = time.perf_counter_ns()
-        remove_worktree(source_repo, worktree=worktree, verbose=args.verbose)
-        cleanup_ms = elapsed_ms(cleanup_start)
+    workflow_ms = elapsed_ms(timed_start)
+    compiler_version = read_compiler_version(worktree)
+    cleanup_start = time.perf_counter_ns()
+    remove_worktree(source_repo, worktree=worktree, verbose=args.verbose)
+    cleanup_ms = elapsed_ms(cleanup_start)
 
     unattributed_ms = max(0, workflow_ms - sum(step["ms"] for step in steps))
 
@@ -459,9 +431,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.parse_args(argv)
     args = argparse.Namespace(**CONFIG)
-    args.jobs = resolve_jobs(args.jobs)
-    args.cpus_per_task = resolve_jobs(args.cpus_per_task)
-    check_build_parallelism(args.jobs, args.cpus_per_task)
+    assert type(args.jobs) is int and 1 <= args.jobs <= FIXED_JOBS, \
+        f"jobs: expected 1..{FIXED_JOBS}, measured {args.jobs!r}"
     return args
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
@@ -511,7 +482,6 @@ def task(t: cluster.Task) -> None:
     first = results[0][1]
     t.info({
         "jobs": args.jobs,
-        "cpus_per_task": args.cpus_per_task,
         "base_commit": first["base_commit"],
     })
     for sample, (host, result) in enumerate(results):

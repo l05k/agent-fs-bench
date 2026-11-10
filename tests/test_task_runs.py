@@ -29,8 +29,8 @@ from test_sqlite_speedtest import SPEEDTEST_STDOUT
 LINUX = sys.platform.startswith('linux')
 
 LAYOUTS = {
-    'one machine': [('local', 'host-a', (0,)), ('local', 'host-a', (1,))],
-    'two machines': [('local', 'host-a', (0,)), ('node-a', 'host-b', (0,))],
+    'one machine': [('local', 'host-a'), ('local', 'host-a')],
+    'two machines': [('local', 'host-a'), ('node-a', 'host-b')],
 }
 
 
@@ -75,7 +75,7 @@ class TaskRunTests(unittest.TestCase):
     @unittest.skipUnless(LINUX and shutil.which('cp'), 'Linux and cp are required')
     def test_clone(self):
         args = clone.parse_args(['--smoke'])
-        args.files, args.repeats = 8, 1
+        args.files, args.repeats, args.seed = 8, 1, 1
         for label, slots in LAYOUTS.items():
             with self.subTest(layout=label):
                 rows = run_tasks(clone, args, slots)

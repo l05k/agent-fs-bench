@@ -10,7 +10,8 @@ experiment; targets are mounted externally. A run uses one copier per target. Ev
 request runs one command, fsyncs its entire destination tree, then fsyncs the
 prepared destination parent. Per-node preparation, per-repeat preread, task startup
 and verification are not timed. A successful fsync is the experiment's persistence
-boundary.
+boundary. File contents are pseudo-random bytes from `random.Random(seed)`, so every
+run with the same config clones byte-identical inputs on every machine.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import os
+import random
 from pathlib import Path
 import re
 import shlex
@@ -66,8 +68,6 @@ CONFIG: dict[str, Any] = {
     "file_size_bytes": 4096,
     "files_per_dir": 128,
     "tasks": 1,
-    "cpus_per_task": 1,
-    "oversubscribe": 1,
     "keep_scratch": False,
 }
 
@@ -137,7 +137,9 @@ def fsync_tree(path: Path) -> None:
             fsync_file(root / name)
         fsync_dir(root)
 
-def gen_dataset(spec: Workload, source: Path, files_per_dir: int) -> None:
+def gen_dataset(spec: Workload, source: Path, files_per_dir: int, seed: int) -> None:
+    """Incompressible but reproducible contents: one seeded stream over all files in order."""
+    stream = random.Random(seed)
     source.mkdir(parents=True)
     (source / "empty").mkdir()
     for index in range(spec.files):
@@ -146,7 +148,7 @@ def gen_dataset(spec: Workload, source: Path, files_per_dir: int) -> None:
         with (directory / f"f_{index}.bin").open("wb") as handle:
             remaining = spec.file_size_bytes
             while remaining:
-                block = os.urandom(min(CHUNK, remaining))
+                block = stream.randbytes(min(CHUNK, remaining))
                 handle.write(block)
                 remaining -= len(block)
     fsync_tree(source)
@@ -194,14 +196,11 @@ def warm_source(source: Path, expected_bytes: int) -> None:
 def resolve_copier(args: argparse.Namespace, target_name: str) -> Copier:
     """The one copier this target uses, as an executable argv template."""
     name = args.target_copiers.get(target_name, args.copier)
-    if not isinstance(name, str):
-        raise BenchmarkError(f"copier for {target_name} must be one command name: {name!r}")
-    if name not in args.commands:
-        raise BenchmarkError(f"no command configured for copier {name!r}")
+    assert isinstance(name, str) and name in args.commands, \
+        f"copier for {target_name}: expected one of {sorted(args.commands)}, measured {name!r}"
     argv = shlex.split(args.commands[name])
-    executable = shutil.which(argv[0]) if argv else None
-    if executable is None:
-        raise BenchmarkError(f"{name}: executable not found: {argv[0] if argv else ''}")
+    executable = shutil.which(argv[0])
+    assert executable, f"{name} executable: expected on PATH, measured {argv[0]!r} not found"
     return Copier(name, (executable, *argv[1:]))
 
 def copy_request(source: Path, destination: Path, copier: Copier) -> RequestResult:
@@ -254,7 +253,7 @@ def validate_copier(copier: Copier, scratch: Path) -> None:
         shutil.rmtree(root)
 
 def build_plan(args: argparse.Namespace) -> Workload:
-    """Validate the one directory shape this run measures; `cluster.allocate` checks tasks."""
+    """Validate the one directory shape this run measures; `cluster.place` checks tasks."""
     for name in ("files", "file_size_bytes", "files_per_dir", "repeats"):
         value = getattr(args, name)
         if type(value) is not int or value < 1:
@@ -297,7 +296,7 @@ def _prepare_node(
                                  f"{free / MIB:.0f} MiB available")
         t.log(f"[{t.target.name}/{t.node}] generate {spec.files} files x "
               f"{spec.file_size_bytes} B = {spec.total_bytes / MIB:g} MiB per request")
-        gen_dataset(spec, t.node_dir / "source", args.files_per_dir)
+        gen_dataset(spec, t.node_dir / "source", args.files_per_dir, args.seed)
         # The run tree created by the framework is durable before any timing.
         fsync_ancestors(t.node_dir, t.target.path)
         inventory = tree_inventory(t.node_dir / "source")

@@ -1,60 +1,67 @@
-"""Measure mount scaling with the original IOR 4.0.0 mdtest binary.
+"""Mount-scale file phases with the original IOR 4.0.0 mdtest binary.
 
-Every phase is one global Open MPI 4.1 MPMD job launched by ``agent_fs_bench.cluster``,
-with one application context per client task pinned to its machine and logical CPU. The
-cluster wrapper verifies the actual hostname, MPI rank and single-CPU affinity, requires
-the task's client aliases to exist on its own machine, prints one placement proof with the
-binary's SHA-256, and only then execs mdtest. Placement is therefore proved per task, and
-this module never resolves or stats a remote path on the controller.
+| Symbol | Definition |
+| --- | --- |
+| N | Client tasks of one global MPI job; the rank is the appfile line |
+| F | `files` per task and phase |
+| T_p | Aggregate phase time: mdtest's `all` row, the maximum task time including the end barrier |
+| t_{p,r} | Rank r's phase time before the end barrier |
 
-mdtest runs unchanged upstream 4.0.0: one global ``MPI_COMM_WORLD``, exactly one ``-d``
-path per task (mdtest rejects several paths with ``-S`` and without ``-u``), its own phase
-barriers, and its own rank CSV. Every task accesses the same task-independent
-``mdtest.shared.<n>`` names through its own client alias. Private phases create each
-task's ``test-dir.0-0`` if absent on the machine that owns the workspace, because mdtest
-creates it only for ranks below ``path_count``; each task then creates
-``mdtest_tree.<rank>.0``.
-
-Timing comes only from mdtest's rank CSV: the ``all`` row is the aggregate (maximum task
-time including the phase-end barrier), each ``<rank>`` row is that task's time before the
-barrier. Command wall time is never a metric and rates are never summed in Python. Global
-rank 0 writes the CSV on its own machine; the wrapper returns it through the launcher
-output, so no machine needs a shared result directory.
+Every phase is one global Open MPI 4.1 MPMD job (no CPU binding). Rank r's ``-d`` is
+client r's own alias, created by its machine's lifecycle worker, so every access goes
+through that client's mount. mdtest runs unchanged: one ``MPI_COMM_WORLD``, one ``-d``
+per task (mdtest rejects several paths with ``-S``), its own barriers and rank CSV.
+Private phases need ``test-dir.0-0`` in each workspace, which mdtest creates only for
+low ranks, so the controller creates it first. Timing comes only from mdtest's CSV;
+command wall time is never a metric and rates are never summed per machine.
 """
 
 from __future__ import annotations
 
 import csv
+from dataclasses import dataclass
 import io
 import math
-from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import Any, Sequence
+from typing import Sequence
 
 from agent_fs_bench import cluster
 
-_VERSION = '4.0.0'
+VERSION = '4.0.0'
 # mdtest's mdtest_test_num_t order; the rank CSV header repeats every name.
 _PHASES = (
     'Directory creation', 'Directory stat', 'Directory read', 'Directory rename',
     'Directory removal', 'File creation', 'File stat', 'File read',
     'File removal', 'Tree creation', 'Tree removal',
 )
-_FILE_PHASES = ('File creation', 'File stat', 'File read', 'File removal')
+FILE_PHASES = ('File creation', 'File stat', 'File read', 'File removal')
+SHARED_PHASES = ('File stat', 'File read')
 _HEADER = ['rank', 'items'] + [f'{kind}-{name}' for name in _PHASES
                                for kind in ('rate', 'time')]
-# A phase's rate starts at 2 + 2 * index, its time at 3 + 2 * index. Rank rows
-# use the same layout but stop before the tree phases and omit the items column.
+# Phase time column; rank rows share the layout up to the tree phases.
 _TIME = {name: 3 + 2 * index for index, name in enumerate(_PHASES)}
-_RANK_ROW = 2 + 2 * _PHASES.index('Tree creation')
-# Open MPI may prefix or interleave its own daemon/launcher lines, so the
-# upstream banner is matched by its distinctive text rather than at line start.
+# Open MPI may prefix its own lines, so the banner is matched anywhere in a line.
 _BANNER = re.compile(
     r'mdtest-(\S+) was launched with (\d+) total task\(s\) on (\d+) node\(s\)'
 )
-# mdtest's TEST_DIR plus prep_testdir's ".<iteration>-<dir_iter>" for -i 1.
 _TEST_DIR = 'test-dir.0-0'
+
+
+@dataclass(frozen=True)
+class Rank:
+    """One mdtest task: its machine and its client aliases on that machine."""
+
+    node: cluster.Node
+    workspace: Path  # Private test directory parent; exists on that machine only.
+    shared: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class Timings:
+    items: int  # Items per task reported by mdtest.
+    phase_s: dict[str, float]  # T_p
+    rank_s: dict[str, list[float]]  # t_{p,r}, rank order
 
 
 @dataclass(frozen=True)
@@ -65,168 +72,122 @@ class Phase:
     rank_elapsed_s: list[float]
 
 
-@dataclass(frozen=True)
-class Rank:
-    """One mdtest task: its placement and its client aliases on that machine."""
-
-    slot: cluster.Slot
-    workspace: Path  # Private test directory parent; exists on the slot's machine only.
-    shared: tuple[Path, ...]
-
-
 def _options(files: int, size: int) -> tuple[str, ...]:
     return ('-F', '-n', str(files), '-w', str(size), '-e', str(size), '-i', '1',
             '--warningAsErrors')
 
 
+def shared_job(path: Path, files: int, size: int) -> tuple[str, ...]:
+    return ('-S', '-T', '-E', '-d', str(path), *_options(files, size))
+
+
+def private_job(path: Path, files: int, size: int) -> tuple[str, ...]:
+    return ('-F', '-u', '-C', '-T', '-E', '-r', '-d', str(path), *_options(files, size))
+
+
+# Validation and parsing (pure) ---------------------------------------------------------------
+
+def check_banner(label: str, stdout: str, tasks: int) -> None:
+    match = _BANNER.search(stdout)
+    assert match, f'{label} mdtest banner: expected one, measured none'
+    assert match.group(1) == VERSION, \
+        f'{label} mdtest version: expected {VERSION}, measured {match.group(1)}'
+    assert int(match.group(2)) == tasks, \
+        f'{label} tasks: expected {tasks}, measured {match.group(2)}'
+
+
+def _seconds(label: str, text: str) -> float:
+    value = float(text)
+    assert math.isfinite(value) and value > 0, f'{label}: expected time > 0, measured {text!r}'
+    return value
+
+
+def read_timings(label: str, text: str, phases: Sequence[str], tasks: int) -> Timings:
+    """T_p from the `all` row and t_{p,r} from the rank rows, for `phases` only."""
+    rows = [row for row in csv.reader(io.StringIO(text)) if row]
+    assert rows[0] == _HEADER, f'{label} CSV header: expected mdtest {VERSION}, measured {rows[0]}'
+    assert rows[1][0] == 'all', f'{label} first CSV row: expected all, measured {rows[1][0]}'
+    ranks = rows[2:]
+    assert [row[0] for row in ranks] == [str(rank) for rank in range(tasks)], \
+        f'{label} rank rows: expected {tasks}, measured {len(ranks)}'
+    return Timings(
+        items=int(rows[1][1]),
+        phase_s={name: _seconds(f'{label} {name}', rows[1][_TIME[name]]) for name in phases},
+        rank_s={name: [_seconds(f'{label} rank {row[0]} {name}', row[_TIME[name]])
+                       for row in ranks] for name in phases})
+
+
+def phases_of(prefix: str, labels: Sequence[str], names: Sequence[str], timings: Timings,
+              operations: int) -> list[Phase]:
+    return [Phase(f'{prefix}/{label}', operations, timings.phase_s[name], timings.rank_s[name])
+            for label, name in zip(labels, names)]
+
+
+# Jobs ----------------------------------------------------------------------------------------
+
+def run_job(launcher: cluster.Launcher, binary: str, tag: str, label: str, ranks: Sequence[Rank],
+            groups: Sequence[Sequence[str]], phases: Sequence[str], log_dir: Path,
+            files: int, private: bool = False) -> Timings:
+    """Run one global MPMD job and return its validated timings."""
+    capture = Path('/tmp') / f'agent-fs-bench-{tag}-{label}.csv'
+    placement = tuple(rank.node for rank in ranks)
+    if private:
+        directories: dict[cluster.Node, list[Path]] = {}
+        for rank in ranks:
+            directories.setdefault(rank.node, []).append(rank.workspace / _TEST_DIR)
+        cluster.make_directories(launcher, directories)
+    programs = [[binary, *group, '--saveRankPerformanceDetails', str(capture)]
+                for group in groups]
+    run = cluster.run_program(placement, launcher, programs, log_dir, label)
+    cluster.validate_exit(run)
+    check_banner(label, run.stdout, len(ranks))
+    timings = read_timings(label, cluster.fetch_file(placement[0], launcher, capture),
+                           phases, len(ranks))
+    assert timings.items == files, f'{label} items per task: expected {files}, ' \
+                                   f'measured {timings.items}'
+    return timings
+
+
+@dataclass(frozen=True)
 class Mdtest:
-    """Run upstream mdtest 4.0.0 file phases and report their upstream timings."""
+    """Upstream mdtest 4.0.0 file phases of one run and target."""
 
-    def __init__(self, binary: str, timeout_s: float, tag: str) -> None:
-        self._binary = binary
-        self._timeout_s = float(timeout_s)
-        self._tag = tag  # Unique per run and target: names task 0's CSV file.
-        self._jobs = 0
-        self._sha256: str | None = None
-        self._version: str | None = None
+    binary: str
+    launcher: cluster.Launcher
+    tag: str  # Unique per run and target: names rank 0's CSV file.
 
-    @property
-    def metadata(self) -> dict[str, Any]:
-        """Version and digest only: no addresses, argv or SSH credentials."""
-        return {'mdtest': {'sha256': self._sha256, 'version': self._version}}
+    def job(self, label: str, ranks: Sequence[Rank], groups: Sequence[Sequence[str]],
+            phases: Sequence[str], log_dir: Path, files: int, private: bool = False) -> Timings:
+        return run_job(self.launcher, self.binary, self.tag, label, ranks, groups, phases,
+                       log_dir, files, private)
 
-    def prepare(self, slot: cluster.Slot, shared_paths: Sequence[Path], files: int, size: int,
+    def prepare(self, node: cluster.Node, shared_paths: Sequence[Path], files: int, size: int,
                 log_dir: Path) -> None:
-        """Create each shared fixture once with one task on `slot`, before measurement."""
+        """Create each shared fixture once with one task on `node`, before measurement."""
         for index, path in enumerate(shared_paths, 1):
-            items, _, _, _ = self._job(
-                f'prepare-{index}', [Rank(slot, path, ())],
-                [('-S', '-C', '-d', str(path), *_options(files, size))],
-                ('File creation',), log_dir,
-            )
-            if items != files:
-                raise RuntimeError(f'mdtest prepared {items} items, expected {files}')
+            self.job(f'prepare-{index}', [Rank(node, path, ())],
+                     [('-S', '-C', '-d', str(path), *_options(files, size))],
+                     ('File creation',), log_dir, files)
 
     def warm(self, ranks: Sequence[Rank], files: int, size: int, log_dir: Path) -> None:
-        """Stat and read every client alias once, outside measured rows."""
+        """Warm-up: stat and read every client alias once; the timings are discarded."""
         for resource in range(len(ranks[0].shared)):
-            items, _, _, _ = self._job(
-                f'warm-shared-{resource + 1}', ranks,
-                [self._shared(rank.shared[resource], files, size) for rank in ranks],
-                ('File stat', 'File read'), log_dir,
-            )
-            if items != files:
-                raise RuntimeError(f'mdtest warmed {items} items, expected {files}')
+            self.job(f'warm-shared-{resource + 1}', ranks,
+                     [shared_job(rank.shared[resource], files, size) for rank in ranks],
+                     SHARED_PHASES, log_dir, files)
 
-    def measure(self, ranks: Sequence[Rank], files: int, size: int, log_dir: Path
-                ) -> tuple[list[Phase], dict[str, list[dict[str, Any]]]]:
-        """Return native phases and verified placements for every measured job."""
-        items, times, per_rank, private_placement = self._job(
-            'private', ranks, [self._private(rank.workspace, files, size) for rank in ranks],
-            _FILE_PHASES, log_dir, private=True,
-        )
-        if items != files:
-            raise RuntimeError(f'mdtest reported {items} items per task, expected {files}')
-        placements = {'private': private_placement}
-        phases = [
-            Phase(f'private/{label}', len(ranks) * files, times[name], per_rank[name])
-            for name, label in zip(_FILE_PHASES, ('create', 'stat', 'read', 'remove'))
-        ]
-        # One resource at a time; every client alias is one task of the same job.
+    def measure(self, ranks: Sequence[Rank], files: int, size: int, log_dir: Path) -> list[Phase]:
+        """Sampling: the private job, then one job per shared resource."""
+        operations = len(ranks) * files
+        timings = self.job('private', ranks,
+                           [private_job(rank.workspace, files, size) for rank in ranks],
+                           FILE_PHASES, log_dir, files, private=True)
+        phases = phases_of('private', ('create', 'stat', 'read', 'remove'), FILE_PHASES,
+                           timings, operations)
         for resource in range(len(ranks[0].shared)):
-            items, times, per_rank, shared_placement = self._job(
-                f'shared-{resource + 1}', ranks,
-                [self._shared(rank.shared[resource], files, size) for rank in ranks],
-                ('File stat', 'File read'), log_dir,
-            )
-            if items != files:
-                raise RuntimeError(
-                    f'mdtest shared-{resource + 1} reported an unexpected item count'
-                )
-            placements[f'shared-{resource + 1}'] = shared_placement
-            phases += [
-                Phase(f'shared-{resource + 1}/{label}', len(ranks) * files,
-                      times[name], per_rank[name])
-                for name, label in (('File stat', 'stat'), ('File read', 'read'))
-            ]
-        return phases, placements
-
-    @staticmethod
-    def _shared(path: Path, files: int, size: int) -> tuple[str, ...]:
-        return ('-S', '-T', '-E', '-d', str(path), *_options(files, size))
-
-    @staticmethod
-    def _private(path: Path, files: int, size: int) -> tuple[str, ...]:
-        return ('-F', '-u', '-C', '-T', '-E', '-r', '-d', str(path),
-                *_options(files, size))
-
-    def _job(self, label: str, ranks: Sequence[Rank], groups: Sequence[Sequence[str]],
-             phases: Sequence[str], log_dir: Path, *, private: bool = False
-             ) -> tuple[int, dict[str, float], dict[str, list[float]], list[dict[str, Any]]]:
-        """Run one global MPMD job and validate its placement and timings."""
-        if len(ranks) != len(groups) or not ranks:
-            raise ValueError('every task needs exactly one mdtest argument group')
-        if len({len(rank.shared) for rank in ranks}) != 1:
-            raise ValueError('every task needs the same number of shared resources')
-        self._jobs += 1
-        capture = Path('/tmp') / f'agent-fs-bench-{self._tag}-{self._jobs:04d}-{label}.csv'
-        slots = [rank.slot for rank in ranks]
-        programs = [[self._binary, *group, '--saveRankPerformanceDetails', str(capture)]
-                    for group in groups]
-        result = cluster.run_native(
-            slots, programs, log_dir, label,
-            exists=[[rank.workspace, *rank.shared] for rank in ranks],
-            mkdirs=[[rank.workspace / _TEST_DIR] if private else [] for rank in ranks],
-            capture=capture, timeout_s=self._timeout_s,
-        )
-        if self._sha256 is None:
-            self._sha256 = result.sha256
-        elif result.sha256 != self._sha256:
-            raise RuntimeError(f'mdtest run {label} used a different mdtest binary')
-        self._version, items, times, per_rank = self._parse(
-            label, result.stdout, result.capture, phases, len(ranks))
-        return items, times, per_rank, result.placement
-
-    @staticmethod
-    def _parse(label: str, stdout: str, text: str, phases: Sequence[str],
-               tasks: int) -> tuple[str, int, dict[str, float], dict[str, list[float]]]:
-        match = _BANNER.search(stdout)
-        if match is None:
-            raise RuntimeError(f'mdtest run {label} did not print its version banner')
-        version, launched = match.group(1), int(match.group(2))
-        if version != _VERSION:
-            raise RuntimeError(f'mdtest run {label} used mdtest-{version}, need {_VERSION}')
-        if launched != tasks:
-            raise RuntimeError(
-                f'mdtest run {label} launched {launched} task(s), expected {tasks}'
-            )
-        rows = [row for row in csv.reader(io.StringIO(text)) if row]
-        if (len(rows) < 2 or rows[0] != _HEADER or rows[1][0] != 'all'
-                or len(rows[1]) != len(_HEADER)):
-            raise RuntimeError(f'mdtest run {label} wrote an unexpected rank CSV')
-        if len(rows) - 2 != tasks:
-            raise RuntimeError(
-                f'mdtest run {label} reported {tasks} tasks but wrote '
-                f'{len(rows) - 2} rank rows'
-            )
-        try:
-            items = int(rows[1][1])
-            times = {name: float(rows[1][_TIME[name]])
-                     for name in _PHASES if rows[1][_TIME[name]]}
-        except ValueError as error:
-            raise RuntimeError(f'mdtest run {label} wrote an unparsable aggregate row') from error
-        per_rank: dict[str, list[float]] = {name: [] for name in _FILE_PHASES}
-        for position, row in enumerate(rows[2:]):
-            if row[0] != str(position) or len(row) < _RANK_ROW:
-                raise RuntimeError(f'mdtest run {label} wrote an unexpected rank row')
-            try:
-                for name in _FILE_PHASES:
-                    per_rank[name].append(float(row[_TIME[name]] or 0.0))
-            except ValueError as error:
-                raise RuntimeError(f'mdtest run {label} wrote an unparsable rank time') from error
-        for name in phases:
-            elapsed = times.get(name, 0.0)
-            if (not math.isfinite(elapsed) or elapsed <= 0.0
-                    or not all(math.isfinite(v) and v > 0.0 for v in per_rank[name])):
-                raise RuntimeError(f'mdtest run {label} reported no time for {name}')
-        return version, items, times, per_rank
+            label = f'shared-{resource + 1}'
+            timings = self.job(label, ranks,
+                               [shared_job(rank.shared[resource], files, size) for rank in ranks],
+                               SHARED_PHASES, log_dir, files)
+            phases += phases_of(label, ('stat', 'read'), SHARED_PHASES, timings, operations)
+        return phases

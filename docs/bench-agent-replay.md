@@ -96,10 +96,10 @@ uv run python -m agent_fs_bench run agent-replay --dirs /mnt/fs-a --mode local
 uv run python -m agent_fs_bench run agent-replay --dirs /mnt/fs-a --mode overflow
 ```
 
-`--mode local` runs every task on the controller; `overflow` fills the controller
-first and then the machines in `local/hosts.toml` in file order; `remote` uses
-only those machines and hosts no task on the controller. A task count above the
-probed capacity of the selected mode is an error, never a smaller run.
+`--mode local` runs every task on the controller; `overflow` deals tasks round-robin
+over the controller and the machines in `local/hosts.toml` in file order; `remote` uses
+only those machines and hosts no task on the controller. Tasks above a machine's CPU
+count share CPUs.
 
 `CONFIG` in `agent_fs_bench/benchmarks/agent_replay.py` holds all settings:
 
@@ -109,8 +109,6 @@ probed capacity of the selected mode is an error, never a smaller run.
 | `case` | `None` | Name of the one case to replay; `None` requires the cases file to list exactly one. |
 | `repeats` | `5` | Independent replays per task. |
 | `tasks` | `1` | Simultaneous independent replays, one per task process. |
-| `cpus_per_task` | `1` | Logical CPUs reserved per task; one replay drives one Docker task. |
-| `oversubscribe` | `1` | Tasks per CPU group. |
 
 `tasks` is the only concurrency control; there is no in-run sweep of cases,
 repeats or tasks. Several tasks may share one machine: the replay starts
@@ -128,7 +126,7 @@ confdir, which costs startup time outside the measured window.
 Each target replays the selected case; its repeats run in order. The node leader
 checks the replay executable, the Python/Harbor/mitmproxy versions and every
 input fingerprint of that case once per node, before any measurement, and records
-them in the manifest. The facts of all nodes must agree.
+them in `config.json`. The facts of all nodes must agree.
 
 Before every repeat, each task restores all inputs into a fresh
 `<target>/agent-fs-bench/agent-replay/<run-id>/<node>/task-NNNN/<case>/repeat-N/mount-I`
@@ -149,7 +147,7 @@ tables.
 
 ## Tables and figures
 
-`results/agent-replay/<run-id>/` holds one `manifest.json` plus flat CSV tables:
+`results/agent-replay/<run-id>/` holds one `config.json` plus flat CSV tables:
 
 | Table | Key columns | Metric columns |
 | --- | --- | --- |
@@ -158,19 +156,17 @@ tables.
 
 A `replays` row is one `target × case × repeat × task`; `sample` is the task
 index and `host` the node it ran on. A `phases` row is one phase Harbor reported
-for that replay. Because both tables have a `repeat` column,
-`summary/<table>.csv` holds the median of each metric per target, case, tasks and
-host, with `n` samples.
+for that replay. Both tables have a `repeat` column, and figures show the median
+and IQR of the raw rows.
 
-`figures/` holds `replay-time-tasks-<case>.pdf` (box plot of `elapsed_s` per tasks
-value) and one `replay-phases-<case>-<tasks>.pdf` per case and tasks value (box
-plot of `seconds` per Harbor phase; punctuation in the value becomes `_`). Pooled
-runs need `plot --vary tasks` (and `case` or any other key that differs);
-`python -m agent_fs_bench plot <run-dir>...` re-renders them.
+`plot` writes `figures/replay-time-tasks-<case>.pdf` (box plot of `elapsed_s` per
+tasks value) and one `replay-phases-<case>-<tasks>.pdf` per case and tasks value
+(box plot of `seconds` per Harbor phase; punctuation in the value becomes `_`).
+Pooled runs need `plot --vary tasks` (and `case` or any other key that differs).
 
 Per-node facts — Python/Harbor/mitmproxy versions, the submodule source hash, the
 model name, and the SHA-256 of the task, cassette and each initial mount — are in
-`manifest.json` under `targets[i].info.hosts[<node>]`. Response bodies are never
+`config.json` under `targets[i].info.hosts[<node>]`. Response bodies are never
 written to the tables.
 
 ## Metrics

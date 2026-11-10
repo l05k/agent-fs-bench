@@ -11,14 +11,19 @@ size ``S``:
 - file-read:   open, read S bytes, close (S=0 is open/close only)
 - file-unlink: unlink
 
-Throughput is ``n*N / max-task phase time`` from mdtest's aggregate CSV row
-(including the end barrier); create/read with S>0 also report
-``n*N*S / time`` in MiB/s. Reads follow writes in the same launch without
-cache drops, so they may be served by the client page cache.
+| Symbol | Definition |
+| --- | --- |
+| N, n, S | `tasks`, `items_per_task`, `file_size_bytes` |
+| T_p | Aggregate phase time (maximum task time including the end barrier) |
+| X_p | `ops_per_s = n*N / T_p` (table `phases`) |
+| B_p | `mib_per_s = n*N*S / T_p / 2^20` for create/read with S > 0 (table `bandwidth`) |
+| t_{p,r} | Rank r's phase time before the end barrier (table `ranks`) |
 
-``tasks = None`` fills the selected machines at two tasks per logical CPU
-(``oversubscribe = 2``); oversubscribed points are intended. A peak curve is several runs
-with explicit ``tasks`` (for example powers of two up to 2x CPUs) pooled with
+Reads follow writes in the same launch without cache drops, so they may be served by the
+client page cache. ``warmup_repeats`` identical launches run first and are discarded, so
+every measured repeat starts from the same post-warm-up cache state. Tasks above the CPU
+count oversubscribe (round-robin per machine); a peak curve is several runs with
+different ``tasks`` (for example powers of two up to 2x CPUs) pooled with
 ``plot --vary tasks``.
 """
 
@@ -30,29 +35,28 @@ from typing import Any, Sequence
 from agent_fs_bench import cluster
 from agent_fs_bench.analysis import Figure
 from agent_fs_bench.benchmarks.mdtest import (
-    MDTEST_VERSION, BenchmarkError, check_banner, check_workload, launch, read_phases,
-    unexpected_warnings,
+    MDTEST_VERSION, binary_info, launch, read_phases, read_rank_times, validate, warm_up,
+    write_repeat,
 )
 from agent_fs_bench.results import RunContext
 
-CACHE_STATE = "write-then-read-same-launch-no-drop"
+CACHE_STATE = "after-warmup-write-then-read-same-launch-no-drop"
 COMPLETION = "fsync-per-file-after-write"
 MIB = 1024 * 1024
 
 CONFIG: dict[str, Any] = {
     "mdtest_bin": "mdtest",
-    "tasks": None,
-    "cpus_per_task": 1,
-    "oversubscribe": 2,
+    "tasks": 128,
     # One file size per run.
     "file_size_bytes": 4096,
     # None: files per task from ITEMS_PER_TASK for this size; an int overrides it.
     "items_per_task": None,
+    "warmup_repeats": 1,  # Discarded launches before the measured repeats.
     "repeats": 3,
     "layout": "private",
 }
 
-# Larger files get fewer items per task, so the 2x-CPU default stays within a few tens
+# Larger files get fewer items per task, so the default 128 tasks stay within a few tens
 # of GiB per launch (128 tasks × 256 × 1 MiB = 32 GiB).
 ITEMS_PER_TASK = {0: 8192, 4096: 8192, 65536: 2048, 1048576: 256}
 
@@ -64,41 +68,51 @@ DATA_OPERATIONS = ("file-create", "file-read")
 FIGURES = [
     Figure('phases', 'tasks', 'ops_per_s', split=('operation', 'layout', 'file_size_bytes'),
            xlabel='Tasks', ylabel='Throughput (Kops/s)', yscale=1000, logx=True),
-    Figure('phases', 'tasks', 'mib_per_s', split=('operation', 'layout', 'file_size_bytes'),
+    Figure('bandwidth', 'tasks', 'mib_per_s', split=('operation', 'layout', 'file_size_bytes'),
            xlabel='Tasks', ylabel='Bandwidth (MiB/s)', logx=True),
 ]
 
 
+def bandwidth(total_items: int, size: int, elapsed_s: float) -> float:
+    """B_p = n*N*S / T_p in MiB/s."""
+    return total_items * size / MIB / elapsed_s
+
+
+def write_bandwidth(ctx: RunContext, keys: dict[str, Any], size: int,
+                    phases: list[tuple[str, int, float, float]]) -> None:
+    for operation, ops, elapsed, _rate in phases:
+        if size and operation in DATA_OPERATIONS:
+            ctx.emit("bandwidth", {"operation": operation, **keys},
+                     {"bytes": ops * size, "elapsed_s": elapsed,
+                      "mib_per_s": bandwidth(ops, size, elapsed)})
+
+
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
-    slots = cluster.allocate(ctx.pool.nodes, args.tasks, args.cpus_per_task, args.oversubscribe)
-    tasks, size, items = len(slots), args.file_size_bytes, args.items_per_task
+    placement = cluster.place(ctx.pool.nodes, args.tasks)
+    tasks, size, items = len(placement), args.file_size_bytes, args.items_per_task
     total = items * tasks
     options = ["-a", "POSIX", "-F", "-n", str(items), "-i", "1", "-w", str(size), "-e", str(size),
                "-y"]
-    ctx.info.update(mdtest_version=MDTEST_VERSION, cache_state=CACHE_STATE, completion=COMPLETION)
+    ctx.info.update(mdtest_version=MDTEST_VERSION, cache_state=CACHE_STATE, completion=COMPLETION,
+                    **binary_info(ctx.pool.launcher, placement, args.mdtest_bin))
+    label = f"S{size}-{args.layout}-N{tasks}"
+    warm_up(ctx, placement, args.mdtest_bin, options, args.layout, "file", total, label,
+            args.warmup_repeats)
     for repeat in range(1, args.repeats + 1):
-        name = f"S{size}-{args.layout}-N{tasks}-rep{repeat}"
+        name = f"{label}-rep{repeat}"
         print(f"  {name}: {items} files/task of {size} B", flush=True)
-        stdout, text = launch(ctx, slots, args.mdtest_bin, options, args.layout, name)
-        check_banner(stdout, tasks, name)
-        check_workload(stdout, "file", tasks, total, name)
-        warnings = unexpected_warnings(stdout)
-        if warnings:
-            raise BenchmarkError(f"{name}: unexpected mdtest warnings: {'; '.join(warnings)}")
-        summary = []
-        for phase, ops, elapsed, rate in read_phases(text, "file", total):
-            operation = OPERATION_NAMES[phase]
-            mib_per_s = (ops * size / MIB / elapsed
-                         if size and operation in DATA_OPERATIONS else None)
-            ctx.emit(
-                "phases",
-                {"operation": operation, "layout": args.layout, "tasks": tasks, "repeat": repeat,
-                 "file_size_bytes": size, "items_per_task": items},
-                {"ops": ops, "elapsed_s": elapsed, "ops_per_s": rate, "mib_per_s": mib_per_s},
-            )
-            summary.append(f"{operation} {rate:.0f} ops/s"
-                           + (f" {mib_per_s:.1f} MiB/s" if mib_per_s is not None else ""))
-        print(f"  {name}: " + ", ".join(summary), flush=True)
+        stdout, text = launch(ctx, placement, args.mdtest_bin, options, args.layout, name)
+        validate(stdout, "file", tasks, total, name)
+        phases = [(OPERATION_NAMES[operation], ops, elapsed, rate)
+                  for operation, ops, elapsed, rate in read_phases(text, "file", total)]
+        ranks = {OPERATION_NAMES[operation]: times
+                 for operation, times in read_rank_times(text, "file", tasks).items()}
+        keys = {"layout": args.layout, "tasks": tasks, "repeat": repeat,
+                "file_size_bytes": size, "items_per_task": items}
+        write_repeat(ctx, keys, placement, phases, ranks)
+        write_bandwidth(ctx, keys, size, phases)
+        print(f"  {name}: " + ", ".join(f"{operation} {rate:.0f} ops/s"
+                                        for operation, _ops, _elapsed, rate in phases), flush=True)
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -112,13 +126,17 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         settings.update(items_per_task=16, repeats=1)
     args = argparse.Namespace(**settings, **vars(parsed))
     if args.items_per_task is None:
-        if args.file_size_bytes not in ITEMS_PER_TASK:
-            raise BenchmarkError(f"no default items_per_task for {args.file_size_bytes} B; "
-                                 f"set it explicitly (defaults: {ITEMS_PER_TASK})")
+        assert args.file_size_bytes in ITEMS_PER_TASK, \
+            f"default items_per_task: expected a size in {ITEMS_PER_TASK}, " \
+            f"measured {args.file_size_bytes} B; set items_per_task explicitly"
         args.items_per_task = ITEMS_PER_TASK[args.file_size_bytes]
-    if (args.repeats < 1 or args.layout not in ("private", "shared")
-            or type(args.items_per_task) is not int or args.items_per_task < 1
-            or type(args.file_size_bytes) is not int or args.file_size_bytes < 0):
-        raise BenchmarkError("layout must be private or shared, with positive repeats and "
-                             "items_per_task and a non-negative file_size_bytes")
+    assert args.repeats >= 1, f"repeats: expected >= 1, measured {args.repeats}"
+    assert args.warmup_repeats >= 1, \
+        f"warmup_repeats: expected >= 1, measured {args.warmup_repeats}"
+    assert args.layout in ("private", "shared"), \
+        f"layout: expected private or shared, measured {args.layout!r}"
+    assert type(args.items_per_task) is int and args.items_per_task >= 1, \
+        f"items_per_task: expected positive integer, measured {args.items_per_task!r}"
+    assert type(args.file_size_bytes) is int and args.file_size_bytes >= 0, \
+        f"file_size_bytes: expected non-negative integer, measured {args.file_size_bytes!r}"
     return args

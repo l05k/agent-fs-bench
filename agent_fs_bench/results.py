@@ -1,4 +1,9 @@
-"""Per-run results: manifest.json plus one flat CSV per record kind."""
+"""Per-run results: config.json (parameter snapshot) plus one flat CSV per observation kind.
+
+Every CSV row is one observation: key columns (experimental conditions) first, then
+metric columns with their unit in the name. Each table has one granularity; a metric
+that does not apply to an observation belongs in another table, never in an empty cell.
+"""
 
 import ast
 import csv
@@ -7,6 +12,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import subprocess
 from typing import Any
 
 from .targets import Target
@@ -17,9 +23,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 def source_digest() -> str:
     """Identify the Python sources and fixed inputs, including local edits.
 
-    Each module's top-level CONFIG literal is excluded: the manifest records a
-    workload's values as `config` (the launcher CONFIG of `cluster.py` only as
-    `config.launcher_sha256`), so one sweep can edit CONFIG per run (e.g. `tasks`)
+    Each module's top-level CONFIG literal is excluded: config.json records a
+    workload's values as `config` (the launcher CONFIG of `cluster.py` as
+    `config.launcher`), so one sweep can edit CONFIG per run (e.g. `tasks`)
     while any other source change still yields a new fingerprint.
     """
     digest = hashlib.sha256()
@@ -47,12 +53,14 @@ def _without_config(path: Path) -> bytes:
     return ''.join(lines).encode()
 
 
+def git_commit() -> str:
+    return subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=PROJECT_ROOT, capture_output=True,
+                          text=True, check=True).stdout.strip()
+
+
 def write_json(path: Path, value: Any) -> None:
-    """Replace the file in one step; the manifest is rewritten after every target."""
-    temporary = path.with_name(path.name + '.tmp')
-    temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False, default=str) + '\n',
-                         encoding='utf-8')
-    temporary.replace(path)
+    path.write_text(json.dumps(value, indent=2, ensure_ascii=False, default=str) + '\n',
+                    encoding='utf-8')
 
 
 def read_table(path: Path) -> list[dict[str, str]]:
@@ -76,8 +84,8 @@ class Tables:
             writer.writeheader()
             self.schemas[table] = schema
             self._files[table] = (handle, writer)
-        elif self.schemas[table] != schema:
-            raise ValueError(f'{table}: columns {schema} differ from {self.schemas[table]}')
+        assert self.schemas[table] == schema, \
+            f'{table} columns: expected {self.schemas[table]}, measured {schema}'
         handle, writer = self._files[table]
         writer.writerow({name: int(value) if isinstance(value, bool) else value
                          for name, value in {**keys, **metrics}.items()})
@@ -100,13 +108,12 @@ class RunContext:
     rows: int = 0
     pool: Any = None  # cluster.Pool of the machines this run may use
 
-    def emit(self, table: str, keys: dict[str, Any], metrics: dict[str, int | float | None]) -> None:
-        """Append one row; `target` is prepended to keys, None metrics stay empty."""
-        if not any(value is not None for value in metrics.values()) or any(
-                value is not None and (isinstance(value, bool)
-                                       or not isinstance(value, (int, float))
-                                       or not math.isfinite(value))
-                for value in metrics.values()):
-            raise ValueError(f'{table}: metrics must be finite numbers or None: {metrics}')
+    def emit(self, table: str, keys: dict[str, Any], metrics: dict[str, int | float]) -> None:
+        """Append one observation; `target` is prepended to the key columns."""
+        assert metrics, f'{table} metrics: expected at least one, measured none'
+        for name, value in metrics.items():
+            assert (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value)), \
+                f'{table}.{name}: expected a finite number, measured {value!r}'
         self.tables.write(table, {'target': self.target.name, **keys}, metrics)
         self.rows += 1

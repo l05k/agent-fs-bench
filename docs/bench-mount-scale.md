@@ -5,7 +5,7 @@ Purpose: hold per-client small-file work fixed and, at one chosen concurrency N,
 Entry point: `agent_fs_bench/benchmarks/mount_scale.py`.
 - `mount_scale_cluster.py` holds the persistent per-machine lifecycle workers.
 - `mount_scale_mdtest.py` handles native timing of the global MPI jobs.
-- Placement, machine probing and the launch wrapper come from the shared `agent_fs_bench/cluster.py` ([run modes](run-modes.md)).
+- Task placement, machine probing and the MPI launch come from the shared `agent_fs_bench/cluster.py` ([run modes](run-modes.md)).
 
 ## Experiment unit and placement
 
@@ -26,15 +26,12 @@ Each client is one single-threaded mdtest task. K is the **total number of direc
 
 `CONFIG['tasks']`:
 
-- `None` (default): N is every available logical CPU of the selected machines, one client each.
-- Positive integer: measure only that N. Machines fill in order, and only machines that receive clients start a lifecycle worker. N above the probed total capacity is an error; the run never oversubscribes or shrinks the experiment.
-- "Available logical CPU" comes from each machine's `os.sched_getaffinity(0)`, not physical core count. Real CPU IDs are kept and assigned in ascending order. Before exec, the cluster wrapper pins each task to one CPU and verifies the actual hostname, global rank and affinity; any mismatch with the plan fails the run.
+- A positive integer N (default 64), one single-threaded client per task. Clients are dealt round-robin over the selected machines (each gets `N // M`, the first `N % M` one more). N above a machine's CPU count oversubscribes it, e.g. 1024 clients on one 64-CPU machine time-share its CPUs; the kernel schedules them. Only machines that receive clients start a lifecycle worker.
+- The CPU count is each machine's `os.sched_getaffinity(0)`, not physical core count. The appfile gives every rank its machine (`-np 1 --host <machine>`), so placement is fixed by the line number; `sample` is the client identity.
 
-Default full-core placement is one task per available logical CPU; it does not guarantee 100% CPU utilization, because filesystem waits can leave a CPU idle. No core is reserved for the controller: Python, MPI, the kernel and filesystem daemons still share CPUs with tasks. Formal experiments should fix cpuset, SMT, NUMA, machine model and background load.
+A machine's CPUs are not dedicated: filesystem waits leave them idle, and Python, MPI, the kernel and filesystem daemons share them with clients. Formal experiments should fix cpuset, SMT, NUMA, machine model and background load.
 
-For example, take 64 available logical CPUs on the controller and 64 on each of two listed machines.
-- `overflow` mode: the default N is 192. An explicit `tasks = 100` allocates controller=64 and first machine=36; the second machine does not participate.
-- `remote` mode: the same request allocates 64 on the first machine and 36 on the second.
+For example, `tasks = 100` in `overflow` mode with the controller and two listed machines allocates 34 tasks to the controller and 33 to each listed machine. In `remote` mode the same request allocates 50 on each listed machine.
 
 To draw a scaling curve, choose N explicitly in separate runs and pool them with `plot --vary tasks`; this implementation does not decide paper sweep points.
 
@@ -45,7 +42,7 @@ Every participating machine needs:
 - this repository's checkout with `uv sync --locked`, at the same path by default;
 - the **same mdtest binary and Open MPI 4.1.x version on the same architecture**.
 
-The controller also needs the Arial font. `run` renders the default figures after the last measurement, so a missing font fails the run only after the CSV tables are written (re-plot them elsewhere with `plot`). mdtest must link this Open MPI; other MPI implementations are not supported. The benchmark does not install tools or use sudo. Machine setup, the inventory, launcher settings and placement proofs: [run modes](run-modes.md).
+The controller also needs the Arial font for `plot`; a missing font fails only figure rendering, not a run. mdtest must link this Open MPI; other MPI implementations are not supported. The benchmark does not install tools or use sudo. Machine setup, the inventory and launcher settings: [run modes](run-modes.md).
 
 Build upstream IOR as follows:
 
@@ -70,7 +67,7 @@ Experiment parameters live in `CONFIG` at the top of `mount_scale.py`; there are
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `tasks` | `None` | Single N; default is every available logical CPU of the `--mode` machines |
+| `tasks` | `64` | Single N per run, one client per task |
 | `profiles` | `local/mounts.toml` | Target mount profile, read on the controller |
 | `directories` | `3` | K, including the private workspace; may be 1 |
 | `files` | `1000` | File operations per client per directory |
@@ -118,28 +115,23 @@ uv run python -m agent_fs_bench run mount-scale --mode local \
   --dirs /tmp/mdtest-directory-smoke -- --directory-smoke
 ```
 
-`--directory-smoke` keeps its ordinary data inside the staging work directory, so it runs on one machine only: its two tasks must fit on the first machine of the mode. If that machine has fewer than two available logical CPUs, the tasks would span machines or exceed capacity, and the run fails before starting workers/MPI; it never shrinks to N=1. This checks `sched_getaffinity`, not a container CPU-time quota.
+`--directory-smoke` keeps its ordinary data inside the staging work directory, so it runs on one machine only: use `--mode local` (or a mode with one machine). Its two tasks are dealt round-robin, so a mode with two or more machines spans them and the run fails before starting workers/MPI. Two tasks on a one-CPU machine share that CPU.
 
 ## Execution and timing boundaries
 
-1. Allocate N one-CPU tasks over the selected machines from the cluster probe (affinity CPU IDs, hostname, kernel, architecture, Python, Open MPI library, source fingerprint), and start one persistent lifecycle worker on each participating machine (over SSH for listed machines).
+1. Allocate N tasks over the selected machines from the cluster probe (CPU count, hostname, kernel, architecture, Python, Open MPI library, source fingerprint), and start one persistent lifecycle worker on each participating machine (over SSH for listed machines).
 2. The first machine's worker creates the run's data root, owner sentinel and shared resources; one mdtest task on the first slot creates each shared fixture in that machine's admin view. In each repeat, every machine creates its own private workspace, sentinels and mountpoints, then samples baseline; this preparation is outside mount command timing.
 3. The controller tells all workers to mount concurrently. Each machine starts its local clients concurrently, and each client runs its mount commands in order: private first, then each shared resource for multi-mount. Each machine verifies that new mount entries exactly match the plan and that sentinel aliases are correct. Mounted-idle is sampled before shared warm-up.
 4. For each shared resource, start one **global MPI job** that stats and reads it; discard that round's performance values.
 5. Start per-machine resource sampling, then start the global private mdtest job `create → stat → read → remove`; then run one job per shared resource for `stat → read`. All tasks use mdtest's own phase barriers in one `MPI_COMM_WORLD`; throughput is not measured per machine and summed. Private/shared and each shared resource remain separate phases, not an interleaved mixed workload.
-6. Each task is explicitly assigned a machine and CPU through the Open MPI appfile. The cluster wrapper:
-   - verifies the global rank, actual hostname and single-CPU affinity;
-   - requires the task's client aliases to exist on its own machine;
-   - reports the binary's SHA-256, then execs upstream mdtest.
-
-   The controller checks that the measured affinity is exactly the requested single CPU and that every task ran the same binary. The private `test-dir.0-0` is created if absent on its machine before the launch, outside timing. Global rank 0 writes the native CSV on its own machine; the wrapper returns it through the launcher output, so no machine needs a shared result disk.
+6. Each task is one appfile line with its machine and mdtest argv, so the rank is the line number. Before the private job, the controller creates the private `test-dir.0-0` in each client workspace over SSH; after the job it fetches rank 0's CSV from rank 0's machine and removes it there. The controller also requires each task's client aliases to exist on its own machine and checks that every machine resolves the binary to one SHA-256. Global rank 0 writes the native CSV on its own machine, so no machine needs a shared result disk.
 7. Stop resource sampling, unmount concurrently in reverse order on each machine, verify no residue, and sample released-idle. On success, emit the whole repeat's results and delete the unmounted private data and the empty repeat directory. After all repeats succeed, collect lifecycle logs; then the first machine's worker deletes this run's shared fixture.
 
-Protocol: warm shared data, no cache drop; prereading does not guarantee later cache residency. Private reads follow this round's create with no fsync/sync, so they do not prove durable-write latency. The mdtest wrapper, loop and barriers are inside upstream phase timing; the Python wrapper, MPI startup, worker startup, fixture, warm-up and result output are outside it.
+Protocol: warm shared data, no cache drop; prereading does not guarantee later cache residency. Private reads follow this round's create with no fsync/sync, so they do not prove durable-write latency. mdtest's loop and barriers are inside upstream phase timing; the controller, MPI startup, worker startup, fixture, warm-up and result output are outside it.
 
 `--warningAsErrors` is enabled. Any of the following fails the run, and the repeat emits no successful throughput:
 - operation errors;
-- wrong task counts or actual placement;
+- wrong task counts;
 - a version or binary mismatch;
 - missing or nonfinite timings.
 
@@ -147,25 +139,29 @@ A failure stops the run and leaves mounts and data in place for inspection: no a
 
 ## Results and interpretation
 
-Each run writes `results/mount-scale/<run-id>/manifest.json` (run configuration, mode, machine facts and per-target discovered facts) plus one flat CSV per record kind. `run` also writes `summary/<table>.csv` for every table with a `repeat` or `sample` column and renders the default figures into `figures/`.
+Each run writes `results/mount-scale/<run-id>/config.json` (run configuration, mode, machine facts and per-target discovered facts) plus one flat CSV per observation kind. Figures come only from `plot`.
 
 | Table | Key columns | Metric columns |
 | --- | --- | --- |
-| `phases` | target, topology, tasks, phase, repeat | ops, elapsed_s, ops_per_s, ops_per_s_per_task, rank_mean_us_per_op, bytes, mib_per_s |
-| `ranks` | target, topology, tasks, phase, repeat, sample, host, cpu | elapsed_s |
-| `mounts` | target, topology, tasks, action, repeat | controller_dispatch_elapsed_s, measured_mounts, remaining_mounts |
-| `lifecycle` | target, topology, tasks, host, action, repeat | elapsed_s, measured_mounts, remaining_mounts |
+| `phases` | target, topology, tasks, phase, repeat | ops, elapsed_s, ops_per_s, ops_per_s_per_task, rank_mean_us_per_op |
+| `bandwidth` | target, topology, tasks, phase, repeat | bytes, elapsed_s, mib_per_s |
+| `ranks` | target, topology, tasks, phase, repeat, sample, host | elapsed_s |
+| `dispatch` | target, topology, tasks, action, repeat | controller_dispatch_elapsed_s |
+| `host_mounts` | target, topology, tasks, host, repeat | elapsed_s, measured_mounts |
+| `host_unmounts` | target, topology, tasks, host, repeat | elapsed_s, remaining_mounts |
 | `agents` | target, topology, tasks, host, action, repeat, sample | elapsed_s |
-| `resources` | target, topology, tasks, host, state, repeat | levels, interval, deltas and peaks (below) |
+| `resource_levels` | target, topology, tasks, host, state, repeat | raw levels and sampling interval (below) |
+| `resource_deltas` | target, topology, tasks, host, state, repeat | used_bytes_delta, slab_bytes_delta, slab_unreclaimable_bytes_delta, mount_entries_delta |
+| `resource_workload` | target, topology, tasks, host, repeat | sampling interval, peak_* and peak_*_delta |
 
 Column values:
-- `phase`: `private/create`, `private/stat`, `private/read`, `private/remove`, or `shared-<n>/stat`/`shared-<n>/read`.
+- `phase`: `private/create`, `private/stat`, `private/read`, `private/remove`, or `shared-<n>/stat`/`shared-<n>/read`. `bandwidth` holds the create and read phases only.
 - `action`: `mount` or `unmount`.
-- `state`: `baseline`, `mounted-idle`, `released-idle` or `workload`.
-- In `ranks`, `sample` is the global mdtest rank index and `host`/`cpu` are that task's logical machine and pinned CPU.
+- `state`: in `resource_levels`, `baseline`, `mounted-idle` or `released-idle`; `resource_deltas` holds the last two.
+- In `ranks`, `sample` is the global mdtest rank index and `host` is that task's machine.
 - In `agents`, `sample` is the client index on that machine.
 
-Metric cells that do not apply to a row stay empty: for example `remaining_mounts` on a mount row, `bytes` on a stat phase, deltas on the baseline, and peaks on a non-workload state. `summary/phases.csv` therefore has one row per target × topology × tasks × phase with `n` and each metric's median; `summary/resources.csv` has one row per target × topology × tasks × host × state.
+Every metric cell is a finite number; a metric that does not apply to an observation is carried by another table. For example `remaining_mounts` appears only in `host_unmounts`, `bytes` and `mib_per_s` only in `bandwidth`, deltas only in `resource_deltas`, and peaks only in `resource_workload`.
 
 | Metric | Definition |
 | --- | --- |
@@ -174,41 +170,40 @@ Metric cells that do not apply to a row stay empty: for example `remaining_mount
 | `phases.ops_per_s` | N×files / elapsed_s; per-machine rates are never summed |
 | `phases.ops_per_s_per_task` | Aggregate throughput / N; not an independent per-client sample |
 | `phases.rank_mean_us_per_op` | sum(task times)/(N×files)×1e6; phase mean, not per-operation latency/p99 |
-| `phases.bytes`, `phases.mib_per_s` | Logical create/read bytes; shared data is read N times, not physical network/disk bytes |
+| `bandwidth.bytes`, `bandwidth.mib_per_s` | Logical create/read bytes; shared data is read N times, not physical network/disk bytes |
 | `ranks.elapsed_s` | One task's time before the phase-end barrier |
-| `lifecycle.elapsed_s` | Wall time of all client lifecycle commands on that machine; excludes alias/mountinfo verification |
+| `host_mounts.elapsed_s`, `host_unmounts.elapsed_s` | Wall time of all client mount or unmount commands on that machine; excludes alias/mountinfo verification |
 | `agents.elapsed_s` | One client's mount or unmount command sequence on that machine |
-| `mounts.controller_dispatch_elapsed_s` | From notifying all workers to receiving all replies, **including the control channel, scheduling and mount verification**; not pure mount time and not a sum of per-machine times |
-| `measured_mounts`, `remaining_mounts` | New/residual entries after per-machine verification; global rows are sums, not inferred connection or daemon counts |
+| `dispatch.controller_dispatch_elapsed_s` | From notifying all workers to receiving all replies, **including the control channel, scheduling and mount verification**; not pure mount time and not a sum of per-machine times |
+| `host_mounts.measured_mounts`, `host_unmounts.remaining_mounts` | New/residual entries after per-machine verification; global rows are sums, not inferred connection or daemon counts |
 
 `scaling_efficiency` is not emitted: a single-point run has no same-round N=1 baseline. If a paper needs efficiency, choose a comparable baseline in separate runs; the harness does not add experiment points implicitly.
 
-`manifest.json` stores the parsed configuration and `mode` once, the launcher version, and each machine's probed facts (`nodes`: hostname, kernel, architecture, Python, mpi4py, Open MPI library, CPU affinity list). `targets[i].info` stores:
-- `hosts`: the CPUs assigned to each participating machine;
-- the mdtest SHA-256 and version;
+`config.json` stores the parsed configuration and `mode` once, the launcher's Open MPI version (`mpi_version`), and each machine's probed facts (`nodes`: name, hostname, cpu_model, cpu_count, system, kernel, machine, Python, mpi4py, mpi_library). `targets[i].info` stores:
+- the mdtest SHA-256 and version (`mdtest`);
 - the mount profile SHA-256;
-- `placement`: the verified placement proof per run case (`N<tasks>-R<repeat>`) and mdtest job, with each task's index, logical machine, hostname and CPUs.
+- `placement`: the task count per machine, e.g. `{"local": 34, "node-a": 33}`.
 
-`ranks` carries each task's planned machine and CPU for every phase; the wrapper's proof fails the run on any machine/CPU mismatch. SSH credentials and mount credentials are not written; archive inventory/profile privately. mdtest stdout/stderr, appfiles and the wrapper's placement lines remain as diagnostic attachments; the appfiles hold each machine's Open MPI address, checkout path and Python path, so remove or redact them before publishing.
+`ranks` carries each task's machine for every phase. SSH credentials and mount credentials are not written; archive inventory/profile privately. mdtest stdout/stderr and appfiles remain as diagnostic attachments; the appfiles hold each machine's Open MPI address and working directory, so remove or redact them before publishing.
 
-Default figures are rendered when their table has rows, so the directory smoke, which mounts nothing, skips `mount-dispatch`. Re-render them with `uv run python -m agent_fs_bench plot <run-dir>...`.
+`plot` writes the default figures; a figure whose table has no rows is skipped, so the directory smoke, which mounts nothing, has no `mount-dispatch` figure. Render them with `uv run python -m agent_fs_bench plot <run-dir>...`.
 
 | Figure stem | Table | x | y | Split |
 | --- | --- | --- | --- | --- |
 | `throughput-<topology>-<phase>` | `phases` | tasks | ops_per_s | topology, phase |
-| `mount-dispatch-<topology>-<action>` | `mounts` | tasks | controller_dispatch_elapsed_s | topology, action |
-| `memory-delta-<topology>` | `resources` | tasks | used_bytes_delta for `mounted-idle` | topology |
+| `mount-dispatch-<topology>-<action>` | `dispatch` | tasks | controller_dispatch_elapsed_s | topology, action |
+| `memory-delta-<topology>` | `resource_deltas` | tasks | used_bytes_delta for `mounted-idle` | topology |
 
 Each run measures one N, so its default figures hold one x point. Pool runs of different N into scaling curves with `uv run python -m agent_fs_bench plot <run-N1> <run-N2>... --vary tasks`. All other configuration, the mode and the source fingerprint must match; the fingerprint ignores each module's `CONFIG` literal, so editing `CONFIG['tasks']` between runs is fine. Line figures draw the median and IQR of all matching rows at each x.
 
-Resources come from **whole-machine counters on each machine**: CPU busy, MemTotal−MemAvailable, cache, dirty, slab, etc. The columns per `state`:
+Resources come from **whole-machine counters on each machine**: CPU busy, MemTotal−MemAvailable, cache, dirty, slab, etc. The columns per table:
 
 | Rows | Columns |
 | --- | --- |
-| `baseline`, `mounted-idle`, `released-idle` | Raw levels: `used_bytes`, `cached_bytes`, `dirty_bytes`, `slab_bytes`, `slab_reclaimable_bytes`, `slab_unreclaimable_bytes`, `mount_entries` |
-| Every row | Sampling interval: `sample_elapsed_s`, `cpu_busy_s`, `cpu_busy_cores`, `cpu_busy_percent` |
-| `mounted-idle`, `released-idle` | Also `used_bytes_delta`, `slab_bytes_delta`, `slab_unreclaimable_bytes_delta` and `mount_entries_delta` against `baseline` |
-| `workload` | No raw levels; observed `peak_*` levels and `peak_*_delta` |
+| `resource_levels`: `baseline`, `mounted-idle`, `released-idle` | Raw levels: `used_bytes`, `cached_bytes`, `dirty_bytes`, `slab_bytes`, `slab_reclaimable_bytes`, `slab_unreclaimable_bytes`, `mount_entries` |
+| `resource_levels`, `resource_workload` | Sampling interval: `sample_elapsed_s`, `cpu_busy_s`, `cpu_busy_cores`, `cpu_busy_percent` |
+| `resource_deltas`: `mounted-idle`, `released-idle` | `used_bytes_delta`, `slab_bytes_delta`, `slab_unreclaimable_bytes_delta` and `mount_entries_delta` against `baseline` |
+| `resource_workload` | No raw levels; observed `peak_*` levels and `peak_*_delta` |
 
 Counters include Python, MPI, daemons, the kernel and other processes; there is no filesystem CPU/RSS attribution. Sampling windows include MPI startup/shutdown and phase gaps, and control timing differs across machines; do not add per-machine peaks and call it a simultaneous global peak. Mount entries belong to the worker's current namespace, so a daemon must create mounts in that namespace.
 
@@ -230,8 +225,8 @@ mdtest was built from the official IOR 4.0.0 release.
 
 | Scenario | Observed result |
 | --- | --- |
-| colima `--mode local`, `--directory-smoke`, N=2, K=3, 32 files | 28 rows: 8 `phases`, 16 `ranks`, 4 `resources`; summaries; the 9 default figures render from these tables |
-| Lab servers `--mode remote`, `--directory-smoke`, N=2 | Controller hosts no client; one lifecycle worker over SSH and the mdtest jobs ran on the second server; 28 rows, task 0's CSV returned through the launcher output |
+| colima `--mode local`, `--directory-smoke`, N=2, K=3, 32 files | The smoke writes `phases`, `ranks`, `bandwidth`, `resource_levels`, `resource_deltas` and `resource_workload` rows; the applicable default figures render from these tables |
+| Lab servers `--mode remote`, `--directory-smoke`, N=2 | Controller hosts no client; one lifecycle worker over SSH and the mdtest jobs ran on the second server; task 0's CSV fetched from its machine |
 
 Directory smokes **only validate the harness/lifecycle**, not independent NAS clients or storage performance; these results are not paper data. Real NFS or LakeBase profiles, a cross-machine admin view and thousand-client experiments have not been run with this implementation; do not claim they passed performance or capacity validation.
 

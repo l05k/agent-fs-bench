@@ -30,12 +30,12 @@ experiment dimension is one value per run too — one manager, one fixture — a
 that one configuration. A curve over `tasks` comes from several runs pooled when plotting, e.g.
 `plot results/npm-install/<run-a> results/npm-install/<run-b> --vary tasks`.
 
-The controller allocates `tasks` slots across the machines of the mode and launches **one** global
-Open MPI job: one task process per slot, each pinned to its machine and CPU set. Every machine
-needs the same checkout with its own `uv sync --locked` environment, a working Open MPI 4.1 and
-`mpi4py`, the selected package manager, `node`, and a `prep_dir` on a local filesystem. Seeding is
-online, so **every machine that hosts a task needs registry access** during the untimed preparation
-step.
+The controller deals `tasks` over the machines of the mode and launches **one** global
+Open MPI job: one task process per slot; the kernel schedules each machine's tasks over
+its CPUs. Every machine needs the same checkout with its own `uv sync --locked` environment, a
+working Open MPI 4.1 and `mpi4py`, the selected package manager, `node`, and a `prep_dir` on a
+local filesystem. Seeding is online, so **every machine that hosts a task needs registry access**
+during the untimed preparation step.
 
 The public workload CLI has no flags: run with the common `--mode`/`--dirs`/`--target` selection and
 edit this mapping in `agent_fs_bench/benchmarks/npm_install.py`.
@@ -46,8 +46,6 @@ edit this mapping in `agent_fs_bench/benchmarks/npm_install.py`.
 | `pm` | `"npm"` | One manager per run: `npm` or `pnpm`. |
 | `repeats` | `10` | Independent barrier-aligned batches of the same configuration. |
 | `tasks` | `1` | Simultaneous independent installs, placed by the controller. |
-| `cpus_per_task` | `4` | Logical CPUs pinned per install; keep it equal to `concurrency`. |
-| `oversubscribe` | `1` | Tasks allowed per CPU group, i.e. per `cpus_per_task` CPUs. |
 | `concurrency` | `4` | Internal pool width per install; `0` keeps tool defaults. |
 | `prep_dir` | `"/dev/shm"` | External local filesystem for sources and copies, on every machine. |
 | `npm_bin` / `pnpm_bin` | `"npm"` / `"pnpm"` | Executables resolved on each machine's `PATH`. |
@@ -62,9 +60,8 @@ the runtime. `CONFIG` is experiment setup — changing it changes the measured p
 preparation semantics — so keep it fixed across compared filesystems. Preparation is always
 external and local, with no same-filesystem mode and no automatic fallback.
 
-`tasks` must fit the pool: capacity is summed per machine, `floor(CPUs / cpus_per_task) ×
-oversubscribe`, over the machines the mode offers; a request above capacity is an error,
-never a smaller run. Two 6-CPU machines at `cpus_per_task = 4` hold two tasks, not three.
+`tasks` are dealt round-robin over the machines the mode offers (see
+[run modes](run-modes.md)); tasks above a machine's CPU count time-share its CPUs.
 A `repeats = 1`, `tasks = 1` run in `--mode local` is a minimal real smoke; it still needs
 registry access during seeding and a valid preparation filesystem.
 
@@ -79,7 +76,7 @@ root is per machine.
 | `agent_fs_bench/benchmarks/npm_install.py` | stdlib workload module, `CONFIG`, `run` and `task`; `data/pnpm-bench/` holds the fixture inputs |
 | `<target>/agent-fs-bench/npm-install/<run-id>/<node>/task-NNNN/repeat-NNNN/` | one task's project for one repeat, on its own machine |
 | `<prep-dir>/agent-fs-bench/npm-install/<run-id>/<target>/<node>/` | that machine's `source/`, `template/`, `seeds/` and `repeats/repeat-NNNN/task-NNNN/{source,home,tmp,xdg,config,data}` |
-| `results/npm-install/<run-id>/{manifest.json,batches.csv,installs.csv}` | run manifest, batch rows and per-install samples |
+| `results/npm-install/<run-id>/{config.json,batches.csv,installs.csv}` | run config snapshot, batch rows and per-install samples |
 | `results/npm-install/<run-id>/<target>/hosts/<node>/` | that machine's diagnostics: per-repeat install logs and the seed log |
 | `results/npm-install/<run-id>/<target>/tasks.stderr.txt` | the MPI job's stderr, including every task's child output |
 
@@ -116,7 +113,7 @@ local disk filesystem. During a repeat each machine's preparation filesystem hol
 plus one copy per task on that machine, and each task's `HOME`/`TMPDIR` — check free space before a
 large `tasks`, and expect concurrent runs on one root to compete for its space and I/O. The rule is
 evaluated per machine, so a pool whose machines mount different preparation filesystems is accepted;
-the manifest records each machine's `prep_fstype` and `target_fstype`.
+`config.json` records each machine's `prep_fstype` and `target_fstype`.
 
 Placement takes `Path` objects and resolves each filesystem type from Linux `/proc/self/mountinfo`
 by the longest matching mount point. `tests/test_npm_install.py` passes real temporary directories,
@@ -127,24 +124,20 @@ so the device comparison runs against real `st_dev` values; the type lookup itse
 | Knob | Default | Meaning |
 | --- | --- | --- |
 | `tasks` | `1` | External concurrency: installs released together, one sample each. |
-| `cpus_per_task` | `4` | CPUs pinned to each task process. |
-| `oversubscribe` | `1` | Tasks per CPU group. |
-| `concurrency` | `4` | Pool width pinned inside each install; `0` keeps tool defaults. |
+| `concurrency` | `4` | Pool width inside each install; `0` keeps tool defaults. |
 
-`tasks` is the experiment axis, and it is one value per run. The controller fills machines in order
-and uses every CPU group of a machine once before reusing one, so `tasks = 4` with
-`cpus_per_task = 4` needs 16 logical CPUs; `oversubscribe = 2` accepts two tasks per group on a
-machine that is short of CPUs, at the cost of two installs sharing a pinned set.
+`tasks` is the experiment axis, and it is one value per run. Machines get `N // M` tasks, and
+the first `N % M` one more; a machine with fewer CPUs than its tasks time-shares them.
 
-Keep `cpus_per_task` equal to `concurrency`. The pin only helps if the pool it names has the CPUs
-to run on: with a wider pool than the task's CPU set the extra workers time-share the same CPUs,
-and with a narrower pool the pinned CPUs idle. `cpus_per_task` is enforced by the launcher's
-affinity mask, `concurrency` by the environment; nothing reconciles them automatically.
+`concurrency` is the only width control. It sets the pool each manager uses for filesystem
+work: with more threads than the machine has CPUs they time-share, and with fewer, CPUs
+idle. It is set through the environment; nothing ties it to the task count.
 
-The pin reaches the pool each manager uses for filesystem work: npm gets `UV_THREADPOOL_SIZE`, pnpm
-gets `RAYON_NUM_THREADS`. pnpm 12 is a Rust binary, and its link phase runs on the global Rayon pool
-on Linux, so `RAYON_NUM_THREADS` sets the number of workers materializing package files. It is not a
-manager-wide limit, and its effect is not comparable across managers: npm has no install-wide limit —
+`concurrency` reaches the pool each manager uses for filesystem work: npm gets
+`UV_THREADPOOL_SIZE`, pnpm gets `RAYON_NUM_THREADS`. pnpm 12 is a Rust binary, and its link
+phase runs on the global Rayon pool on Linux, so `RAYON_NUM_THREADS` sets the number of workers
+materializing package files. It is not a manager-wide limit, and its effect is not comparable
+across managers: npm has no install-wide limit —
 Arborist fans packages out to pacote — and its libuv pool is shared with work such as zlib. pnpm's
 documented `child-concurrency`, `network-concurrency` and `workspace-concurrency` are not used here:
 they bound lifecycle scripts, registry requests and workspace tasks, while the timed install is
@@ -157,7 +150,7 @@ they bound lifecycle scripts, registry requests and workspace tasks, while the t
    machine's `source/` (npm cache; pnpm store plus XDG cache) from the committed inputs. The seed
    verifies the lockfile is unchanged, copies manifest plus lockfile into `template/`, and the leader
    records `target_fstype`, `prep_fstype`, `tool_versions` and `seed_input_sha256` as
-   this node's manifest facts. Nothing touches the target. With `seed_only` every task stops here
+   this node's `config.json` facts. Nothing touches the target. With `seed_only` every task stops here
    and the sources stay on their machines.
 2. **Per-repeat preparation (untimed).** Per task: copy the machine's whole source into
    `repeats/repeat-NNNN/task-NNNN/source`, create the project from the template under the task's own
@@ -198,9 +191,8 @@ the node leader's `os.sync()`. Step 2 keeps its project-placement check but drop
 does not exist, and nothing in the benchmark forces the tree to stable storage. The check that a
 project lies inside the measured target is not a sync and stays unconditional.
 
-`batches.csv` carries only `install_mean_s`, `batch_install_s`, `installs_per_s`, `user_s`, `sys_s`
-and the tree inventory; `flush_*`, `durable_*` and `durable_installs_per_s` are absent, and
-`installs.csv` has no `flush_s` or `durable_s`. The manifest `config` records `flush` (`true` for
+`batches.csv` keeps `wall_s` and `installs_per_s`; `installs.csv` has no `flush_s` or `durable_s`.
+`config.json`'s `config` records `flush` (`true` for
 `npm-install`, `false` here), and results live under `results/npm-install-nofsync/`. `install_s`
 still covers the whole command, including whatever the tool itself syncs; it ends at process exit,
 so it describes page-cache completion, not durability. Without the leader's `os.sync()`, writeback
@@ -217,38 +209,34 @@ the tree occupies, not how much was written. npm always unpacks from its cache i
 
 ## Tables
 
-Two flat CSV tables per run; `run` also writes `summary/batches.csv` and `summary/installs.csv` with
-n and the median of each metric per target × manager × `tasks` (both `repeat` and `sample` are
-pooled).
+Two flat CSV tables per run, one per granularity. Nothing is aggregated in the run: means,
+medians or sums over a batch's installs come from the `installs` rows in analysis.
 
 | Table | Key columns | Metric columns |
 | --- | --- | --- |
-| `batches` | `target`, `manager`, `tasks`, `repeat` | `install_mean_s`, `flush_mean_s`, `durable_mean_s`, `batch_install_s`, `batch_durable_s`, `installs_per_s`, `durable_installs_per_s`, `user_s`, `sys_s`, `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` |
-| `installs` | `target`, `manager`, `tasks`, `repeat`, `sample`, `host` | `install_s`, `flush_s`, `durable_s`, `user_s`, `sys_s` |
+| `batches` | `target`, `manager`, `tasks`, `repeat` | `wall_s`, `installs_per_s` |
+| `installs` | `target`, `manager`, `tasks`, `repeat`, `sample`, `host` | `install_s`, `flush_s`, `durable_s`, `user_s`, `sys_s`, `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` |
 
 `repeat` is the 1-based batch index, `sample` the task index within the job and `host` the machine's
-node name (`local` for the controller), so every task's raw, unrounded sample is one `installs` row.
-`npm-install-nofsync` emits the same tables without the flush and durable columns (`flush_mean_s`,
-`durable_mean_s`, `batch_durable_s`, `durable_installs_per_s`, `flush_s`, `durable_s`).
+node name (`local` for the controller), so every task's raw sample is one `installs` row.
+`npm-install-nofsync` emits the same tables without `flush_s` and `durable_s`.
 
 | Metric | Meaning |
 | --- | --- |
-| `install_mean_s`, `flush_mean_s`, `durable_mean_s` | Mean `install_s`, `flush_s`, `durable_s` over the batch's tasks. |
-| `batch_install_s` | Slowest task's own `install_s`. Cross-machine start offsets are not observable, so this is the slowest single install rather than a wall clock from release, and it excludes release skew. |
-| `batch_durable_s` | The batch's barrier-to-barrier wall time: from the release barrier to the barrier after every task's flush, so it includes release skew and every task's flush. Only with `flush`. |
-| `installs_per_s` / `durable_installs_per_s` | `tasks / batch_install_s` / `tasks / batch_durable_s`. |
-| `user_s`, `sys_s` | Summed child CPU time, from each task's own `RUSAGE_CHILDREN` delta. |
-| `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` | Summed tree inventory over the batch's tasks. |
+| `wall_s` | The batch's barrier-to-barrier wall time: from the release barrier to the barrier after every task's install (and flush, with `flush`), so it includes release skew. |
+| `installs_per_s` | `tasks / wall_s`; durable throughput with `flush`. |
+| `install_s`, `flush_s`, `durable_s` | That install's command time, project fsync time, and their sum. |
+| `user_s`, `sys_s` | That install's child CPU time (`RUSAGE_CHILDREN` delta). |
+| `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` | That install's `node_modules` inventory. |
 
-Means describe one install, batch times describe the batch, and throughput is a batch quantity,
-never a per-install latency. Clocks are never compared across machines: every duration is measured
-inside the task that produced it, and the only cross-task time is the barrier wall that the
-launcher's own barriers delimit.
+Install rows describe one install; batch rows describe the batch. Clocks are never compared across
+machines: every duration is measured inside the task that produced it, and the only cross-task time
+is the barrier wall that the launcher's own barriers delimit.
 
-Discovered facts live in `manifest.json`: `targets[].info.hosts[<node>]` holds that machine's
+Discovered facts live in `config.json`: `targets[].info.hosts[<node>]` holds that machine's
 `target_fstype`, `prep_fstype`, `tool_versions` and `seed_input_sha256` of the committed
 template inputs; `targets[].path` holds the target directory, `run_id` the run, and `config` the run
-settings (`fixture`, `pm`, `repeats`, `tasks`, `cpus_per_task`, `oversubscribe`, `concurrency`,
+settings (`fixture`, `pm`, `repeats`, `tasks`, `concurrency`,
 `prep_dir`, `ignore_scripts`, `flush`, `keep_node_modules`, `seed_only`, executable names, version
 pins). Device IDs and resolved executable paths are not stored. `plot` pools repeated runs only when
 their configs and source fingerprints match; a non-zero exit, missing tree, walk or fsync failure,
@@ -256,16 +244,16 @@ or failed `du` aborts the whole job and emits no row for that repeat.
 
 ## Figures
 
-`run` renders the default figures into `results/npm-install/<run-id>/figures/`, one file per
-manager; `python -m agent_fs_bench plot <run-dir>...` re-renders them.
+`plot` writes the default figures into `results/npm-install/<run-id>/figures/`, one file per
+manager.
 
 | Figure | Table | X | Y |
 | --- | --- | --- | --- |
-| `batches-install_mean_s-<manager>` | `batches` | `tasks` | `install_mean_s` |
-| `batches-durable_mean_s-<manager>` | `batches` | `tasks` | `durable_mean_s` |
+| `installs-install_s-<manager>` | `installs` | `tasks` | `install_s` |
+| `installs-durable_s-<manager>` | `installs` | `tasks` | `durable_s` |
 
-Each point is the median over repeats with IQR error bars, the x axis is logarithmic, and the series
-is the target, so several targets of one run share a figure. `npm-install-nofsync` renders only the
+Each point is the median over all install rows with IQR error bars, the x axis is logarithmic, and the series
+is the target, so several targets of one run share a figure. `npm-install-nofsync` has only the
 install-time figure. Because `tasks` is one value per run, a curve needs runs pooled with
 `--vary tasks`, and a run holds only one `tasks` value. Latency and throughput stay in separate
 figures because one is per install and the other per batch. A one-off figure comes from the same
@@ -278,5 +266,5 @@ and never invents data to fill one.
 The timed install reads the preparation filesystem every run, so keep it local and quiet on every
 machine. `install_s` includes process startup, so increase `repeats` rather than shrinking the
 workload. The benchmark root stays on the target; delete it yourself. Changing the timed command,
-flush protocol, CPU pin or isolation changes `source_sha256`; select one source identity rather than
+flush protocol or isolation changes `source_sha256`; select one source identity rather than
 pooling old and new measurements.

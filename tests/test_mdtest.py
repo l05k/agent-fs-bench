@@ -3,10 +3,10 @@ from unittest import mock
 
 from agent_fs_bench.benchmarks import mdtest, mdtest_peak
 from agent_fs_bench.benchmarks.mdtest import (
-    BenchmarkError,
     check_banner,
     check_workload,
     read_phases,
+    read_rank_times,
     unexpected_warnings,
 )
 
@@ -55,17 +55,23 @@ class CsvTests(unittest.TestCase):
         ])
 
     def test_missing_aggregate_row_is_rejected(self):
-        with self.assertRaisesRegex(BenchmarkError, "aggregate 'all' row"):
+        with self.assertRaisesRegex(AssertionError, "aggregate 'all' rows"):
             read_phases(self.csv({}, drop_aggregate=True), 'file', 128)
 
     def test_non_finite_or_non_positive_phase_time_is_rejected(self):
         for value in ('inf', 'nan', '0', '-1'):
-            with self.subTest(elapsed=value), self.assertRaises(BenchmarkError):
+            with self.subTest(elapsed=value), self.assertRaises(AssertionError):
                 read_phases(self.csv({'File read': ('256', value)}), 'file', 128)
 
     def test_phase_that_did_not_run_is_rejected(self):
-        with self.assertRaisesRegex(BenchmarkError, 'File stat phase did not run'):
+        with self.assertRaisesRegex(AssertionError, 'File stat time: expected a phase time'):
             read_phases(self.csv({'File stat': ('', '')}), 'file', 128)
+
+    def test_rank_times_follow_rank_order_and_skip_the_aggregate(self):
+        ranks = read_rank_times(self.csv({}), 'file', 2)
+        self.assertEqual(ranks['file-create'], [9.9, 9.9])
+        with self.assertRaisesRegex(AssertionError, 'rank rows'):
+            read_rank_times(self.csv({}), 'file', 3)
 
     def test_directory_rates_use_total_work_despite_corrupted_upstream_csv_rates(self):
         # 4.0.0 aggregate create/stat counts are overwritten with rank-local
@@ -103,19 +109,19 @@ class BannerTests(unittest.TestCase):
         check_banner(self.banner(), 4, self.label)
 
     def test_singleton_launch_is_rejected(self):
-        with self.assertRaisesRegex(BenchmarkError, 'expected 4'):
+        with self.assertRaisesRegex(AssertionError, 'expected 4'):
             check_banner(self.banner(tasks=1), 4, self.label)
 
     def test_mdtest_node_count_is_not_compared(self):
         # mdtest counts MPI shared-memory domains: unequal per-machine task counts make
-        # the banner's node count differ from the planned machine count. Placement is
-        # proved per task by the wrapper instead.
+        # the banner's node count differ from the planned machine count; the appfile
+        # fixes every task's machine instead.
         for nodes in (1, 2, 3):
             with self.subTest(nodes=nodes):
                 check_banner(self.banner(tasks=12, nodes=nodes), 12, self.label)
 
     def test_unpinned_version_is_rejected(self):
-        with self.assertRaisesRegex(BenchmarkError, 'reported version 3.5.0'):
+        with self.assertRaisesRegex(AssertionError, 'measured 3.5.0'):
             check_banner(self.banner(version='3.5.0'), 4, self.label)
 
 class WorkloadTests(unittest.TestCase):
@@ -132,7 +138,7 @@ class WorkloadTests(unittest.TestCase):
     def test_wrong_task_count_total_or_object_type_is_rejected(self):
         for report in ('1 tasks, 128 files', '4 tasks, 32 files',
                        '4 tasks, 128 directories', ''):
-            with self.subTest(report=report), self.assertRaises(BenchmarkError):
+            with self.subTest(report=report), self.assertRaises(AssertionError):
                 check_workload(report, 'file', 4, 128, self.label)
 
 
@@ -143,12 +149,12 @@ class ParseArgsTests(unittest.TestCase):
         for override in ({'layout': 'Private'}, {'subset': 'files'}, {'tasks': 3},
                          {'total_items': 4, 'tasks': 4}):
             with self.subTest(override=override), mock.patch.dict(mdtest.CONFIG, override), \
-                    self.assertRaises(BenchmarkError):
+                    self.assertRaises(AssertionError):
                 mdtest.parse_args([])
 
     def test_peak_rejects_unknown_layout(self):
         with mock.patch.dict(mdtest_peak.CONFIG, {'layout': 'Private'}), \
-                self.assertRaises(BenchmarkError):
+                self.assertRaises(AssertionError):
             mdtest_peak.parse_args([])
 
 

@@ -9,7 +9,7 @@ Push a client to its throughput ceiling with the unmodified **IOR mdtest 4.0.0**
 Prerequisites match [`mdtest`](bench-mdtest.md): the same `mdtest` 4.0.0 on every task machine, Open MPI 4.1, and targets mounted externally. Machine placement follows [run modes](run-modes.md).
 
 ```sh
-# Default: fill the --mode machines at two tasks per logical CPU.
+# Default: 128 tasks dealt round-robin over the --mode machines.
 uv run python -m agent_fs_bench run mdtest-peak --mode local --dirs /mnt/fs-a /mnt/fs-b
 
 # Small real end-to-end check (16 files/task, one repeat); not a result.
@@ -25,12 +25,11 @@ One run measures one task count and one file size. A peak curve is several runs 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `mdtest_bin` | `mdtest` | Native IOR 4.0.0 executable, the same on every machine |
-| `tasks` | `None` | N; `None` fills the capacity of the `--mode` machines |
-| `cpus_per_task` | `1` | One pinned logical CPU per task |
-| `oversubscribe` | `2` | Up to two tasks per CPU, so the default N is 2× the available CPUs; oversubscribed points are intended |
+| `tasks` | `128` | N, a positive integer; tasks above a machine's CPU count share CPUs, and oversubscribed points are intended |
 | `file_size_bytes` | `4096` | Bytes written and read per file (one size per run) |
-| `items_per_task` | `None` | Files per task; `None` takes the per-size default (0 B and 4 KiB 8192, 64 KiB 2048, 1 MiB 256), which keeps the 2× CPU point within a few tens of GiB per launch; an integer overrides it, and another size needs one |
-| `repeats` | 3 | Fresh launch and working directories per repeat |
+| `items_per_task` | `None` | Files per task; `None` takes the per-size default (0 B and 4 KiB 8192, 64 KiB 2048, 1 MiB 256), which keeps 128 tasks within a few tens of GiB per launch; an integer overrides it, and another size needs one |
+| `warmup_repeats` | 1 | Identical launches before the measured repeats; validated, timings discarded |
+| `repeats` | 3 | Measured launches with fresh working directories |
 | `layout` | `private` | `private`: one directory per machine with per-task trees (`-u`); `shared`: one common directory |
 
 Each launch is `mdtest -a POSIX -F -i 1 -n <n> -w S -e S -y [-u]`:
@@ -42,31 +41,36 @@ Each launch is `mdtest -a POSIX -F -i 1 -n <n> -w S -e S -y [-u]`:
 | `file-read` | open, read S bytes, close |
 | `file-unlink` | unlink |
 
-`-y` makes mdtest fsync after each write. IOR 4.0.0 skips the write for S=0, so the 0 B create has no fsync; it measures pure create/close metadata cost. Reads follow writes in the same launch with **no cache drop** (`cache_state = write-then-read-same-launch-no-drop`), so read MiB/s can come from the client page cache. Do not report it as storage-server read bandwidth.
+`-y` makes mdtest fsync after each write. IOR 4.0.0 skips the write for S=0, so the 0 B create has no fsync; it measures pure create/close metadata cost. Measured repeats follow `warmup_repeats` identical, discarded launches, and reads follow writes in the same launch with **no cache drop** (`cache_state = after-warmup-write-then-read-same-launch-no-drop`), so read MiB/s can come from the client page cache. Do not report it as storage-server read bandwidth.
 
 ## Results
 
-Each run writes one flat CSV per record kind plus a `manifest.json`:
+Each run writes one flat CSV per record kind plus a `config.json`:
 
 | Table | Key columns | Metric columns |
 | --- | --- | --- |
-| `phases` | `operation`, `layout`, `tasks`, `repeat`, `file_size_bytes`, `items_per_task` | `ops`, `elapsed_s`, `ops_per_s`, `mib_per_s` |
+| `phases` | `operation`, `layout`, `tasks`, `repeat`, `file_size_bytes`, `items_per_task` | `ops`, `elapsed_s`, `ops_per_s` |
+| `bandwidth` | `operation`, `layout`, `tasks`, `repeat`, `file_size_bytes`, `items_per_task` | `bytes`, `elapsed_s`, `mib_per_s` |
+| `ranks` | `operation`, `layout`, `tasks`, `repeat`, `file_size_bytes`, `items_per_task`, `sample`, `host` | `elapsed_s` |
+
+`bandwidth` holds only create and read with S>0. A `ranks` row is one task's phase time before the end barrier, from mdtest's per-rank CSV rows. Warm-up launches emit no row.
 
 | Metric | Definition |
 | --- | --- |
 | `ops` | n×N, checked against mdtest's own `N tasks, n×N files` report |
 | `elapsed_s` | Aggregate `all`-row phase time from the CSV: max over tasks, including the end barrier |
 | `ops_per_s` | ops / elapsed_s |
-| `mib_per_s` | create/read with S>0 only: ops×S / MiB / elapsed_s (logical bytes); empty elsewhere |
+| `bytes` | ops×S, logical create/read bytes |
+| `mib_per_s` | bytes / MiB / elapsed_s, for create/read with S>0 |
 
-`run` also writes `summary/phases.csv` (n and the median of each metric per target and dimension). Timing, validation, the per-machine directories and the IOR 4.0.0 CSV item-count caveat are identical to [`mdtest`](bench-mdtest.md#timing-and-results); launch checks and helpers are shared with that module. The manifest records each machine's CPUs (`nodes`) and every launch's verified placement.
+Timing, validation, the per-machine directories and the IOR 4.0.0 CSV item-count caveat are identical to [`mdtest`](bench-mdtest.md#timing-and-results); launch checks and helpers are shared with that module. `config.json` records each machine's facts (`nodes`) and the task count per machine (`placement`).
 
 ## Default figures
 
-`run` renders one figure per operation, layout and size for both metrics, plus standalone Python scripts with the raw samples. Examples: `figures/phases-ops_per_s-file_read-private-4096.pdf` and `figures/phases-mib_per_s-file_read-private-4096.pdf` (punctuation in split values becomes `_`).
+`plot` renders one default figure per operation, layout and size for both metrics, plus standalone Python scripts with the raw samples. The default figures are `phases-ops_per_s-...` and `bandwidth-mib_per_s-...`; examples: `figures/phases-ops_per_s-file_read-private-4096.pdf` and `figures/bandwidth-mib_per_s-file_read-private-4096.pdf` (punctuation in split values becomes `_`).
 - X is the task count (log scale); Y is Kops/s or MiB/s, with the median/IQR over repeats.
 - One run gives one x point; pool runs of different `tasks` to draw the curve.
-- Bandwidth figures only contain rows that have a bandwidth value, so `mib_per_s` appears for create/read with S>0.
+- The `bandwidth` table only holds create/read with S>0, so its figures contain those rows only.
 
 ```sh
 # Pool one size and layout at several task counts.

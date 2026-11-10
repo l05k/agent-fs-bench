@@ -1,19 +1,18 @@
-"""Per-run summaries and paper figures from the flat CSV tables."""
+"""Paper figures from the raw per-observation CSV tables (the `plot` command).
+
+Figures draw every raw observation: `line` shows the median and IQR of all pooled rows at
+each numeric x, `box` one box per x category. No aggregated table is written.
+"""
 
 import argparse
-import csv
 from dataclasses import dataclass, field
 import importlib
 import json
 from pathlib import Path
 import re
-import statistics
 
 from . import figure
 from .results import read_table
-
-# Index columns a summary pools over; every other key column is a dimension.
-POOLED = ('repeat', 'sample')
 
 
 @dataclass
@@ -42,37 +41,6 @@ class Figure:
 
 def workload(benchmark: str):
     return importlib.import_module(f'agent_fs_bench.benchmarks.{benchmark.replace("-", "_")}')
-
-
-def summarize(run_dir: Path) -> None:
-    """Write summary/<table>.csv: n and each metric's median per target and dimensions.
-
-    Only tables with a `repeat` or `sample` column are summarized; others
-    already hold one row per group.
-    """
-    manifest = json.loads((run_dir / 'manifest.json').read_text(encoding='utf-8'))
-    for table, schema in manifest['tables'].items():
-        dimensions = [key for key in schema['keys'] if key not in POOLED]
-        if dimensions == schema['keys']:
-            continue
-        groups: dict[tuple, list[dict]] = {}
-        for row in read_table(run_dir / f'{table}.csv'):
-            groups.setdefault(tuple(row[key] for key in dimensions), []).append(row)
-        (run_dir / 'summary').mkdir(exist_ok=True)
-        with (run_dir / 'summary' / f'{table}.csv').open('w', newline='', encoding='utf-8') as handle:
-            writer = csv.writer(handle)
-            writer.writerow([*dimensions, 'n', *schema['metrics']])
-            for key, rows in groups.items():
-                writer.writerow([*key, len(rows),
-                                 *(_median(rows, metric) for metric in schema['metrics'])])
-
-
-def _median(rows: list[dict], metric: str) -> int | float | str:
-    values = [float(row[metric]) for row in rows if row[metric] != '']
-    if not values:
-        return ''
-    value = statistics.median(values)
-    return int(value) if value.is_integer() else float(f'{value:.6g}')
 
 
 def _cell(value) -> str:
@@ -114,52 +82,51 @@ def figure_data(spec: Figure, rows: list[dict], legend: list[str],
     return datasets
 
 
+def load_snapshots(run_dirs: list[Path], vary: tuple[str, ...]) -> list[dict]:
+    """config.json of each run; pooled runs share benchmark, source and config except `vary`."""
+    snapshots = [json.loads((run / 'config.json').read_text(encoding='utf-8')) for run in run_dirs]
+    first = snapshots[0]
+    for run, snapshot in zip(run_dirs[1:], snapshots[1:]):
+        assert snapshot['benchmark'] == first['benchmark'], \
+            f'{run} benchmark: expected {first["benchmark"]}, measured {snapshot["benchmark"]}'
+        assert snapshot['source_sha256'] == first['source_sha256'], \
+            f'{run} source_sha256: expected {first["source_sha256"]}, measured ' \
+            f'{snapshot["source_sha256"]}; runs of different sources never pool'
+        differ = sorted(key for key in first['config'].keys() | snapshot['config'].keys()
+                        if key not in vary
+                        and first['config'].get(key) != snapshot['config'].get(key))
+        assert not differ, f'{run} config: expected equal to {run_dirs[0]} outside --vary, ' \
+                           f'measured differences in {differ}'
+    return snapshots
+
+
 def plot(run_dirs: list[Path], figures: list[Figure] | None = None, *,
          targets: list[str] | None = None, output: Path | None = None,
          size: tuple[float, float] = (3.5, 1.5), vary: tuple[str, ...] = ()) -> list[Path]:
     """Render `figures` (default: the workload's FIGURES) and return the written stems.
 
-    Several runs pool their rows only if they share benchmark and source
-    fingerprint and their configs match apart from keys in `vary` (e.g. one
-    mount-scale run per client count). `targets` orders and filters the legend
-    by target name or full series label (e.g. `LakeBase/cp-r`).
+    `targets` orders and filters the legend by target name or full series label
+    (e.g. `LakeBase/cp-r`); the first is the primary system.
     """
-    manifests = [json.loads((run / 'manifest.json').read_text(encoding='utf-8')) for run in run_dirs]
-    first = manifests[0]
-    for run, manifest in zip(run_dirs[1:], manifests[1:]):
-        if manifest['benchmark'] != first['benchmark']:
-            raise ValueError(f'{run}: benchmark {manifest["benchmark"]} is not {first["benchmark"]}')
-        if manifest['source_sha256'] != first['source_sha256']:
-            raise ValueError(f'{run}: source_sha256 differs from {run_dirs[0]}; '
-                             'runs of different benchmark sources never pool')
-        differ = sorted(key for key in first['config'].keys() | manifest['config'].keys()
-                        if key not in vary
-                        and first['config'].get(key) != manifest['config'].get(key))
-        if differ:
-            raise ValueError(f'{run}: config differs from {run_dirs[0]} in {", ".join(differ)}; '
-                             'pass --vary KEY,... only if the figure separates them')
+    snapshots = load_snapshots(run_dirs, vary)
     finished = list(dict.fromkeys(
-        target['name'] for manifest in manifests for target in manifest['targets']))
-    legend = targets or finished
+        target['name'] for snapshot in snapshots for target in snapshot['targets']))
     required = figures is not None
-    if figures is None:
-        figures = getattr(workload(first['benchmark']), 'FIGURES', [])
+    figures = figures if required else getattr(workload(snapshots[0]['benchmark']), 'FIGURES', [])
     tables = {spec.table: [row for run in run_dirs if (run / f'{spec.table}.csv').exists()
                            for row in read_table(run / f'{spec.table}.csv')]
               for spec in figures}
     if targets:
         known = set(finished) | {'/'.join(row[key] for key in spec.series)
                                  for spec in figures for row in tables[spec.table]}
-        unknown = [name for name in targets if name not in known]
-        if unknown:
-            raise ValueError(f'unknown --targets {", ".join(unknown)}; '
-                             f'targets and series: {", ".join(sorted(known))}')
+        assert set(targets) <= known, f'--targets: expected within {sorted(known)}, ' \
+                                      f'measured {targets}'
     output = output or run_dirs[0] / 'figures'
     stems = []
     for spec in figures:
-        datasets = figure_data(spec, tables[spec.table], legend, size)
-        if required and not datasets:
-            raise ValueError(f'no rows in {spec.table}.csv match {spec}')
+        datasets = figure_data(spec, tables[spec.table], targets or finished, size)
+        assert datasets or not required, f'{spec.table}.csv rows matching {spec}: expected ' \
+                                         f'>= 1, measured 0'
         for suffix, data in datasets:
             output.mkdir(parents=True, exist_ok=True)
             stem = output / ((spec.name or f'{spec.table}-{spec.y}') + suffix)
@@ -178,7 +145,7 @@ def write_script(stem: Path, data: dict) -> None:
         encoding='utf-8')
 
 
-def main(argv: list[str]) -> int:
+def plot_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='agent-fs-bench plot',
         description='Render the workload default figures, or one custom figure with --table.')
@@ -206,6 +173,11 @@ def main(argv: list[str]) -> int:
     custom.add_argument('--logx', action='store_true')
     custom.add_argument('--logy', action='store_true')
     custom.add_argument('--name', help='file stem (default: <table>-<y>)')
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    parser = plot_parser()
     args = parser.parse_args(argv)
     figures = None
     if args.table:
@@ -216,8 +188,7 @@ def main(argv: list[str]) -> int:
                           args.ylabel, args.xscale, args.yscale, args.logx, args.logy, args.name)]
     stems = plot(args.runs, figures, targets=args.targets, output=args.output,
                  size=tuple(args.size), vary=args.vary)
-    if not stems:
-        raise ValueError(f'no figure rows in {", ".join(map(str, args.runs))}')
+    assert stems, f'figures from {args.runs}: expected >= 1, measured 0'
     for stem in stems:
         print(f'{stem}.pdf')
     return 0
