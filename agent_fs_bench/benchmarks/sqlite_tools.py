@@ -13,6 +13,8 @@ import time
 from typing import Any, Dict, Sequence, Tuple
 import urllib.request
 
+from agent_fs_bench.results import PROJECT_ROOT
+
 SQLITE_VERSION = "3.54.1"
 SQLITE_AMALGAMATION = "sqlite-amalgamation-3540100.zip"
 SQLITE_AMALGAMATION_URL = "https://sqlite.org/2026/" + SQLITE_AMALGAMATION
@@ -35,6 +37,10 @@ COMPILE_FLAGS = (
 
 class BenchmarkError(RuntimeError):
     pass
+
+def build_directory(configured: str | Path | None, name: str) -> Path:
+    """Resolve a build cache on this machine; None means this checkout's build/<name>."""
+    return Path(configured or PROJECT_ROOT / "build" / name).expanduser().resolve()
 
 def download(url: str, destination: Path, expected_sha256: str) -> None:
     """Verify fixed source content before atomically replacing the cache."""
@@ -253,7 +259,3 @@ def run_command(command: Sequence[str]) -> subprocess.CompletedProcess:
             + proc.stderr
         )
     return proc
-
-def remove_database(db_path: Path) -> None:
-    for suffix in ("", "-wal", "-shm", "-journal"):
-        Path(str(db_path) + suffix).unlink(missing_ok=True)

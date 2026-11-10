@@ -1,8 +1,8 @@
 """Shared SSH host inventory and Open MPI remote-shell agent.
 
-The multi-host benchmark and mount-scale read the same private TOML inventory.
-Open MPI execs this module's absolute source path with the controller Python,
-so the agent CLI below imports nothing from the package and needs no install.
+`agent_fs_bench.cluster` reads this private TOML inventory for overflow and remote runs.
+Open MPI execs this module's absolute source path with the controller Python, so the
+agent CLI below imports nothing from the package and needs no install.
 """
 from __future__ import annotations
 
@@ -23,7 +23,8 @@ class Host:
     user: str | None = None
     port: int = 22
     ssh_args: tuple[str, ...] = ()
-    python: str = "python3"
+    python: str | None = None  # default: <root>/.venv/bin/python
+    root: str | None = None  # checkout path; default: the controller's checkout path
 
 
 def load_hosts(path: Path) -> tuple[Host, ...]:
@@ -42,7 +43,7 @@ def load_hosts(path: Path) -> tuple[Host, ...]:
     names: set[str] = set()
     endpoints: set[tuple[str | None, str, int]] = set()
     for item in document["hosts"]:
-        if not isinstance(item, dict) or set(item) - {"name", "address", "user", "port", "ssh_args", "python"}:
+        if not isinstance(item, dict) or set(item) - {"name", "address", "user", "port", "ssh_args", "python", "root"}:
             raise ValueError("unknown host configuration keys")
         name, address = item.get("name"), item.get("address")
         if not isinstance(name, str) or not _NAME_RE.fullmatch(name) or name in names:
@@ -58,14 +59,17 @@ def load_hosts(path: Path) -> tuple[Host, ...]:
         ssh_args = item.get("ssh_args", [])
         if not isinstance(ssh_args, list) or any(not isinstance(s, str) or not s for s in ssh_args):
             raise ValueError(f"{name}: ssh_args must be an array of non-empty strings")
-        python = item.get("python", "python3")
-        if not isinstance(python, str) or not python or "\x00" in python:
-            raise ValueError(f"{name}: invalid Python executable")
+        python = item.get("python")
+        if python is not None and (not isinstance(python, str) or not python.startswith("/") or "\x00" in python):
+            raise ValueError(f"{name}: python must be an absolute executable path")
+        root = item.get("root")
+        if root is not None and (not isinstance(root, str) or not root.startswith("/") or "\x00" in root):
+            raise ValueError(f"{name}: root must be an absolute checkout path")
         endpoint = (user, address, port)
         if endpoint in endpoints:
             raise ValueError(f"{name}: duplicate SSH endpoint")
         endpoints.add(endpoint)
-        hosts.append(Host(name, address, user, port, tuple(ssh_args), python))
+        hosts.append(Host(name, address, user, port, tuple(ssh_args), python, root))
         names.add(name)
     return tuple(hosts)
 

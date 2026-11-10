@@ -38,21 +38,24 @@ class Client:
     shared: tuple[Path, ...]
 
 
-def load_profile(path: Path, target_name: str) -> Profile:
-    """Read ``[profiles.<target_name>]`` from a private TOML file."""
-    with path.open("rb") as handle:
-        table = tomllib.load(handle)["profiles"][target_name]
+def parse_profile(text: str, target_name: str, source: str = "mounts.toml") -> Profile:
+    """Read ``[profiles.<target_name>]`` from private TOML text.
+
+    No filesystem check: the controller may not mount ``admin_root``; each worker checks
+    it on its own machine.
+    """
+    table = tomllib.loads(text)["profiles"][target_name]
     topology = table["topology"]
     if topology not in _TOPOLOGIES:
-        raise ValueError(f"{path}: topology must be {MULTI_MOUNT} or {SHARED_DIRECTORY}")
+        raise ValueError(f"{source}: topology must be {MULTI_MOUNT} or {SHARED_DIRECTORY}")
     admin_root = Path(table["admin_root"])
-    if not admin_root.is_absolute() or not admin_root.is_dir():
-        raise ValueError(f"{path}: admin_root must be an existing absolute directory")
+    if not admin_root.is_absolute():
+        raise ValueError(f"{source}: admin_root must be an absolute path")
 
     def command(key: str, required: bool) -> tuple[str, ...]:
         if key not in table:
             if required:
-                raise ValueError(f"{path}: profile is missing {key}")
+                raise ValueError(f"{source}: profile is missing {key}")
             return ()
         return tuple(table[key])
 

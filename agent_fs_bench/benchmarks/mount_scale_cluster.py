@@ -1,16 +1,16 @@
-"""Local-first CPU placement and SSH workers for mount-scale lifecycle only.
+"""Persistent per-machine lifecycle workers for mount-scale.
 
-All file-operation timing belongs to the separate, global Open MPI mdtest job.
-Workers keep Layout/Sampler state; JSON replies and diagnostics use local staging,
-never the measured volume. A failed command leaves mounts and data for inspection.
+All file-operation timing belongs to the separate, global Open MPI mdtest jobs. Each
+machine of the run keeps one worker in its own checkout (started over SSH for remote
+machines) that holds Layout/Sampler state across those jobs. JSON replies and diagnostics
+use local staging, never the measured volume. A failed command leaves mounts and data for
+inspection.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 import json
-import os
 from pathlib import Path
 import platform
 from queue import Empty, Queue
@@ -22,40 +22,11 @@ import threading
 import time
 import traceback
 
+from agent_fs_bench import cluster
 from agent_fs_bench.results import PROJECT_ROOT
-from agent_fs_bench.ssh import Host, ssh_argv
-from .mount_scale_mdtest import _executable, _sha256
-from .mount_scale_mounts import Client, Layout, load_profile
+from agent_fs_bench.ssh import ssh_argv
+from .mount_scale_mounts import Client, Layout, parse_profile
 from . import mount_scale_resources as resources
-
-
-@dataclass(frozen=True)
-class Allocation:
-    name: str
-    cpus: tuple[int, ...]
-
-
-def allocate(capacities: list[tuple[str, list[int]]], clients: int | None) -> tuple[Allocation, ...]:
-    """Fill available CPUs in host order, without oversubscription or a sweep."""
-    if not capacities or any(not cpus or len(set(cpus)) != len(cpus)
-                             for _, cpus in capacities):
-        raise ValueError('every host needs a non-empty, unique CPU affinity set')
-    if len({name for name, _ in capacities}) != len(capacities):
-        raise ValueError('host names must be unique')
-    total = sum(len(cpus) for _, cpus in capacities)
-    count = total if clients is None else clients
-    if type(count) is not int or not 1 <= count <= total:
-        raise ValueError(f'clients must be between 1 and {total} available logical CPUs')
-    allocations = []
-    remaining = count
-    for name, cpus in capacities:
-        selected = tuple(sorted(cpus)[:remaining])
-        if selected:
-            allocations.append(Allocation(name, selected))
-            remaining -= len(selected)
-        if remaining == 0:
-            break
-    return tuple(allocations)
 
 
 def idle(seconds: float) -> dict[str, int | float]:
@@ -66,7 +37,7 @@ def idle(seconds: float) -> dict[str, int | float]:
 
 
 def parallel(workers: list[Worker], action: str, **data) -> list[dict]:
-    """Preserve host order while issuing lifecycle commands concurrently."""
+    """Preserve machine order while issuing lifecycle commands concurrently."""
     with ThreadPoolExecutor(max_workers=len(workers)) as pool:
         futures = [pool.submit(worker.call, action, **data) for worker in workers]
         return [future.result() for future in futures]
@@ -75,23 +46,19 @@ def parallel(workers: list[Worker], action: str, **data) -> list[dict]:
 class Worker:
     """One persistent local/SSH subprocess; no restart or recovery protocol."""
 
-    def __init__(self, name: str, host: Host | None, job: dict,
-                 diagnostic_dir: Path, timeout_s: float, connect_timeout_s: int):
-        self.name, self.host, self.job = name, host, job
+    def __init__(self, node: cluster.Node, job: dict, diagnostic_dir: Path, timeout_s: float):
+        self.node, self.name, self.job = node, node.name, job
         self.timeout_s = timeout_s
-        self.package_root = PROJECT_ROOT if host is None else Path(job['deployment'])
         diagnostic_dir.mkdir(parents=True, exist_ok=True)
         self.diagnostic_dir = diagnostic_dir
-        if host is not None:
-            self._deploy(connect_timeout_s)
-        python = sys.executable if host is None else host.python
-        argv = [python, '-u', '-m', 'agent_fs_bench.benchmarks.mount_scale_cluster', '--worker']
-        if host is not None:
-            argv = [*ssh_argv(host, connect_timeout_s),
-                    f'cd {shlex.quote(str(self.package_root))} && exec {shlex.join(argv)}']
+        argv = [node.python, '-u', '-m', 'agent_fs_bench.benchmarks.mount_scale_cluster',
+                '--worker']
+        if node.host is not None:
+            argv = [*ssh_argv(node.host, cluster.CONFIG['connect_timeout_s']),
+                    f'cd {shlex.quote(str(node.root))} && exec {shlex.join(argv)}']
         self._stderr = (diagnostic_dir / 'worker.stderr.txt').open('w')
         self.process = subprocess.Popen(
-            argv, cwd=PROJECT_ROOT if host is None else None,
+            argv, cwd=PROJECT_ROOT if node.host is None else None,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._stderr,
             text=True, bufsize=1,
         )
@@ -102,48 +69,10 @@ class Worker:
             assert self.process.stdin is not None
             self.process.stdin.write(json.dumps(job) + '\n')
             self.process.stdin.flush()
-            self.info = self._reply()
+            self._reply()
         except BaseException:
             self.close(success=False)
             raise
-
-    def _deploy(self, connect_timeout_s: int) -> None:
-        sources = {str(path.relative_to(PROJECT_ROOT)): path.read_text()
-                   for path in (PROJECT_ROOT / 'agent_fs_bench').rglob('*.py')}
-        source = """
-import json, os, sys
-from pathlib import Path
-job = json.load(sys.stdin)
-staging = Path(job['staging'])
-if not staging.is_absolute() or not staging.is_dir():
-    raise ValueError(f'staging must be an existing absolute directory: {staging}')
-root = Path(job['root'])
-if not root.resolve().is_relative_to(staging.resolve()):
-    raise ValueError('deployment escapes staging through a symlink')
-root.mkdir(parents=True, exist_ok=False, mode=0o700)
-os.chmod(root, 0o700)
-for relative, content in job['sources'].items():
-    path = root / relative
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
-if job['profile'] is not None:
-    profile = root / 'mounts.toml'
-    profile.write_text(job['profile'])
-    profile.chmod(0o600)
-"""
-        assert self.host is not None
-        profile = Path(self.job['profiles']).read_text()
-        completed = subprocess.run(
-            [*ssh_argv(self.host, connect_timeout_s),
-             shlex.join([self.host.python, '-c', source])],
-            input=json.dumps({'root': str(self.package_root), 'sources': sources,
-                              'profile': profile, 'staging': self.job['staging']}),
-            text=True, capture_output=True, timeout=self.timeout_s,
-        )
-        (self.diagnostic_dir / 'deploy.stderr.txt').write_text(completed.stderr)
-        if completed.returncode:
-            raise RuntimeError(f'{self.name}: deployment failed; inspect {self.diagnostic_dir}')
-        self.job['profiles'] = str(self.package_root / 'mounts.toml')
 
     def _read(self) -> None:
         assert self.process.stdout is not None
@@ -191,34 +120,28 @@ if job['profile'] is not None:
         self._stderr.close()
 
 
-def preflight(job: dict) -> dict:
+def preflight(job: dict) -> None:
     if platform.system() != 'Linux' or sys.version_info < (3, 12):
         raise ValueError('mount-scale workers require Linux and Python 3.12+')
     staging = Path(job['staging'])
     if not staging.is_absolute() or not staging.is_dir():
         raise ValueError(f'staging must be an existing absolute directory: {staging}')
+    if not Path(job['work_dir']).resolve().is_relative_to(staging.resolve()):
+        raise ValueError('work directory escapes staging through a symlink')
     if not job['directory_smoke']:
-        profile = load_profile(Path(job['profiles']), job['target'])
+        profile = parse_profile(job['profile'], job['target'])
+        if not profile.admin_root.is_dir():
+            raise ValueError(f'admin_root is not mounted here: {profile.admin_root}')
         if (staging.resolve().is_relative_to(profile.admin_root.resolve())
                 or profile.admin_root.resolve().is_relative_to(staging.resolve())):
             raise ValueError('staging must be outside admin_root')
-    binary = _executable(job['mdtest'])
-    version = subprocess.run([*job['mpi_launcher'], '--version'], text=True,
-                             capture_output=True, check=True,
-                             timeout=job['command_timeout_s']).stdout.strip()
-    if 'Open MPI' not in version and 'OpenRTE' not in version:
-        raise ValueError('mount-scale requires Open MPI')
-    return {'hostname': platform.node(), 'cpus': sorted(os.sched_getaffinity(0)),
-            'kernel': platform.release(), 'machine': platform.machine(),
-            'binary': str(binary), 'mdtest_sha256': _sha256(binary),
-            'mpi_version': version, 'python': sys.version.split()[0]}
 
 
 class Lifecycle:
     def __init__(self, job: dict):
         self.job = job
         self.profile = (None if job['directory_smoke'] else
-                        load_profile(Path(job['profiles']), job['target']))
+                        parse_profile(job['profile'], job['target']))
         self.data_root = Path(job['data_root'])
         self.logs = Path(job['work_dir']) / 'diagnostics' / job['name']
         self.logs.mkdir(parents=True, exist_ok=True)
@@ -229,6 +152,8 @@ class Lifecycle:
 
     def command(self, request: dict) -> dict:
         action = request['action']
+        if action == 'init-data':
+            return self.init_data()
         if action == 'setup':
             return self.setup(request['repeat'], request['clients'], request['total_clients'])
         if action == 'mount':
@@ -257,16 +182,32 @@ class Lifecycle:
             shutil.rmtree(self.local)
             self.private = self.local = None
             return {}
+        if action == 'remove-repeat':
+            # Every machine has removed its private tree; the repeat directory must be empty.
+            (self.data_root / request['name']).rmdir()
+            return {}
+        if action == 'remove-data':
+            shutil.rmtree(self.data_root)
+            return {}
         if action == 'diagnostics':
             return {str(path.relative_to(self.logs)): path.read_text()
                     for path in self.logs.rglob('*.txt')}
         if action == 'finish':
             if self.sampler is not None:
                 raise RuntimeError('cannot finish while resource sampling is active')
-            if self.job['name'] != 'local':
-                shutil.rmtree(self.job['deployment'])
             return {}
         raise ValueError(f'unknown mount-scale worker action: {action}')
+
+    def init_data(self) -> dict:
+        """Create the run's data root, owner sentinel and shared resources (first machine)."""
+        admin = self.data_root.parent if self.profile is None else self.profile.admin_root
+        if not self.data_root.resolve().is_relative_to(admin.resolve()):
+            raise RuntimeError('data_root escapes admin_root through a symlink')
+        self.data_root.mkdir(parents=True, exist_ok=False)
+        (self.data_root / '.owner').write_text(self.job['token'])
+        for number in range(1, self.job['directories']):
+            (self.data_root / f'shared-{number}').mkdir()
+        return {}
 
     def setup(self, repeat: int, clients: int, total_clients: int) -> dict:
         if (self.data_root / '.owner').read_text() != self.job['token']:
@@ -302,9 +243,9 @@ class Lifecycle:
 def worker_main() -> int:
     job = json.loads(sys.stdin.readline())
     try:
-        info = preflight(job)
+        preflight(job)
         lifecycle = Lifecycle(job)
-        print(json.dumps({'result': info}), flush=True)
+        print(json.dumps({'result': {}}), flush=True)
         for line in sys.stdin:
             request = json.loads(line)
             result = lifecycle.command(request)

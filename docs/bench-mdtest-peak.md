@@ -1,19 +1,22 @@
-# Single-client mdtest peak
+# mdtest peak
 
-Push one Linux client to its throughput ceiling with the unmodified **IOR mdtest 4.0.0**. This complements the fixed-total-work [`mdtest`](bench-mdtest.md) sweep, which cannot show a ceiling for two reasons. First, it stops at 16 processes. Second, its fixed 65536-object total leaves a few thousand objects per process at high P, so phases are short enough for barrier and launch overhead to dominate. It also moves no file data.
+Push a client to its throughput ceiling with the unmodified **IOR mdtest 4.0.0**. This complements the fixed-total-work [`mdtest`](bench-mdtest.md) runs, which cannot show a ceiling: their fixed 65536-object total leaves a few thousand objects per task at high N, so phases are short enough for barrier and launch overhead to dominate. They also move no file data.
 
-`mdtest-peak` uses **weak scaling**. Each process gets a fixed file count, so the total is n×P and phase time grows once the target saturates. That growth makes the plateau visible. Every point reports file ops/s; create and read with non-empty files also report MiB/s.
+`mdtest-peak` uses **weak scaling**. Each task gets a fixed file count, so the total is n×N and phase time grows once the target saturates. That growth makes the plateau visible. Every point reports file ops/s; create and read with non-empty files also report MiB/s.
 
 ## Commands
 
-Prerequisites match [`mdtest`](bench-mdtest.md): `mdtest` 4.0.0 and its MPI launcher are on PATH, and targets are mounted externally.
+Prerequisites match [`mdtest`](bench-mdtest.md): the same `mdtest` 4.0.0 on every task machine, Open MPI 4.1, and targets mounted externally. Machine placement follows [run modes](run-modes.md).
 
 ```sh
-uv run python -m agent_fs_bench run mdtest-peak --dirs /mnt/fs-a /mnt/fs-b
+# Default: fill the --mode machines at two tasks per logical CPU.
+uv run python -m agent_fs_bench run mdtest-peak --mode local --dirs /mnt/fs-a /mnt/fs-b
 
-# Small real end-to-end check (16 files/process, P=1,2, one repeat); not a result.
-uv run python -m agent_fs_bench run mdtest-peak --dirs /mnt/smoke -- --smoke
+# Small real end-to-end check (16 files/task, one repeat); not a result.
+uv run python -m agent_fs_bench run mdtest-peak --mode local --dirs /mnt/smoke -- --smoke
 ```
+
+One run measures one task count and one file size. A peak curve is several runs with explicit `CONFIG["tasks"]` (for example powers of two up to 2× the CPUs, plus the CPU count) pooled with `plot --vary tasks`.
 
 ## Settings
 
@@ -21,11 +24,14 @@ uv run python -m agent_fs_bench run mdtest-peak --dirs /mnt/smoke -- --smoke
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `mpi_command` | `("mpiexec", "--oversubscribe", "-n")` | Launcher prefix plus process-count flag. Points above the CPU count oversubscribe, which Open MPI rejects without `--oversubscribe`. Drop that flag for MPICH. |
-| `items_per_proc` | `{0: 8192, 4096: 8192, 65536: 2048, 1048576: 256}` | File size in bytes → files per process. At 128 processes the 1 MiB point writes 32 GiB. |
-| `conc_levels` | `None` | `None` means powers of two up to 2× available logical CPUs (`sched_getaffinity`), plus the CPU count and 2× it. With 64 CPUs: 1…64, 128. |
-| `repeats` | 3 | Fresh launch and working directory per repeat |
-| `layouts` | `("private", "shared")` | `-u` per-process directories versus one common directory |
+| `mdtest_bin` | `mdtest` | Native IOR 4.0.0 executable, the same on every machine |
+| `tasks` | `None` | N; `None` fills the capacity of the `--mode` machines |
+| `cpus_per_task` | `1` | One pinned logical CPU per task |
+| `oversubscribe` | `2` | Up to two tasks per CPU, so the default N is 2× the available CPUs; oversubscribed points are intended |
+| `file_size_bytes` | `4096` | Bytes written and read per file (one size per run) |
+| `items_per_task` | `8192` | Files per task; former per-size defaults: 0 B and 4 KiB 8192, 64 KiB 2048, 1 MiB 256 |
+| `repeats` | 3 | Fresh launch and working directories per repeat |
+| `layout` | `private` | `private`: `-u` per-task directories; `shared`: one common directory |
 
 Each launch is `mdtest -a POSIX -F -i 1 -n <n> -w S -e S -y [-u]`:
 
@@ -44,26 +50,30 @@ Each run writes one flat CSV per record kind plus a `manifest.json`:
 
 | Table | Key columns | Metric columns |
 | --- | --- | --- |
-| `phases` | `operation`, `layout`, `procs`, `repeat`, `file_size_bytes`, `items_per_proc` | `ops`, `elapsed_s`, `ops_per_s`, `mib_per_s` |
+| `phases` | `operation`, `layout`, `tasks`, `repeat`, `file_size_bytes`, `items_per_task` | `ops`, `elapsed_s`, `ops_per_s`, `mib_per_s` |
 
 | Metric | Definition |
 | --- | --- |
-| `ops` | n×P, checked against mdtest's own `P tasks, n×P files` report |
-| `elapsed_s` | Aggregate `all`-row phase time from the CSV: max over ranks, including the end barrier |
+| `ops` | n×N, checked against mdtest's own `N tasks, n×N files` report |
+| `elapsed_s` | Aggregate `all`-row phase time from the CSV: max over tasks, including the end barrier |
 | `ops_per_s` | ops / elapsed_s |
 | `mib_per_s` | create/read with S>0 only: ops×S / MiB / elapsed_s (logical bytes); empty elsewhere |
 
-`run` also writes `summary/phases.csv` (n and the median of each metric per target and dimension). Timing, validation and the IOR 4.0.0 CSV item-count caveat are identical to [`mdtest`](bench-mdtest.md#timing-and-results). Launch checks and helpers are shared with that module. The client CPU count the sweep was derived from is in the manifest config.
+`run` also writes `summary/phases.csv` (n and the median of each metric per target and dimension). Timing, validation, the per-task directories and the IOR 4.0.0 CSV item-count caveat are identical to [`mdtest`](bench-mdtest.md#timing-and-results); launch checks and helpers are shared with that module. The manifest records each machine's CPUs (`nodes`) and every launch's verified placement.
 
 ## Default figures
 
-`run` renders one figure per operation, layout and size for both metrics, e.g. `figures/phases-ops_per_s-file_read-private-1048576.pdf` and `figures/phases-mib_per_s-file_read-private-1048576.pdf` (punctuation in split values becomes `_`), plus standalone Python scripts with the raw samples. X is the process count (log scale). Y is Kops/s or MiB/s, with the median/IQR over repeats. Bandwidth figures only contain rows that have a bandwidth value, so `mib_per_s` appears for create/read with S>0.
+`run` renders one figure per operation, layout and size for both metrics, plus standalone Python scripts with the raw samples. Examples: `figures/phases-ops_per_s-file_read-private-4096.pdf` and `figures/phases-mib_per_s-file_read-private-4096.pdf` (punctuation in split values becomes `_`).
+- X is the task count (log scale); Y is Kops/s or MiB/s, with the median/IQR over repeats.
+- One run gives one x point; pool runs of different `tasks` to draw the curve.
+- Bandwidth figures only contain rows that have a bandwidth value, so `mib_per_s` appears for create/read with S>0.
 
 ```sh
-# Re-render the default figures for a finished run (or pool runs of one config).
-uv run python -m agent_fs_bench plot results/mdtest-peak/<run-id> --targets ours,nfs
+# Pool one size and layout at several task counts.
+uv run python -m agent_fs_bench plot results/mdtest-peak/<run-n8> results/mdtest-peak/<run-n128> \
+  --vary tasks --targets ours,nfs
 ```
 
-`plot` accepts several run directories of the same benchmark and rejects runs whose config or source fingerprint differ. `--targets` sets legend order and filtering; the first entry is the paper's primary system. Each size's files-per-process value is part of the config, so changing `items_per_proc` produces a separate configuration.
+`plot` accepts several run directories of the same benchmark and rejects runs whose config or source fingerprint differ, except in keys given to `--vary`. `--targets` sets legend order and filtering; the first entry is the paper's primary system. Figures split by `file_size_bytes`, so runs of several sizes can be pooled with `--vary tasks,file_size_bytes,items_per_task`.
 
-The ceiling is the plateau of a curve. Points beyond the CPU count show whether more outstanding requests still help; past that plateau the client CPU, not the target, is the bottleneck. Report the client CPU count, mount options and server hardware with the numbers.
+The ceiling is the plateau of a curve. Points beyond the CPU count show whether more outstanding requests still help; past that plateau the client CPU, not the target, is the bottleneck. Report the CPU count, mount options and server hardware with the numbers. In `overflow` and `remote` modes the tasks of one point can span several machines, so a curve is no longer a single-client ceiling; state the placement of each point.

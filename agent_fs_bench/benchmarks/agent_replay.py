@@ -1,4 +1,10 @@
-"""Replay accepted Harbor agent traces against fresh task-data mounts on Linux."""
+"""Replay accepted Harbor agent traces against fresh task-data mounts on Linux.
+
+Each task runs its own independent replay of every case and repeat on its own
+machine: it restores its own initial-data copies under its task directory and
+starts together with every other task through one global Open MPI job. Replay
+output and logs are diagnostics and stay in this node's checkout.
+"""
 
 from __future__ import annotations
 
@@ -14,28 +20,31 @@ import subprocess
 import sys
 import tomllib
 
+from agent_fs_bench import cluster
 from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
 
 CONFIG = {
-    "cases_file": PROJECT_ROOT / "local" / "agent-replay.toml",
+    # Relative names resolve in each machine's own checkout, never on the controller.
+    "cases_file": "local/agent-replay.toml",
     "repeats": 5,
+    "tasks": 1,
+    "cpus_per_task": 1,  # One Harbor trial per task; Docker containers run outside the pin.
+    "oversubscribe": 1,
 }
 REPLAY_ROOT = PROJECT_ROOT / "third_party" / "agent-mitm-replay"
 
 FIGURES = [
-    Figure("replays", "case", "elapsed_s", kind="box",
-           xlabel="Replay case", ylabel="Wall-clock time (s)", name="replay-time"),
-    Figure("phases", "phase", "seconds", kind="box", split=("case",),
+    Figure("replays", "tasks", "elapsed_s", kind="box", split=("case",),
+           xlabel="Tasks", ylabel="Wall-clock time (s)", name="replay-time-tasks"),
+    Figure("phases", "phase", "seconds", kind="box", split=("case", "tasks"),
            xlabel="Harbor phase", ylabel="Phase time (s)", name="replay-phases"),
 ]
-
 
 @dataclass(frozen=True)
 class Mount:
     source: Path
     container: str
-
 
 @dataclass(frozen=True)
 class ReplayCase:
@@ -44,11 +53,14 @@ class ReplayCase:
     cassette: Path
     mounts: tuple[Mount, ...]
 
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     argparse.ArgumentParser(description=__doc__).parse_args(argv)
     return argparse.Namespace(**CONFIG)
 
+def cases_path(value: str) -> Path:
+    """The cases file in this machine's checkout; a relative name resolves there."""
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 def load_cases(config: Path) -> list[ReplayCase]:
     config = config.expanduser().resolve()
@@ -88,7 +100,6 @@ def load_cases(config: Path) -> list[ReplayCase]:
         raise ValueError("at least one replay case is required")
     return cases
 
-
 def fingerprint(root: Path, paths: list[Path] | None = None) -> str:
     """Hash input bytes, modes, symlinks and hard-link topology, not host paths."""
     digest = hashlib.sha256()
@@ -116,10 +127,7 @@ def fingerprint(root: Path, paths: list[Path] | None = None) -> str:
         digest.update(b"\0")
     return digest.hexdigest()
 
-
 def restore(source: Path, destination: Path) -> None:
-    # Request metadata preservation; run() checks the restored input before replay.
-    # A new destination per measurement prevents reuse of a mutated task tree.
     process = subprocess.run(
         ["cp", "-a", "--reflink=never", "--", str(source), str(destination)],
         capture_output=True, text=True,
@@ -127,81 +135,142 @@ def restore(source: Path, destination: Path) -> None:
     if process.returncode:
         raise RuntimeError(f"cannot restore initial data: {process.stderr.strip()}")
 
+def restore_verified(source: Path, destination: Path, expected: str) -> None:
+    """Restore one task's private copy and reject any metadata or content loss.
 
-def check_storage(case: ReplayCase, target: Path) -> None:
-    for path in (REPLAY_ROOT, case.task, case.cassette,
+    A new destination per measurement prevents reuse of a mutated task tree.
+    """
+    restore(source, destination)
+    if fingerprint(destination) != expected:
+        raise RuntimeError(f"restored task data differs from source: {destination}")
+
+def check_storage(case: ReplayCase, target: Path, cases_file: Path) -> None:
+    """Inputs, tools and the cases file must stay outside the measured target."""
+    target = target.resolve()
+    for path in (cases_file, REPLAY_ROOT, case.task, case.cassette,
                  *(mount.source for mount in case.mounts)):
+        path = path.resolve()
         if path.is_relative_to(target) or target.is_relative_to(path):
             raise ValueError(f"replay inputs and tools must be outside target: {path}")
 
+def check_consistent(entries: list[dict]) -> None:
+    """Every machine must fingerprint the same tools and inputs."""
+    for entry in entries[1:]:
+        if entry["facts"] != entries[0]["facts"]:
+            raise ValueError("replay tools or inputs differ between machines: "
+                             f"{entries[0]['node']} and {entry['node']}")
 
-def run(ctx: RunContext, args: argparse.Namespace) -> None:
-    if sys.platform != "linux":
-        raise RuntimeError("agent-replay measurements require Linux and a local Docker daemon")
-    cases = load_cases(Path(args.cases_file).expanduser().resolve())
+def node_facts(t: cluster.Task, cases: list[ReplayCase], cases_file: Path) -> dict:
+    """Check this machine once and fingerprint every input its tasks reuse."""
     executable = REPLAY_ROOT / ".venv" / "bin" / "agent-mitm-replay"
-    if not executable.is_file():
-        raise RuntimeError("initialize the submodule, then run uv sync --locked "
-                           "--project third_party/agent-mitm-replay on the measurement host")
     for case in cases:
-        check_storage(case, ctx.target.path.resolve())
+        check_storage(case, t.target.path, cases_file)
+        for path in (case.task, case.cassette, *(mount.source for mount in case.mounts)):
+            if not path.exists():
+                raise RuntimeError(f"{t.node}: replay input is missing on this machine: {path}")
+    if not executable.is_file():
+        raise RuntimeError(f"{t.node}: initialize the submodule, then run uv sync --locked "
+                           f"--project {REPLAY_ROOT}")
     version_command = [str(executable.with_name("python")), "-c",
                        "import importlib.metadata as m, json, platform; "
                        "print(json.dumps({'python': platform.python_version(), "
                        "'harbor': m.version('harbor'), 'mitmproxy': m.version('mitmproxy')}))"]
     versions = subprocess.run(version_command, capture_output=True, text=True)
     if versions.returncode:
-        raise RuntimeError(f"cannot inspect replay environment: {versions.stderr.strip()}")
+        raise RuntimeError(f"{t.node}: cannot inspect replay environment: "
+                           f"{versions.stderr.strip()}")
     tool_versions = json.loads(versions.stdout)
     replay_paths = [REPLAY_ROOT / name for name in
                     ("pyproject.toml", "uv.lock", "uv.toml", ".python-version")]
     replay_paths += sorted((REPLAY_ROOT / "src").rglob("*.py"))
-    replay_digest = fingerprint(REPLAY_ROOT, replay_paths)
-    ctx.info["replay"] = {"tool_versions": tool_versions, "source_sha256": replay_digest}
-    ctx.info["cases"] = {}
+    facts = {"replay": {"tool_versions": tool_versions,
+                        "source_sha256": fingerprint(REPLAY_ROOT, replay_paths)},
+             "cases": {}}
     for case in cases:
         cassette_paths = [case.cassette / name for name in
-                          ("flows.mitm", "manifest.json", "commands.json", "task.toml", "validation.json")]
+                          ("flows.mitm", "manifest.json", "commands.json", "task.toml",
+                           "validation.json")]
         environment = case.cassette / "environment"
         if environment.exists():
             cassette_paths += [environment, *environment.rglob("*")]
         manifest = json.loads((case.cassette / "manifest.json").read_text())
-        expected = {mount.container: fingerprint(mount.source) for mount in case.mounts}
-        ctx.info["cases"][case.name] = {
+        facts["cases"][case.name] = {
             "model": manifest["model"],
             "task_sha256": fingerprint(case.task),
             "cassette_sha256": fingerprint(case.cassette, cassette_paths),
-            "mounts": [{"container": mount.container, "initial_sha256": expected[mount.container]}
+            "mounts": [{"container": mount.container,
+                        "initial_sha256": fingerprint(mount.source)}
                        for mount in case.mounts],
         }
-        work = ctx.work_dir / case.name
-        results = ctx.result_dir / case.name
-        work.mkdir()
-        results.mkdir()
-        for repeat in range(1, args.repeats + 1):
-            directory = work / f"repeat-{repeat}"
-            directory.mkdir()
-            output = results / f"repeat-{repeat}"
-            command = [str(executable), "replay", "--task", str(case.task),
-                       "--cassette", str(case.cassette), "--output", str(output)]
-            for index, mount in enumerate(case.mounts):
-                destination = directory / f"mount-{index}"
-                restore(mount.source, destination)
-                if fingerprint(destination) != expected[mount.container]:
-                    raise RuntimeError(f"restored task data differs from source: {destination}")
-                command += ["--mount", f"{destination}:{mount.container}"]
-            log = results / f"repeat-{repeat}.log"
-            with log.open("x") as handle:
-                process = subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT)
-            if process.returncode:
-                raise RuntimeError(f"agent replay failed; inspect {log} and {output}")
-            summary = json.loads((output / "summary.json").read_text())
-            if summary["mode"] != "replay" or summary["checked"] or not summary["measured"]:
-                raise ValueError(f"not a measured replay: {output}")
-            ctx.emit("replays", {"case": case.name, "repeat": repeat},
-                     {"elapsed_s": summary["elapsed_sec"],
-                      "model_requests": summary["model_requests"]})
-            for phase, seconds in summary["phase_seconds"].items():
-                if seconds is not None:
-                    ctx.emit("phases", {"case": case.name, "repeat": repeat, "phase": phase},
-                             {"seconds": seconds})
+    return facts
+
+def measurements(summary: dict, output: Path) -> dict:
+    """The measured values of one replay summary; reject record/validate output."""
+    if summary["mode"] != "replay" or summary["checked"] or not summary["measured"]:
+        raise ValueError(f"not a measured replay: {output}")
+    return {"elapsed_s": summary["elapsed_sec"],
+            "model_requests": summary["model_requests"],
+            "phases": {phase: seconds for phase, seconds in summary["phase_seconds"].items()
+                       if seconds is not None}}
+
+def replay_once(t: cluster.Task, case: ReplayCase, repeat: int,
+                expected: dict[str, str]) -> dict:
+    """One task's independent replay of one case and repeat."""
+    directory = t.task_dir / case.name / f"repeat-{repeat}"
+    directory.mkdir(parents=True)
+    diagnostics = t.log_dir / f"task-{t.local_index:04d}" / case.name
+    diagnostics.mkdir(parents=True, exist_ok=True)
+    output = diagnostics / f"repeat-{repeat}"
+    log = diagnostics / f"repeat-{repeat}.log"
+    command = [str(REPLAY_ROOT / ".venv" / "bin" / "agent-mitm-replay"), "replay",
+               "--task", str(case.task), "--cassette", str(case.cassette),
+               "--output", str(output)]
+    for index, mount in enumerate(case.mounts):
+        destination = directory / f"mount-{index}"
+        restore_verified(mount.source, destination, expected[mount.container])
+        command += ["--mount", f"{destination}:{mount.container}"]
+    with log.open("x") as handle:
+        process = subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT)
+    if process.returncode:
+        raise RuntimeError(f"{t.node}: agent replay failed; inspect {log} and {output}")
+    summary = json.loads((output / "summary.json").read_text())
+    return measurements(summary, output)
+
+def run(ctx: RunContext, args: argparse.Namespace) -> None:
+    if sys.platform != "linux":
+        raise RuntimeError("agent-replay measurements require Linux and a local Docker daemon")
+    if type(args.repeats) is not int or args.repeats < 1:
+        raise ValueError(f"repeats must be a positive integer: {args.repeats!r}")
+    cluster.run_tasks(ctx, args)
+
+def task(t: cluster.Task) -> None:
+    cases_file = cases_path(t.args.cases_file)
+    cases = load_cases(cases_file)
+    names = t.gather([case.name for case in cases])
+    if t.index == 0 and any(entry != names[0] for entry in names):
+        raise RuntimeError(f"every machine must list the same replay cases: {names}")
+    facts = node_facts(t, cases, cases_file) if t.leader else None
+    facts = t.node_comm.bcast(facts, root=0)
+    t.node_info(facts if t.leader else None)
+    t.node_barrier()
+    entries = t.gather({"node": t.node, "facts": facts} if t.leader else None)
+    if t.index == 0:
+        check_consistent([entry for entry in entries if entry is not None])
+    hosts = t.gather(t.node)
+    for case in cases:
+        expected = {mount["container"]: mount["initial_sha256"]
+                    for mount in facts["cases"][case.name]["mounts"]}
+        for repeat in range(1, t.args.repeats + 1):
+            wall, results = t.batch(replay_once, case, repeat, expected)
+            if t.index != 0:
+                continue
+            for sample, result in enumerate(results):
+                keys = {"case": case.name, "tasks": t.count, "repeat": repeat,
+                        "sample": sample, "host": hosts[sample]}
+                t.emit("replays", keys,
+                       {"elapsed_s": result["elapsed_s"],
+                        "model_requests": result["model_requests"]})
+                for phase, seconds in result["phases"].items():
+                    t.emit("phases", {**keys, "phase": phase}, {"seconds": seconds})
+            t.log(f"[{t.target.name}/{case.name}] repeat {repeat}: {t.count} task(s), "
+                  f"wall={wall:.3f}s")

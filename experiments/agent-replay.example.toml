@@ -1,16 +1,20 @@
-# Copy to local/agent-replay.toml. Paths are relative to that file, or absolute.
-# Keep tasks, cassettes and initial data on the local control disk, outside targets.
-# Only accepted cassettes (record -> validate once) are used for measurements.
-# repeats is configured in agent_fs_bench/benchmarks/agent_replay.py, not here.
+# Copy to local/agent-replay.toml in EVERY machine's checkout; each machine reads
+# its own copy, and every path below must exist on every machine. Paths are
+# relative to this file, or absolute. Keep tasks, cassettes and initial data on a
+# local disk of that machine, outside the measured targets. Docker images must
+# already be present there. Only accepted cassettes (record -> validate once) are
+# used for measurements.
+# tasks, cpus_per_task, oversubscribe and repeats are configured in
+# agent_fs_bench/benchmarks/agent_replay.py, not here.
 
 [[cases]]
 name = "task-a"
 task = "replay/task-a"
 cassette = "replay/cassettes/task-a"
 
-# Restore a fresh copy of each source directory before EVERY measured replay.
-# Include hidden files (.git), modes and links; bind mounts hide image contents.
-# These container paths must match record/validate, and must not overlap.
+# Each task restores a fresh copy of every source directory before EVERY measured
+# replay. Include hidden files (.git), modes and links; bind mounts hide image
+# contents. These container paths must match record/validate, and must not overlap.
 [[cases.mounts]]
 source = "replay/initial/task-a"
 container = "/app"

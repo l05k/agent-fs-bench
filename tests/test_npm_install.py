@@ -1,15 +1,13 @@
-import hashlib
 import os
 from pathlib import Path
-import shutil
-import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
 from agent_fs_bench.benchmarks import npm_install as bench
-from agent_fs_bench.results import RunContext, Tables, read_table
-from agent_fs_bench.targets import Target
+from agent_fs_bench.benchmarks import npm_install_nofsync
+
 
 class DurabilityTests(unittest.TestCase):
     def test_project_flush_persists_parent_without_following_symlinks(self):
@@ -91,320 +89,126 @@ class ConcurrencyEnvTests(unittest.TestCase):
         self.assertEqual(env['RAYON_NUM_THREADS'], '4')
         self.assertNotIn('UV_THREADPOOL_SIZE', env)
 
-
-class InstallBatchTests(unittest.TestCase):
-    def test_independent_install_workers_overlap_and_report_durable_completion(self):
+    def test_manager_env_keeps_home_and_tmp_inside_the_sandbox(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            jobs = []
-            for index in range(2):
-                project = root / f'project-{index}'
-                project.mkdir()
-                program = (
-                    'from pathlib import Path; import sys, time\n'
-                    'root, project, index = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]\n'
-                    '(root / ("ready-" + index)).touch()\n'
-                    'deadline = time.monotonic() + 10\n'
-                    'while not all((root / ("ready-" + str(i))).exists() for i in range(2)):\n'
-                    '    if time.monotonic() >= deadline: raise RuntimeError("workers ran serially")\n'
-                    '    time.sleep(0.01)\n'
-                    '(project / "node_modules").mkdir()\n'
-                    '(project / "node_modules" / "payload").write_text(index)\n'
-                )
-                jobs.append({
-                    'project': project, 'log': root / f'worker-{index}.log',
-                    'command': [sys.executable, '-c', program, str(root), str(project), str(index)],
-                    'env': os.environ.copy(), 'flush': True,
-                })
-            tasks = bench.run_workers(jobs)
-            for index, task in enumerate(tasks):
-                payload = jobs[index]['project'] / 'node_modules' / 'payload'
-                self.assertEqual(payload.read_text(), str(index))
-                self.assertAlmostEqual(task['durable_s'], task['install_s'] + task['flush_s'])
-                self.assertGreaterEqual(task['start_offset_s'], 0)
-                self.assertEqual(task['task'], index + 1)
+            sandbox = Path(directory) / 'sandbox'
+            env = bench.manager_env('npm', 4, sandbox)
+            home = str((sandbox / 'home').resolve())
+            temporary = str((sandbox / 'tmp').resolve())
+        self.assertEqual(env['HOME'], home)
+        self.assertEqual(env['TMPDIR'], temporary)
+        self.assertEqual(env['NPM_CONFIG_USERCONFIG'], str(sandbox / 'user.npmrc'))
 
-    def test_failed_install_aborts_batch_instead_of_reporting_throughput(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            jobs = [{
-                'project': root, 'log': root / 'failure.log',
-                'command': [sys.executable, '-c', 'import sys; sys.exit(23)'],
-                'env': os.environ.copy(), 'flush': True,
-            }]
-            with self.assertRaisesRegex(bench.BenchError, 'install exited 23'):
-                bench.run_workers(jobs)
 
-    def test_throughput_uses_batch_span_including_start_offsets(self):
-        tasks = [
-            {'start_offset_s': 0.0, 'install_s': 2.0, 'flush_s': 1.0,
-             'durable_s': 3.0, 'user_s': 0.4, 'sys_s': 0.2},
-            {'start_offset_s': 0.7, 'install_s': 1.6, 'flush_s': 0.2,
-             'durable_s': 1.8, 'user_s': 0.3, 'sys_s': 0.1},
+class CommandTests(unittest.TestCase):
+    def test_npm_replays_the_committed_lockfile_offline(self):
+        self.assertEqual(
+            bench.install_command('npm', '/usr/bin/npm', Path('/prep/source'), True),
+            ['/usr/bin/npm', 'ci', '--offline', '--cache', '/prep/source/cache',
+             '--legacy-peer-deps', '--no-audit', '--no-fund', '--no-update-notifier',
+             '--ignore-scripts'])
+
+    def test_pnpm_reads_only_the_copied_store_and_cache(self):
+        self.assertEqual(
+            bench.install_command('pnpm', '/usr/bin/pnpm', Path('/prep/source'), True),
+            ['/usr/bin/pnpm', 'install', '--offline', '--frozen-lockfile',
+             '--store-dir', '/prep/source/store', '--cache-dir', '/prep/source/cache',
+             '--package-import-method=copy',
+             '--config.enable-global-virtual-store=false', '--reporter=append-only',
+             '--ignore-scripts'])
+
+    def test_lifecycle_scripts_run_only_when_the_experiment_asks(self):
+        self.assertNotIn(
+            '--ignore-scripts',
+            bench.install_command('npm', 'npm', Path('/prep/source'), False))
+        self.assertNotIn(
+            '--ignore-scripts',
+            bench.install_command('pnpm', 'pnpm', Path('/prep/source'), False))
+
+
+class BatchMetricTests(unittest.TestCase):
+    TREES = [
+        {'files': 3, 'dirs': 1, 'symlinks': 0, 'hardlinks': 0,
+         'logical_bytes': 10, 'allocated_bytes': 10, 'du_kib': 1},
+        {'files': 5, 'dirs': 2, 'symlinks': 1, 'hardlinks': 0,
+         'logical_bytes': 20, 'allocated_bytes': 20, 'du_kib': 2},
+    ]
+
+    def test_durable_batch_takes_the_barrier_wall_and_the_slowest_install(self):
+        samples = [
+            {'host': 'local', 'install_s': 2.0, 'flush_s': 1.0, 'durable_s': 3.0,
+             'user_s': 0.4, 'sys_s': 0.2},
+            {'host': 'node-b', 'install_s': 1.6, 'flush_s': 0.2, 'durable_s': 1.8,
+             'user_s': 0.3, 'sys_s': 0.1},
         ]
-        result = bench.batch_metrics(tasks, [{'files': 3}, {'files': 5}])
-        self.assertEqual(result['batch_install_s'], 2.3)
-        self.assertEqual(result['batch_durable_s'], 3.0)
-        self.assertEqual(result['install_mean_s'], 1.8)
-        self.assertEqual(result['durable_mean_s'], 2.4)
-        self.assertAlmostEqual(result['installs_per_s'], 2 / 2.3, places=6)
-        self.assertAlmostEqual(result['durable_installs_per_s'], 2 / 3.0, places=6)
-        self.assertEqual(result['files'], 8)
-
-class NoFlushTests(unittest.TestCase):
-    def make_batch(self, root, flush):
-        target = root / 'target'
-        work = target / 'agent-fs-bench' / 'npm-install-nofsync' / 'run'
-        work.mkdir(parents=True)
-        result = root / 'results'
-        (result / 'logs').mkdir(parents=True)
-        source = root / 'source' / 'cache'
-        source.mkdir(parents=True)
-        (source / 'payload').write_bytes(b'cache')
-        template = root / 'template'
-        template.mkdir()
-        (template / 'package.json').write_text('{"name":"fixture"}')
-        (template / 'package-lock.json').write_text('{}')
-        prep = root / 'prep'
-        prep.mkdir()
-        fake = root / 'fake-npm'
-        fake.write_text('#!/bin/sh\nmkdir -p node_modules/pkg\n'
-                        'printf "module.exports = 1;\\n" > node_modules/pkg/index.js\n')
-        fake.chmod(0o755)
-        ctx = RunContext('npm-install-nofsync', 'run', Target('t', target),
-                         work, result, Tables(result))
-        args = bench.parse_args([], {
-            **bench.CONFIG, 'flush': flush, 'concurrency': 0,
-        })
-        return ctx, args, str(fake), source, template, prep
-
-    def test_run_batch_without_flush_never_syncs(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            ctx, args, fake, source, template, prep = self.make_batch(root, False)
-            with mock.patch.object(bench, 'sync_filesystem') as sync_filesystem, \
-                    mock.patch.object(bench, 'fsync_tree') as fsync_tree, \
-                    mock.patch.object(bench, 'fsync_path') as fsync_path:
-                metrics, tasks = bench.run_batch(
-                    ctx, args, 'npm', fake, source, template, prep, 1, 1)
-            sync_filesystem.assert_not_called()
-            fsync_tree.assert_not_called()
-            fsync_path.assert_not_called()
-            self.assertIn('install_mean_s', metrics)
-            self.assertNotIn('durable_mean_s', metrics)
-            self.assertNotIn('flush_s', tasks[0])
-
-    def test_run_batch_with_flush_syncs_before_and_after(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            ctx, args, fake, source, template, prep = self.make_batch(root, True)
-            with mock.patch.object(bench, 'sync_filesystem') as sync_filesystem, \
-                    mock.patch.object(bench, 'fsync_tree') as fsync_tree, \
-                    mock.patch.object(bench, 'fsync_path') as fsync_path:
-                metrics, tasks = bench.run_batch(
-                    ctx, args, 'npm', fake, source, template, prep, 1, 1)
-            self.assertEqual(sync_filesystem.call_count, 2)
-            self.assertEqual(fsync_tree.call_count, 1)
-            self.assertTrue(fsync_path.called)
-            self.assertIn('durable_mean_s', metrics)
-            self.assertIn('flush_s', tasks[0])
-
-    def test_placement_is_enforced_without_flush(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            ctx, args, fake, source, template, prep = self.make_batch(root, False)
-            ctx.work_dir = root / 'outside-target'
-            with self.assertRaisesRegex(bench.BenchError, 'outside the measured target'):
-                bench.run_batch(ctx, args, 'npm', fake, source, template, prep, 1, 1)
-
-    def test_seeding_sync_is_skipped_without_flush(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / 'target'
-            target.mkdir()
-            prep_root = root / 'prep'
-            prep_root.mkdir()
-            result = root / 'results'
-            result.mkdir()
-            ctx = RunContext('npm-install-nofsync', 'run', Target('t', target),
-                             target / 'work', result, Tables(result))
-
-            def seed(binary, cache, seed_dir, template, fixture, ignore, concurrency):
-                (template / 'package.json').write_text('{"name":"fixture"}')
-                (template / 'package-lock.json').write_text('{}')
-
-            actual_is_file = Path.is_file
-
-            def mountinfo_only(path):
-                return True if str(path) == '/proc/self/mountinfo' else actual_is_file(path)
-
-            for flush in (False, True):
-                args = bench.parse_args([], {
-                    **bench.CONFIG, 'pm': 'npm', 'runs': 1, 'flush': flush,
-                    'prep_dir': str(prep_root), 'seed_only': True,
-                })
-                with mock.patch.object(Path, 'is_file', mountinfo_only), \
-                        mock.patch.object(bench, 'check_placement',
-                                          return_value=('ext4', 'tmpfs')), \
-                        mock.patch.object(bench, 'checked_tools',
-                                          return_value=({'npm': '/fake/npm'},
-                                                        {'npm': '1', 'node': '1'})), \
-                        mock.patch.object(bench, 'fixture_dir_for', return_value=root), \
-                        mock.patch.object(bench, 'seed_npm_fixture', side_effect=seed), \
-                        mock.patch.object(bench.os, 'sched_getaffinity',
-                                          return_value={0, 1, 2, 3}, create=True), \
-                        mock.patch.object(bench, 'sync_filesystem') as sync_filesystem:
-                    bench.run(ctx, args)
-                if flush:
-                    self.assertEqual(sync_filesystem.call_count, 1)
-                else:
-                    sync_filesystem.assert_not_called()
-                self.assertEqual(ctx.info['target_fstype'], 'ext4')
-                self.assertEqual(ctx.info['prep_fstype'], 'tmpfs')
-                shutil.rmtree(prep_root / 'agent-fs-bench')
-
-    def test_batch_metrics_omit_flush_and_durable_phases(self):
-        tasks = [
-            {'start_offset_s': 0.0, 'install_s': 2.0, 'user_s': 0.4, 'sys_s': 0.2},
-            {'start_offset_s': 0.5, 'install_s': 1.0, 'user_s': 0.3, 'sys_s': 0.1},
-        ]
-        result = bench.batch_metrics(tasks, [{'files': 1}], flush=False)
+        result = bench.batch_metrics(samples, self.TREES, wall=3.4)
         self.assertEqual(result['batch_install_s'], 2.0)
-        self.assertEqual(result['install_mean_s'], 1.5)
+        self.assertEqual(result['batch_durable_s'], 3.4)
+        self.assertEqual(result['install_mean_s'], 1.8)
+        self.assertEqual(result['flush_mean_s'], 0.6)
+        self.assertEqual(result['durable_mean_s'], 2.4)
+        self.assertAlmostEqual(result['installs_per_s'], 1.0, places=6)
+        self.assertAlmostEqual(result['durable_installs_per_s'], 2 / 3.4, places=6)
         self.assertEqual(result['user_s'], 0.7)
         self.assertEqual(result['sys_s'], 0.3)
+        self.assertEqual(result['files'], 8)
+        self.assertEqual(result['dirs'], 3)
+        self.assertEqual(result['du_kib'], 3)
+
+    def test_install_only_batch_has_no_flush_or_durable_columns(self):
+        samples = [
+            {'host': 'local', 'install_s': 2.0, 'user_s': 0.4, 'sys_s': 0.2},
+            {'host': 'node-b', 'install_s': 1.0, 'user_s': 0.3, 'sys_s': 0.1},
+        ]
+        result = bench.batch_metrics(samples, self.TREES, wall=2.2, flush=False)
+        self.assertEqual(result['batch_install_s'], 2.0)
+        self.assertEqual(result['install_mean_s'], 1.5)
         self.assertAlmostEqual(result['installs_per_s'], 1.0, places=6)
+        self.assertEqual(result['user_s'], 0.7)
+        self.assertEqual(result['files'], 8)
         for key in ('flush_mean_s', 'durable_mean_s',
                     'batch_durable_s', 'durable_installs_per_s'):
             self.assertNotIn(key, result)
 
-    def test_noflush_worker_skips_fsync_and_durable_keys(self):
+    def test_one_task_batch_is_its_own_install(self):
+        samples = [{'host': 'local', 'install_s': 2.5, 'flush_s': 0.5,
+                    'durable_s': 3.0, 'user_s': 1.0, 'sys_s': 0.5}]
+        result = bench.batch_metrics(samples, self.TREES[:1], wall=3.1)
+        self.assertEqual(result['batch_install_s'], 2.5)
+        self.assertEqual(result['batch_durable_s'], 3.1)
+        self.assertAlmostEqual(result['durable_installs_per_s'], 1 / 3.1, places=6)
+
+    def test_install_rows_drop_the_removed_start_offset(self):
+        sample = {'host': 'node-b', 'install_s': 2.0, 'flush_s': 0.5, 'durable_s': 2.5,
+                  'user_s': 0.4, 'sys_s': 0.2}
+        self.assertEqual(list(bench.install_metrics(sample, True)),
+                         ['install_s', 'flush_s', 'durable_s', 'user_s', 'sys_s'])
+        self.assertEqual(list(bench.install_metrics(sample, False)),
+                         ['install_s', 'user_s', 'sys_s'])
+
+
+class TreeMetricTests(unittest.TestCase):
+    def test_inventory_counts_links_without_following_them(self):
         with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory)
-            (project / 'payload').write_bytes(b'data')
-            connection = mock.MagicMock()
-            with mock.patch.object(bench, 'fsync_tree') as fsync_tree:
-                bench.install_worker(
-                    [sys.executable, '-c', 'pass'], project,
-                    project / 'worker.log', os.environ.copy(),
-                    mock.MagicMock(), connection, False,
-                )
-            fsync_tree.assert_not_called()
-            sample = connection.send.call_args.args[0]
-            self.assertIn('install_s', sample)
-            self.assertNotIn('flush_s', sample)
-            self.assertNotIn('durable_s', sample)
+            node_modules = Path(directory) / 'node_modules'
+            package = node_modules / 'pkg'
+            package.mkdir(parents=True)
+            payload = package / 'index.js'
+            payload.write_text('module.exports = 1;\n')
+            (package / 'alias').symlink_to('index.js')
+            (package / 'hard').hardlink_to(payload)
+            size = payload.stat().st_size
+            metrics = bench.tree_metrics(node_modules)
+        self.assertEqual(metrics['dirs'], 2)
+        self.assertEqual(metrics['files'], 2)
+        self.assertEqual(metrics['symlinks'], 1)
+        self.assertEqual(metrics['hardlinks'], 2)
+        self.assertEqual(metrics['logical_bytes'], 2 * size)
+        self.assertGreater(metrics['du_kib'], 0)
 
-    def test_nofsync_workload_exposes_flush_off(self):
-        from agent_fs_bench.benchmarks import npm_install_nofsync
-        self.assertFalse(npm_install_nofsync.CONFIG['flush'])
-        self.assertFalse(npm_install_nofsync.parse_args([]).flush)
-        self.assertTrue(bench.parse_args([]).flush)
-
-class TableTests(unittest.TestCase):
-    def run_workload(self, root, ctx, args, metrics, tasks):
-        def seed(binary, cache, seed_dir, template, fixture, ignore, concurrency):
-            (template / 'package.json').write_text('{"name":"fixture"}')
-            (template / 'package-lock.json').write_text('{}')
-
-        actual_is_file = Path.is_file
-
-        def mountinfo_only(path):
-            return True if str(path) == '/proc/self/mountinfo' else actual_is_file(path)
-
-        with mock.patch.object(Path, 'is_file', mountinfo_only), \
-                mock.patch.object(bench, 'check_placement', return_value=('ext4', 'tmpfs')), \
-                mock.patch.object(bench, 'checked_tools',
-                                  return_value=({'npm': '/fake/npm'},
-                                                {'npm': '1', 'node': '1'})), \
-                mock.patch.object(bench, 'fixture_dir_for', return_value=root), \
-                mock.patch.object(bench, 'seed_npm_fixture', side_effect=seed), \
-                mock.patch.object(bench.os, 'sched_getaffinity',
-                                  return_value={0, 1, 2, 3}, create=True), \
-                mock.patch.object(bench, 'run_batch', return_value=(metrics, tasks)):
-            bench.run(ctx, args)
-
-    def make_context(self, root, prep_root):
-        target = root / 'target'
-        target.mkdir()
-        prep_root.mkdir()
-        result = root / 'results'
-        result.mkdir()
-        ctx = RunContext('npm-install', 'run', Target('fs', target),
-                         target / 'work', result, Tables(result))
-        return ctx, result
-
-    def test_run_writes_batch_and_task_rows_and_discovered_info(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            ctx, result = self.make_context(root, root / 'prep')
-            args = bench.parse_args([], {
-                **bench.CONFIG, 'pm': 'npm', 'runs': 2, 'concurrent_jobs': [1, 2],
-                'prep_dir': str(root / 'prep'),
-            })
-            metrics = {
-                'install_mean_s': 1.0, 'flush_mean_s': 0.5, 'durable_mean_s': 1.5,
-                'batch_install_s': 1.0, 'batch_durable_s': 1.5, 'installs_per_s': 1.0,
-                'durable_installs_per_s': 0.5, 'user_s': 0.4, 'sys_s': 0.2,
-                'files': 3, 'dirs': 1, 'symlinks': 0, 'hardlinks': 0,
-                'logical_bytes': 10, 'allocated_bytes': 10, 'du_kib': 1,
-            }
-            tasks = [{'task': 1, 'install_s': 1.0, 'flush_s': 0.5, 'durable_s': 1.5,
-                      'user_s': 0.4, 'sys_s': 0.2, 'start_offset_s': 0.0}]
-            self.run_workload(root, ctx, args, metrics, tasks)
-            ctx.tables.close()
-
-            batches = read_table(result / 'batches.csv')
-            self.assertEqual(
-                {(row['manager'], row['concurrent_jobs'], row['repeat']) for row in batches},
-                {('npm', '1', '1'), ('npm', '1', '2'), ('npm', '2', '1'), ('npm', '2', '2')})
-            self.assertEqual(float(batches[0]['install_mean_s']), 1.0)
-            self.assertEqual(float(batches[0]['du_kib']), 1.0)
-            samples = read_table(result / 'tasks.csv')
-            self.assertEqual(len(samples), 4)
-            self.assertEqual({row['sample'] for row in samples}, {'1'})
-            self.assertEqual(float(samples[0]['durable_s']), 1.5)
-            self.assertEqual(float(samples[0]['start_offset_s']), 0.0)
-            self.assertEqual(ctx.info['target_fstype'], 'ext4')
-            self.assertEqual(ctx.info['prep_fstype'], 'tmpfs')
-            self.assertEqual(ctx.info['tool_versions'], {'npm': {'node': '1', 'npm': '1'}})
-            self.assertEqual(ctx.info['seed_input_sha256'], {
-                'npm': {'package.json': hashlib.sha256(b'{"name":"fixture"}').hexdigest(),
-                        'package-lock.json': hashlib.sha256(b'{}').hexdigest()},
-            })
-            self.assertIn('cpu_count', ctx.info)
-            self.assertFalse((root / 'prep' / 'agent-fs-bench' / 'npm-install'
-                              / 'run' / 'fs').exists())
-
-    def test_without_flush_task_rows_omit_durable_columns(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            ctx, result = self.make_context(root, root / 'prep')
-            args = bench.parse_args([], {
-                **bench.CONFIG, 'pm': 'npm', 'runs': 1, 'flush': False,
-                'prep_dir': str(root / 'prep'),
-            })
-            metrics = {
-                'install_mean_s': 1.0, 'batch_install_s': 1.0, 'installs_per_s': 1.0,
-                'user_s': 0.4, 'sys_s': 0.2, 'files': 3, 'dirs': 1, 'symlinks': 0,
-                'hardlinks': 0, 'logical_bytes': 10, 'allocated_bytes': 10, 'du_kib': 1,
-            }
-            tasks = [{'task': 1, 'install_s': 1.0, 'user_s': 0.4, 'sys_s': 0.2,
-                      'start_offset_s': 0.0}]
-            self.run_workload(root, ctx, args, metrics, tasks)
-            ctx.tables.close()
-
-            batch_row = read_table(result / 'batches.csv')[0]
-            task_row = read_table(result / 'tasks.csv')[0]
-            for column in ('flush_mean_s', 'durable_mean_s', 'batch_durable_s',
-                           'durable_installs_per_s'):
-                self.assertNotIn(column, batch_row)
-            for column in ('flush_s', 'durable_s'):
-                self.assertNotIn(column, task_row)
-            self.assertEqual(float(task_row['install_s']), 1.0)
 
 class PlacementTests(unittest.TestCase):
-    def test_placement_accepts_path_objects_from_run(self):
+    def test_same_device_and_type_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target, prep = root / 'target', root / 'prep'
@@ -419,11 +223,64 @@ class PlacementTests(unittest.TestCase):
                 with self.assertRaisesRegex(bench.BenchError, 'different device'):
                     bench.check_placement(target, prep)
 
-class ParseArgsTests(unittest.TestCase):
-    def test_duplicate_or_nonpositive_batch_sizes_are_rejected(self):
-        for jobs in ([2, 2], [0], [1, -1]):
-            with self.subTest(jobs=jobs), self.assertRaises(bench.BenchError):
-                bench.parse_args([], {**bench.CONFIG, 'concurrent_jobs': jobs})
+    def test_non_local_preparation_filesystem_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target, prep = root / 'target', root / 'prep'
+            target.mkdir()
+            prep.mkdir()
+            prep_resolved = prep.resolve()
+
+            def fake_fstype(path):
+                return 'nfs' if path.resolve() == prep_resolved else 'ext4'
+
+            with mock.patch.object(bench, 'fstype', side_effect=fake_fstype):
+                with self.assertRaisesRegex(bench.BenchError, 'local filesystem'):
+                    bench.check_placement(target, prep)
+
+    def test_separate_device_and_type_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target, prep = root / 'target', root / 'prep'
+            target.mkdir()
+            prep.mkdir()
+            prep_resolved = prep.resolve()
+
+            def fake_fstype(path):
+                return 'tmpfs' if path.resolve() == prep_resolved else 'ext4'
+
+            def fake_stat(self, *args, **kwargs):
+                # os.path.realpath, not Path.resolve: resolve() calls stat() itself.
+                return types.SimpleNamespace(
+                    st_dev=2 if os.path.realpath(self) == str(prep_resolved) else 1)
+
+            with mock.patch.object(bench, 'fstype', side_effect=fake_fstype), \
+                    mock.patch.object(Path, 'stat', fake_stat):
+                self.assertEqual(bench.check_placement(target, prep), ('ext4', 'tmpfs'))
+
+    def test_project_outside_the_target_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / 'target'
+            (target / 'project').mkdir(parents=True)
+            with self.assertRaisesRegex(bench.BenchError, 'outside the measured target'):
+                bench.check_project_placement(root / 'project', target)
+            bench.check_project_placement(target / 'project', target)
+
+
+class ConfigTests(unittest.TestCase):
+    def test_a_sweep_over_managers_is_rejected(self):
+        with self.assertRaisesRegex(bench.BenchError, 'pm must be one of'):
+            bench.parse_args([], {**bench.CONFIG, 'pm': 'both'})
+
+    def test_repeats_must_be_positive(self):
+        with self.assertRaisesRegex(bench.BenchError, 'repeats must be a positive integer'):
+            bench.parse_args([], {**bench.CONFIG, 'repeats': 0})
+
+    def test_nofsync_workload_exposes_flush_off(self):
+        self.assertFalse(npm_install_nofsync.parse_args([]).flush)
+        self.assertTrue(bench.parse_args([]).flush)
+
 
 if __name__ == '__main__':
     unittest.main()

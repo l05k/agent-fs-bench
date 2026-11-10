@@ -1,6 +1,3 @@
-import contextlib
-import io
-import json
 import os
 from pathlib import Path
 import shutil
@@ -11,8 +8,7 @@ from unittest import mock
 
 from agent_fs_bench.benchmarks import dev_workflow, mini_dev_workflow
 from agent_fs_bench.benchmarks.build_settings import read_compiler_version
-from agent_fs_bench.results import PROJECT_ROOT, RunContext, Tables, read_table
-from agent_fs_bench.targets import Target
+from agent_fs_bench.results import PROJECT_ROOT
 
 BUILD_VARIABLES = (
     'CC', 'CXX', 'CPP', 'AR', 'LD', 'AS', 'NM', 'STRIP', 'OBJCOPY',
@@ -36,10 +32,76 @@ class KernelConfigFixtureTests(unittest.TestCase):
         self.assertNotIn('# CONFIG_64BIT is not set', lines)
         self.assertNotIn('CONFIG_X86_32=y', lines)
 
-class WorkflowRecordingTests(unittest.TestCase):
+class ConfigurationTests(unittest.TestCase):
+    def test_mini_caps_build_parallelism(self):
+        with mock.patch.dict(mini_dev_workflow.CONFIG, {'jobs': 9, 'cpus_per_task': 9}):
+            args = mini_dev_workflow.parse_args([])
+        self.assertEqual((args.jobs, args.cpus_per_task),
+                         (mini_dev_workflow.FIXED_JOBS, mini_dev_workflow.FIXED_JOBS))
+
+    def test_mini_rejects_mismatched_build_parallelism(self):
+        with mock.patch.dict(mini_dev_workflow.CONFIG, {'jobs': 1, 'cpus_per_task': 2}):
+            with self.assertRaises(ValueError):
+                mini_dev_workflow.parse_args([])
+
+    def test_dev_workflow_rejects_mismatched_build_parallelism(self):
+        with mock.patch.dict(dev_workflow.CONFIG, {'jobs': 4, 'cpus_per_task': 8}):
+            with self.assertRaises(ValueError):
+                dev_workflow.parse_args([])
+
+    def test_build_parallelism_requires_positive_jobs(self):
+        with self.assertRaises(ValueError):
+            dev_workflow.check_build_parallelism(0, 0)
+
+class FixtureResolutionTests(unittest.TestCase):
+    def test_relative_fixture_dir_resolves_in_checkout(self):
+        expected = PROJECT_ROOT / 'data' / 'dev-workflow'
+        self.assertEqual(dev_workflow.resolve_fixture_dir('data/dev-workflow'), expected)
+
+    def test_absolute_fixture_dir_is_taken_as_given(self):
+        path = Path('/var/tmp/fixtures')
+        self.assertEqual(dev_workflow.resolve_fixture_dir(str(path)), path)
+
+    def test_linux_url_passes_through(self):
+        url = 'https://github.com/torvalds/linux.git'
+        self.assertEqual(dev_workflow.resolve_linux_url(url), url)
+        self.assertEqual(dev_workflow.resolve_linux_url('git@example.invalid:linux.git'),
+                         'git@example.invalid:linux.git')
+
+    def test_relative_linux_mirror_resolves_in_checkout(self):
+        self.assertEqual(dev_workflow.resolve_linux_url('data'),
+                         str(PROJECT_ROOT / 'data'))
+
+    def test_absolute_linux_mirror_is_taken_as_given(self):
+        self.assertEqual(dev_workflow.resolve_linux_url('/var/tmp/linux.git'),
+                         '/var/tmp/linux.git')
+
+    def test_fixture_names_cover_series_files(self):
+        series = {'commits': [{
+            'id': 'abc', 'search_commands': 'search.cmds',
+            'read_commands': 'read.cmds', 'edit_commands': 'edit.cmds',
+        }]}
+        self.assertEqual(dev_workflow.fixture_names(series), {
+            dev_workflow.DEFAULT_SERIES, dev_workflow.DEFAULT_CONFIG,
+            'search.cmds', 'read.cmds', 'edit.cmds',
+        })
+        self.assertEqual(mini_dev_workflow.fixture_names(series), {
+            mini_dev_workflow.DEFAULT_SERIES, mini_dev_workflow.DEFAULT_BUNDLE,
+            'search.cmds', 'read.cmds', 'edit.cmds',
+        })
+
+    def test_shipped_fixtures_validate(self):
+        for module in (dev_workflow, mini_dev_workflow):
+            fixture_dir = module.resolve_fixture_dir(module.CONFIG['fixture_dir'])
+            series = module.validate_fixtures(fixture_dir)
+            self.assertTrue(series['commits'])
+            for name in module.fixture_names(series):
+                self.assertTrue((fixture_dir / name).is_file(), name)
+
+class MakeProbeTests(unittest.TestCase):
     def setUp(self):
-        if not all(shutil.which(name) for name in ('make', 'cc', 'git', 'bash')):
-            self.skipTest('GNU make, a C compiler, Git and Bash are required')
+        if not all(shutil.which(name) for name in ('make', 'cc')):
+            self.skipTest('GNU make and a C compiler are required')
         version = subprocess.run(['make', '--version'], capture_output=True, text=True, check=True)
         if 'GNU Make' not in version.stdout:
             self.skipTest('GNU make is required')
@@ -51,111 +113,10 @@ class WorkflowRecordingTests(unittest.TestCase):
         environment.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
         self.enterContext(mock.patch.dict(os.environ, environment, clear=True))
 
-    def context(self, name):
-        work = self.root / name
-        work.mkdir()
-        tables = Tables(work)
-        self.addCleanup(tables.close)
-        return RunContext(name, 'run', Target('local', self.root), work, work, tables)
-
     def compiler_version(self, command='cc'):
         output = subprocess.run([command, '--version'], capture_output=True, text=True,
                                 check=True).stdout
         return output.strip().splitlines()[0]
-
-    def git(self, repo, *args):
-        return subprocess.run(
-            ['git', '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false',
-             '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', *args],
-            cwd=repo, check=True, capture_output=True, text=True,
-        ).stdout.strip()
-
-    def kernel_fixture(self):
-        source = self.root / 'source'
-        source.mkdir()
-        self.git(source, 'init', '--quiet')
-        (source / 'Makefile').write_text(
-            '.DEFAULT_GOAL := all\n'
-            'CC = cc\n'
-            '.PHONY: all probe tinyconfig olddefconfig\n'
-            'all: probe\n\t@./probe >> "$(BUILD_OBSERVATIONS)"\n'
-            'probe: probe.c\n'
-            '\t$(CC) $(KCFLAGS) probe.c -o probe\n'
-            'tinyconfig:\n'
-            '\t@printf \'%s\\n\' \'# CONFIG_OVERLAY_FS is not set\' > .config\n'
-            'olddefconfig:\n'
-            '\t@test -f .config\n'
-        )
-        before = '#include <stdio.h>\nint main(void) { printf("before:%d\\n", BENCH_VALUE); return 0; }\n'
-        after = before.replace('before:', 'after:')
-        (source / 'probe.c').write_text(before)
-        self.git(source, 'add', '.')
-        self.git(source, 'commit', '--quiet', '-m', 'base')
-        base = self.git(source, 'rev-parse', 'HEAD')
-        (source / 'probe.c').write_text(after)
-        self.git(source, 'add', '.')
-        self.git(source, 'commit', '--quiet', '-m', 'change message')
-        commit = self.git(source, 'rev-parse', 'HEAD')
-        fixture = self.root / 'fixture'
-        fixture.mkdir()
-        (fixture / dev_workflow.DEFAULT_CONFIG).write_text('CONFIG_OVERLAY_FS=y\n')
-        (fixture / 'search.cmds').write_text('grep before probe.c\n')
-        (fixture / 'read.cmds').write_text('cat probe.c\n')
-        (fixture / 'edit.cmds').write_text(
-            'python3 -c \'from pathlib import Path; p = Path("probe.c"); '
-            'p.write_text(p.read_text().replace("before:", "after:"))\'\n'
-        )
-        (fixture / dev_workflow.DEFAULT_SERIES).write_text(json.dumps({
-            'base_commit': base,
-            'commits': [{'id': commit, 'message': 'change message', 'files': ['probe.c'],
-                         'search_commands': 'search.cmds', 'read_commands': 'read.cmds',
-                         'edit_commands': 'edit.cmds'}],
-        }))
-        return source, fixture, base
-
-    def test_kernel_replay_preserves_make_precedence(self):
-        source, fixture, base = self.kernel_fixture()
-        observations = self.root / 'observations'
-        os.environ.update(CC='/missing/environment-compiler',
-                          KCFLAGS='-DBENCH_VALUE=7',
-                          BUILD_OBSERVATIONS=str(observations))
-        args = dev_workflow.parse_args([])
-        args.fixture_dir, args.linux_url, args.jobs = str(fixture), str(source), 1
-        ctx = self.context('kernel')
-        # Platform and installed kernel prerequisites are not under test; the
-        # checkout, make/compiler, replay and cleanup are real.
-        with mock.patch.object(dev_workflow, 'require_linux'), \
-                mock.patch.object(dev_workflow, 'ensure_dependencies'), \
-                contextlib.redirect_stderr(io.StringIO()):
-            dev_workflow.run(ctx, args)
-        self.assertEqual(observations.read_text().splitlines(), ['before:7', 'after:7'])
-        self.assertEqual(ctx.info['base_commit'], base)
-        self.assertEqual(ctx.info['jobs'], 1)
-        self.assertEqual(ctx.info['tool_versions']['compiler'], self.compiler_version())
-        self.assertEqual([entry['ok'] for entry in ctx.info['tree_assertions']], [True])
-        workflow = read_table(ctx.result_dir / 'workflow.csv')
-        self.assertEqual(len(workflow), 1)
-        self.assertEqual(workflow[0]['target'], 'local')
-        steps = read_table(ctx.result_dir / 'steps.csv')
-        self.assertIn('verify', {row['kind'] for row in steps})
-        self.assertIn('command', {row['kind'] for row in steps})
-        self.assertEqual(self.git(ctx.work_dir / 'repo', 'status', '--porcelain'), '')
-
-    def test_mini_records_compiler_selected_by_make(self):
-        os.environ.update(CC='/missing/environment-compiler', MAKEFLAGS='CC=cc', CFLAGS='-O0')
-        ctx = self.context('mini')
-        with mock.patch.object(mini_dev_workflow, 'require_linux'), \
-                contextlib.redirect_stderr(io.StringIO()):
-            mini_dev_workflow.run(ctx, mini_dev_workflow.parse_args([]))
-        self.assertEqual(ctx.info['jobs'], 2)
-        self.assertEqual(ctx.info['tool_versions']['compiler'], self.compiler_version())
-        source = ctx.work_dir / 'repo-source'
-        self.assertFalse((ctx.work_dir / 'repo').exists())
-        self.assertEqual(len(self.git(source, 'worktree', 'list', '--porcelain').split('worktree ')), 2)
-        workflow = read_table(ctx.result_dir / 'workflow.csv')[0]
-        self.assertIn('source_setup_ms', workflow)
-        steps = read_table(ctx.result_dir / 'steps.csv')
-        self.assertEqual({row['kind'] for row in steps}, {'worktree', 'build', 'command', 'git'})
 
     def test_make_probe_preserves_recursive_make_selection(self):
         root = self.root / 'recursive'

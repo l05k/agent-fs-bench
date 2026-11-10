@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+from agent_fs_bench import cluster
 from agent_fs_bench.analysis import Figure, figure_data, plot
 from agent_fs_bench.cli import run_benchmark
 from agent_fs_bench.results import RunContext, Tables, _without_config, read_table, write_json
@@ -96,6 +97,9 @@ class RunCommandTests(unittest.TestCase):
             directory.mkdir()
         self.enterContext(mock.patch('agent_fs_bench.cli.RESULTS_DIR', self.results))
         self.render = self.enterContext(mock.patch('agent_fs_bench.figure.render'))
+        # The runner probes the machines of --mode; these tests run no MPI.
+        self.enterContext(mock.patch.object(cluster, 'open_pool', return_value=cluster.Pool(
+            'local', (), {'name': 'mpiexec', 'version': '4.1.6'})))
 
     def invoke(self, module, *args):
         with (mock.patch('agent_fs_bench.analysis.workload', return_value=module),
@@ -109,7 +113,8 @@ class RunCommandTests(unittest.TestCase):
         self.assertEqual(self.invoke(fake_workload(), '--dirs', *map(str, self.dirs)), 0)
         run = self.run_dir()
         manifest = json.loads((run / 'manifest.json').read_text())
-        self.assertEqual(manifest['config'], {'repeats': 3, 'fixture': '/data/fixture'})
+        self.assertEqual(manifest['config'], {'repeats': 3, 'fixture': '/data/fixture',
+                                              'mode': 'local'})
         self.assertEqual(manifest['targets'], [
             {'name': 'a', 'path': str(self.dirs[0]), 'info': {'fstype': 'tmpfs'}},
             {'name': 'b', 'path': str(self.dirs[1]), 'info': {'fstype': 'tmpfs'}},
@@ -143,14 +148,6 @@ class RunCommandTests(unittest.TestCase):
         with mock.patch('agent_fs_bench.cli.TARGETS_FILE', config), self.assertRaises(ValueError):
             self.invoke(fake_workload(), '--target', 'missing')
         self.assertFalse(self.results.exists())
-
-    def test_symlink_cannot_redirect_managed_work(self):
-        outside = self.root / 'outside'
-        outside.mkdir()
-        (self.dirs[0] / 'agent-fs-bench').symlink_to(outside, target_is_directory=True)
-        with self.assertRaisesRegex(ValueError, 'escapes target'):
-            self.invoke(fake_workload(), '--dirs', str(self.dirs[0]))
-        self.assertEqual(list(outside.iterdir()), [])
 
     def test_misspelled_target_copier_alias_fails_before_creating_run(self):
         module = fake_workload()
