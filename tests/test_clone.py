@@ -77,7 +77,7 @@ class WorkloadPlanTests(unittest.TestCase):
             args = argparse.Namespace(**{**clone.CONFIG, name: 0})
             with self.subTest(name=name), self.assertRaisesRegex(BenchmarkError, name):
                 build_plan(args)
-        build_plan(argparse.Namespace(**{**clone.CONFIG, 'tasks': None}))
+        build_plan(argparse.Namespace(**{**clone.CONFIG, 'tasks': 0}))
 
     def test_copier_selection_fails_instead_of_measuring_something_else(self):
         commands = {'cp-r': 'cp -r {src} {dst}'}

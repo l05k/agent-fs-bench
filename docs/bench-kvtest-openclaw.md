@@ -40,7 +40,7 @@ Experiment settings are the `CONFIG` mapping at the top of
 `agent_fs_bench/benchmarks/kvtest.py`. Change that code for an ablation; do not
 commit private settings. Defaults: `count=2000`, `size=2048`, `variance=0`,
 `cache_size=1000` KiB, `jmode=delete`, `multitrans=True`, `repeats=5`, `mmap=0`,
-`nosync=False`, `tasks=1`, `cpus_per_task=1`, `oversubscribe=1`.
+`nosync=False`, `tasks=1`, `cpus_per_task=1`.
 FULL synchronization is pinned at build time; kvtest does not print a
 connection-level readback. `nosync=True` explicitly requests OFF and is not part
 of the NAS baseline. `build_dir` and `force_download` manage the build cache and
@@ -50,8 +50,8 @@ are not experiment parameters.
 each with its own database. Each instance is a single connection and the
 workload is single-threaded, so `cpus_per_task` stays 1. N is one value per run,
 never swept inside a run; obtain a curve by pooling several runs with
-`plot --vary tasks`. `oversubscribe` above 1 reuses CPU groups and is not part
-of the default baseline.
+`plot --vary tasks`. Tasks above a machine's CPU count share CPUs, which is not
+part of the default baseline.
 
 For transaction-granularity sensitivity, run fixed sizes such as 1024, 4096 and
 16384 bytes with `variance=0`, separately for `multitrans=True` and False. Each

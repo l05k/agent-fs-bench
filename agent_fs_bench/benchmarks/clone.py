@@ -67,7 +67,6 @@ CONFIG: dict[str, Any] = {
     "files_per_dir": 128,
     "tasks": 1,
     "cpus_per_task": 1,
-    "oversubscribe": 1,
     "keep_scratch": False,
 }
 

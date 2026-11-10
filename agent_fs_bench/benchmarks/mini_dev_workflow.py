@@ -64,7 +64,6 @@ CONFIG = {
     # Must equal "jobs": one pinned CPU per make job.
     "cpus_per_task": FIXED_JOBS,
     "jobs": FIXED_JOBS,
-    "oversubscribe": 1,
     "verbose": False,
 }
 

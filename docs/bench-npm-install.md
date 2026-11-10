@@ -47,7 +47,6 @@ edit this mapping in `agent_fs_bench/benchmarks/npm_install.py`.
 | `repeats` | `10` | Independent barrier-aligned batches of the same configuration. |
 | `tasks` | `1` | Simultaneous independent installs, placed by the controller. |
 | `cpus_per_task` | `4` | Logical CPUs pinned per install; keep it equal to `concurrency`. |
-| `oversubscribe` | `1` | Tasks allowed per CPU group, i.e. per `cpus_per_task` CPUs. |
 | `concurrency` | `4` | Internal pool width per install; `0` keeps tool defaults. |
 | `prep_dir` | `"/dev/shm"` | External local filesystem for sources and copies, on every machine. |
 | `npm_bin` / `pnpm_bin` | `"npm"` / `"pnpm"` | Executables resolved on each machine's `PATH`. |
@@ -62,9 +61,9 @@ the runtime. `CONFIG` is experiment setup — changing it changes the measured p
 preparation semantics — so keep it fixed across compared filesystems. Preparation is always
 external and local, with no same-filesystem mode and no automatic fallback.
 
-`tasks` must fit the pool: capacity is summed per machine, `floor(CPUs / cpus_per_task) ×
-oversubscribe`, over the machines the mode offers; a request above capacity is an error,
-never a smaller run. Two 6-CPU machines at `cpus_per_task = 4` hold two tasks, not three.
+`tasks` are dealt round-robin over the machines the mode offers and then over each machine's
+groups of `cpus_per_task` CPUs (see [run modes](run-modes.md)); tasks above a machine's group
+count share a pinned set.
 A `repeats = 1`, `tasks = 1` run in `--mode local` is a minimal real smoke; it still needs
 registry access during seeding and a valid preparation filesystem.
 
@@ -128,13 +127,11 @@ so the device comparison runs against real `st_dev` values; the type lookup itse
 | --- | --- | --- |
 | `tasks` | `1` | External concurrency: installs released together, one sample each. |
 | `cpus_per_task` | `4` | CPUs pinned to each task process. |
-| `oversubscribe` | `1` | Tasks per CPU group. |
 | `concurrency` | `4` | Pool width pinned inside each install; `0` keeps tool defaults. |
 
-`tasks` is the experiment axis, and it is one value per run. The controller fills machines in order
-and uses every CPU group of a machine once before reusing one, so `tasks = 4` with
-`cpus_per_task = 4` needs 16 logical CPUs; `oversubscribe = 2` accepts two tasks per group on a
-machine that is short of CPUs, at the cost of two installs sharing a pinned set.
+`tasks` is the experiment axis, and it is one value per run. Each machine gets an equal share,
+dealt over its CPU groups, so `tasks = 4` with `cpus_per_task = 4` gets its own CPUs only with 16
+logical CPUs; on a machine with fewer, two installs share one pinned set.
 
 Keep `cpus_per_task` equal to `concurrency`. The pin only helps if the pool it names has the CPUs
 to run on: with a wider pool than the task's CPU set the extra workers time-share the same CPUs,
@@ -248,7 +245,7 @@ launcher's own barriers delimit.
 Discovered facts live in `manifest.json`: `targets[].info.hosts[<node>]` holds that machine's
 `target_fstype`, `prep_fstype`, `tool_versions` and `seed_input_sha256` of the committed
 template inputs; `targets[].path` holds the target directory, `run_id` the run, and `config` the run
-settings (`fixture`, `pm`, `repeats`, `tasks`, `cpus_per_task`, `oversubscribe`, `concurrency`,
+settings (`fixture`, `pm`, `repeats`, `tasks`, `cpus_per_task`, `concurrency`,
 `prep_dir`, `ignore_scripts`, `flush`, `keep_node_modules`, `seed_only`, executable names, version
 pins). Device IDs and resolved executable paths are not stored. `plot` pools repeated runs only when
 their configs and source fingerprints match; a non-zero exit, missing tree, walk or fsync failure,

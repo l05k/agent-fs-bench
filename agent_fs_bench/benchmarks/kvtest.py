@@ -78,7 +78,6 @@ CONFIG = {
     "repeats": 5,
     "tasks": 1,
     "cpus_per_task": 1,
-    "oversubscribe": 1,
     "build_dir": None,
     "force_download": False,
 }

@@ -27,8 +27,8 @@ uv run python -m agent_fs_bench run mini-dev-workflow --mode local --dirs /mnt/t
 uv run python -m agent_fs_bench run dev-workflow --mode local --dirs /mnt/testfs
 ```
 
-`--mode local` runs tasks on the controller; `overflow` fills the controller
-first and then the machines in `local/hosts.toml` in file order; `remote` uses
+`--mode local` runs tasks on the controller; `overflow` deals tasks round-robin over
+the controller and the machines in `local/hosts.toml` in file order; `remote` uses
 only those machines and the controller hosts no task. Every mode launches one
 Open MPI job with one task per allocated slot.
 
@@ -62,7 +62,6 @@ workload; edit them in source for a deliberate experiment. Defaults are:
 | `tasks` | `1` | `1` |
 | `cpus_per_task` | `8` | `2` (hard maximum 2) |
 | `jobs` | `8` | `2` (hard maximum 2) |
-| `oversubscribe` | `1` | `1` |
 | `verbose` | `False` | `False` |
 | `linux_url` | `https://github.com/torvalds/linux.git` | not used |
 
@@ -77,9 +76,8 @@ a local path is resolved on each machine, so use one that exists there.
 `tasks` is the number of simultaneous independent instances, one per task.
 `cpus_per_task` is the number of logical CPUs each task is pinned to and must
 equal `jobs`: one `make` job per pinned CPU. Change both keys together. Mini caps
-both values at 2, matching the harness's fixed build parallelism. `oversubscribe`
-places that many tasks per CPU group when the run asks for more tasks than the
-pool has groups.
+both values at 2, matching the harness's fixed build parallelism. Tasks above a
+machine's CPU group count share groups.
 
 ## Prerequisites and complete smoke commands
 

@@ -1,5 +1,6 @@
 """Placement, pool and launch invariants of the cluster dispatcher; no MPI is executed."""
 
+from collections import Counter
 import contextlib
 import io
 import os
@@ -29,47 +30,44 @@ def placed(slots):
 
 
 class AllocateTests(unittest.TestCase):
-    def test_controller_fills_before_hosts_and_keeps_real_cpu_ids(self):
+    def test_tasks_alternate_machines_and_keep_real_cpu_ids(self):
         nodes = [node('local', [7, 2, 11]), node('node-a', [6, 0]), node('node-b', [9, 4])]
-        local = [('local', (2,)), ('local', (7,)), ('local', (11,))]
         for tasks, expected in (
-            (1, local[:1]),
-            (3, local),
-            (4, local + [('node-a', (0,))]),
-            (6, local + [('node-a', (0,)), ('node-a', (6,)), ('node-b', (4,))]),
+            (1, [('local', (2,))]),
+            (2, [('local', (2,)), ('node-a', (0,))]),
+            (5, [('local', (2,)), ('local', (7,)), ('node-a', (0,)), ('node-a', (6,)),
+                 ('node-b', (4,))]),
         ):
             with self.subTest(tasks=tasks):
                 self.assertEqual(placed(allocate(nodes, tasks)), expected)
 
-    def test_none_fills_every_node_and_out_of_range_requests_fail(self):
-        nodes = [node('local', [8, 3]), node('node-a', [12])]
-        self.assertEqual(placed(allocate(nodes, None)),
-                         [('local', (3,)), ('local', (8,)), ('node-a', (12,))])
-        for tasks in (0, -1, 4, True, (1, 2)):
-            with self.subTest(tasks=tasks), self.assertRaises(ValueError):
-                allocate(nodes, tasks)
-
-    def test_multi_cpu_tasks_take_whole_groups_and_skip_too_small_nodes(self):
-        nodes = [node('local', range(10)), node('node-a', range(3)), node('node-b', range(4))]
-        self.assertEqual(placed(allocate(nodes, None, cpus_per_task=4)),
-                         [('local', (0, 1, 2, 3)), ('local', (4, 5, 6, 7)),
-                          ('node-b', (0, 1, 2, 3))])
-        with self.assertRaisesRegex(ValueError, 'between 1 and 3'):
-            allocate(nodes, 4, cpus_per_task=4)
-
-    def test_oversubscription_reuses_each_cpu_group_only_after_all_are_used(self):
-        nodes = [node('local', [0, 1]), node('node-a', [5])]
-        self.assertEqual(placed(allocate(nodes, None, oversubscribe=2)),
+    def test_tasks_above_cpu_count_share_groups_evenly_per_machine(self):
+        # Each machine gets the same share regardless of size; its groups differ by at most one.
+        nodes = [node('local', [0, 1]), node('node-a', [5, 6, 7, 8])]
+        self.assertEqual(placed(allocate(nodes, 7)),
                          [('local', (0,)), ('local', (1,)), ('local', (0,)), ('local', (1,)),
-                          ('node-a', (5,)), ('node-a', (5,))])
-        # Without oversubscription the same request exceeds capacity instead of shrinking.
-        with self.assertRaises(ValueError):
-            allocate(nodes, 4)
+                          ('node-a', (5,)), ('node-a', (6,)), ('node-a', (7,))])
+        loads = Counter(placed(allocate([node('local', range(64))], 1024)))
+        self.assertEqual(set(loads.values()), {16})
 
-    def test_slot_shape_parameters_must_be_positive_integers(self):
-        for keywords in ({'cpus_per_task': 0}, {'oversubscribe': 0}, {'cpus_per_task': 1.5}):
-            with self.subTest(**keywords), self.assertRaises(ValueError):
-                allocate([node('local', [0, 1])], 1, **keywords)
+    def test_multi_cpu_tasks_take_whole_groups(self):
+        nodes = [node('local', range(10)), node('node-a', range(4))]
+        self.assertEqual(placed(allocate(nodes, 5, cpus_per_task=4)),
+                         [('local', (0, 1, 2, 3)), ('local', (4, 5, 6, 7)),
+                          ('local', (0, 1, 2, 3)), ('node-a', (0, 1, 2, 3)),
+                          ('node-a', (0, 1, 2, 3))])
+
+    def test_machine_too_small_for_a_task_fails_only_when_it_receives_one(self):
+        nodes = [node('local', range(4)), node('node-a', range(3))]
+        self.assertEqual(len(allocate(nodes, 1, cpus_per_task=4)), 1)
+        with self.assertRaisesRegex(ValueError, 'node-a'):
+            allocate(nodes, 2, cpus_per_task=4)
+
+    def test_tasks_and_cpus_per_task_must_be_positive_integers(self):
+        for tasks, cpus_per_task in ((0, 1), (-1, 1), (None, 1), (True, 1), (1, 0), (1, 1.5)):
+            with self.subTest(tasks=tasks, cpus_per_task=cpus_per_task), \
+                    self.assertRaises(ValueError):
+                allocate([node('local', [0, 1])], tasks, cpus_per_task)
 
 
 class PlacementProofTests(unittest.TestCase):

@@ -18,8 +18,9 @@ from .mount_scale_mounts import parse_profile
 
 CONFIG = {
     'profiles': PROJECT_ROOT / 'local' / 'mounts.toml',
-    # One N per run; None fills every logical CPU of the --mode machines, one client each.
-    'tasks': None,
+    # One N per run, dealt round-robin over the --mode machines and their CPUs; N above
+    # the CPU count puts several single-threaded clients on one CPU.
+    'tasks': 64,
     'directories': 3,  # Total per agent: one private workspace + X-1 shared resources.
     'files': 1000,
     'file_size_bytes': 4096,
@@ -150,8 +151,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
                  profile.admin_root / 'agent-fs-bench' / 'mount-scale' / ctx.run_id)
     if ctx.result_dir.resolve().is_relative_to(data_root.resolve()):
         raise ValueError('results must be outside the measured filesystem data')
-    # One single-threaded client per logical CPU, never oversubscribed.
-    slots = cluster.allocate(ctx.pool.nodes, args.tasks, 1, 1)
+    slots = cluster.allocate(ctx.pool.nodes, args.tasks, 1)
     nodes = list(dict.fromkeys(slot.node for slot in slots))
     if profile is None and len(nodes) > 1:
         raise ValueError('--directory-smoke keeps its data in one machine\'s staging and runs on '

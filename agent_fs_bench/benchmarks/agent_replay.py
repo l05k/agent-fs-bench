@@ -33,7 +33,6 @@ CONFIG = {
     "repeats": 5,
     "tasks": 1,
     "cpus_per_task": 1,  # One Harbor trial per task; Docker containers run outside the pin.
-    "oversubscribe": 1,
 }
 REPLAY_ROOT = PROJECT_ROOT / "third_party" / "agent-mitm-replay"
 

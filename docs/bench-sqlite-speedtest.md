@@ -31,7 +31,6 @@ real workload. Mount targets externally. Change `CONFIG` in
 | `repeats` | `5` | Complete suite invocations per task, each on a fresh database |
 | `tasks` | `1` | Independent single-connection instances started together |
 | `cpus_per_task` | `1` | Each instance is single-threaded |
-| `oversubscribe` | `1` | Tasks per CPU group; 1 is the baseline |
 | `build_dir` | `None` | Default `build/sqlite-speedtest/` in each checkout |
 | `force_download` | `False` | Refresh sources and rebuild when True |
 

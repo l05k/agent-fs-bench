@@ -23,8 +23,8 @@ uv run python -m agent_fs_bench run clone --mode local --dirs /mnt/fs-a -- --smo
 uv run python -m agent_fs_bench run clone --mode local --dirs /mnt/fs-a
 ```
 
-`--mode local` runs every task on the controller; `overflow` fills the controller
-first and then the machines in `local/hosts.toml` in file order; `remote` uses
+`--mode local` runs every task on the controller; `overflow` deals tasks round-robin
+over the controller and the machines in `local/hosts.toml` in file order; `remote` uses
 only those machines and hosts no task on the controller. Every machine needs the
 same checkout and its own `uv sync --locked` environment.
 
@@ -38,7 +38,6 @@ same checkout and its own `uv sync --locked` environment.
 | `repeats` | `5` | Independent fresh-destination batches. |
 | `tasks` | `1` | Simultaneous independent requests, one per task process. |
 | `cpus_per_task` | `1` | Logical CPUs reserved per task; `cp` is single-threaded. |
-| `oversubscribe` | `1` | Tasks per CPU group. |
 | `copier` | `"cp-r"` | Copier name of every target without an override. |
 | `target_copiers` | `{}` | Target alias → copier name override; one copier per target and run. |
 | `commands` | `cp-r` and `lakebase` templates | Shell-quoted argv containing `{src}` and `{dst}`; executed without a shell. Only selected executables must exist. |
@@ -46,9 +45,8 @@ same checkout and its own `uv sync --locked` environment.
 
 `tasks` is the only concurrency control; there is no in-run sweep of `files`,
 `file_size_bytes`, `tasks` or copiers: a run uses one copier per target. A run with
-`tasks=16` starts 16 identical requests, split across the participating machines by
-the placement plan; `tasks=None` fills the capacity of the selected mode. A task
-count above that capacity is an error, never a smaller run.
+`tasks=16` starts 16 identical requests, dealt round-robin over the participating
+machines and their CPUs; tasks above a machine's CPU count share CPUs.
 
 Example with registered aliases `LakeBase` and `NFS`:
 

@@ -54,7 +54,6 @@ CONFIG = {
     # Must equal "jobs": one pinned CPU per make job.
     "cpus_per_task": DEFAULT_JOBS,
     "jobs": DEFAULT_JOBS,
-    "oversubscribe": 1,
     "verbose": False,
     "linux_url": DEFAULT_LINUX_URL,
 }

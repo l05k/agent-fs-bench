@@ -96,27 +96,31 @@ CONFIG = {
 
 ## Placement
 
-A workload declares `tasks`, `cpus_per_task` (default 1; multi-threaded tasks declare
-their width, e.g. npm-install 4, dev-workflow 8) and `oversubscribe` (default 1;
-mdtest-peak 2):
+A workload declares `tasks` (a positive integer) and `cpus_per_task` (default 1;
+multi-threaded tasks declare their width, e.g. npm-install 4, dev-workflow 8):
 
-- A machine's capacity is `floor(available CPUs / cpus_per_task) × oversubscribe`.
-  Available CPUs are that machine's `sched_getaffinity` set, so `taskset` and cpusets
-  apply.
-- Machines fill in mode order. Within a machine, the CPUs are sorted and cut into groups
-  of `cpus_per_task`, and every group gets one task before any group gets a second.
-- `tasks = None` fills the whole capacity. A request above it is an error; a run never
-  shrinks N or silently shares CPUs.
+- Tasks are dealt round-robin over the mode's machines: machine i of M gets
+  `tasks // M`, plus one if `i < tasks % M`. Every machine gets the same share
+  whatever its CPU count; with fewer tasks than machines only the first ones are used.
+- Within a machine, the CPUs (its `sched_getaffinity` set, so `taskset` and cpusets
+  apply) are sorted and cut into groups of `cpus_per_task`, and its tasks are dealt
+  round-robin over the groups: group loads differ by at most one.
+- There is no capacity limit. Tasks above a machine's group count share CPU groups;
+  that is how one CPU runs several tasks. MPI ranks are contiguous per machine.
+- A machine that receives a task but has fewer CPUs than `cpus_per_task` is an error.
+- Shared CPUs need `mpi_yield_when_idle` (always set) so ranks waiting in a barrier do
+  not spin. Many tasks per machine also need high enough `ulimit -u` / `ulimit -n`;
+  Python workloads cost one interpreter per task.
 - No CPU is reserved for the controller, Python, MPI or filesystem daemons. Formal runs
   should fix cpuset, SMT, NUMA, machine model and background load.
 
-For example, with 8 CPUs on the controller and 8 on `node-a` in `overflow` mode:
+For example, with 8 CPUs on the controller and 64 on `node-a` in `overflow` mode:
 
-- `tasks = 12`: 8 tasks on the controller's CPUs 0–7 and 4 on node-a's CPUs 0–3.
-- `tasks = 3` with `cpus_per_task = 4`: the controller runs two tasks on CPUs {0–3}
-  and {4–7}, node-a one on {0–3}. The capacity is 4, so `tasks = 12` is an error.
-- `tasks = 16` with `oversubscribe = 2`: all 16 run on the controller, two per CPU,
-  and node-a is unused; `tasks = None` places 16 on each machine.
+- `tasks = 1`: one task on the controller's CPU 0; node-a is unused.
+- `tasks = 16`: 8 on the controller (one per CPU) and 8 on node-a's CPUs 0–7.
+- `tasks = 144`: 72 on each machine: the controller runs 9 per CPU, node-a 2 on
+  CPUs 0–7 and 1 on the rest.
+- `remote` with only node-a and `tasks = 1024`: 16 tasks per CPU.
 
 ## Launch and placement proof
 

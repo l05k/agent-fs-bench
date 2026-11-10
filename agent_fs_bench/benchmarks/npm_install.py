@@ -52,7 +52,6 @@ CONFIG: dict[str, Any] = {
     # Keep cpus_per_task equal to the pool width below: each install gets the CPUs
     # its file materialization can actually use.
     "cpus_per_task": 4,
-    "oversubscribe": 1,
     "concurrency": 4,
     "prep_dir": "/dev/shm",
     "npm_bin": "npm",

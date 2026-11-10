@@ -16,10 +16,9 @@ Throughput is ``n*N / max-task phase time`` from mdtest's aggregate CSV row
 ``n*N*S / time`` in MiB/s. Reads follow writes in the same launch without
 cache drops, so they may be served by the client page cache.
 
-``tasks = None`` fills the selected machines at two tasks per logical CPU
-(``oversubscribe = 2``); oversubscribed points are intended. A peak curve is several runs
-with explicit ``tasks`` (for example powers of two up to 2x CPUs) pooled with
-``plot --vary tasks``.
+``tasks`` is required; tasks above the CPU count share CPUs (round-robin per machine), so
+oversubscribed points are intended. A peak curve is several runs with different ``tasks``
+(for example powers of two up to 2x CPUs) pooled with ``plot --vary tasks``.
 """
 
 from __future__ import annotations
@@ -41,9 +40,8 @@ MIB = 1024 * 1024
 
 CONFIG: dict[str, Any] = {
     "mdtest_bin": "mdtest",
-    "tasks": None,
+    "tasks": 128,
     "cpus_per_task": 1,
-    "oversubscribe": 2,
     # One file size per run.
     "file_size_bytes": 4096,
     # None: files per task from ITEMS_PER_TASK for this size; an int overrides it.
@@ -52,7 +50,7 @@ CONFIG: dict[str, Any] = {
     "layout": "private",
 }
 
-# Larger files get fewer items per task, so the 2x-CPU default stays within a few tens
+# Larger files get fewer items per task, so the default 128 tasks stay within a few tens
 # of GiB per launch (128 tasks × 256 × 1 MiB = 32 GiB).
 ITEMS_PER_TASK = {0: 8192, 4096: 8192, 65536: 2048, 1048576: 256}
 
@@ -70,7 +68,7 @@ FIGURES = [
 
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
-    slots = cluster.allocate(ctx.pool.nodes, args.tasks, args.cpus_per_task, args.oversubscribe)
+    slots = cluster.allocate(ctx.pool.nodes, args.tasks, args.cpus_per_task)
     tasks, size, items = len(slots), args.file_size_bytes, args.items_per_task
     total = items * tasks
     options = ["-a", "POSIX", "-F", "-n", str(items), "-i", "1", "-w", str(size), "-e", str(size),

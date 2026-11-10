@@ -57,7 +57,6 @@ CONFIG: dict[str, Any] = {
     "mdtest_bin": "mdtest",
     "tasks": 1,
     "cpus_per_task": 1,
-    "oversubscribe": 1,
     "total_items": 65536,
     "repeats": 5,
     "layout": "private",
@@ -198,7 +197,7 @@ def launch(ctx: RunContext, slots: Sequence[cluster.Slot], binary: str, options:
 
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
-    slots = cluster.allocate(ctx.pool.nodes, args.tasks, args.cpus_per_task, args.oversubscribe)
+    slots = cluster.allocate(ctx.pool.nodes, args.tasks, args.cpus_per_task)
     tasks = len(slots)
     if args.total_items % tasks or args.total_items // tasks < 2:
         raise BenchmarkError(f"total_items {args.total_items} must divide into at least two "
@@ -237,8 +236,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     if (args.repeats < 1 or args.layout not in ("private", "shared")
             or args.subset not in ("file", "dir")):
         raise BenchmarkError("layout must be private or shared, subset file or dir, repeats >= 1")
-    if args.tasks is not None and (type(args.tasks) is not int or args.tasks < 1
-                                   or args.total_items % args.tasks
-                                   or args.total_items // args.tasks < 2):
+    if (type(args.tasks) is not int or args.tasks < 1 or args.total_items % args.tasks
+            or args.total_items // args.tasks < 2):
         raise BenchmarkError("total_items must divide evenly into at least two items per task")
     return args

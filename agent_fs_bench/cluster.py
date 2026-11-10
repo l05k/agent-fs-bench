@@ -10,9 +10,9 @@
 Every machine keeps the same checkout (``root``, default: the controller's path) with its own
 ``uv sync --locked`` environment. The controller probes each machine and rejects a pool whose
 hostnames repeat or whose architecture, Open MPI library or source fingerprint differ. A
-workload requests ``tasks`` tasks of ``cpus_per_task`` logical CPUs with at most
-``oversubscribe`` tasks per CPU group; machines fill in order, each CPU group once before any
-is reused, and a request above capacity fails instead of shrinking.
+workload requests ``tasks`` tasks of ``cpus_per_task`` logical CPUs. Tasks are dealt round-robin
+over the machines, then round-robin over each machine's CPU groups, so a CPU group may hold any
+number of tasks (oversubscription is implicit in ``tasks``).
 
 One launch is one global Open MPI MPMD job with one application context per task, so
 ``--host`` pins each task to its machine. A wrapper checks the hostname and MPI rank, pins the
@@ -71,7 +71,9 @@ CONFIG = {
 # Plain TCP plus same-host shared memory; Open MPI binding stays off because the wrapper pins.
 _MCA = ('--mca', 'pml', 'ob1', '--mca', 'btl', 'self,vader,tcp',
         '--mca', 'orte_keep_fqdn_hostnames', '1',
-        '--mca', 'hwloc_base_binding_policy', 'none')
+        '--mca', 'hwloc_base_binding_policy', 'none',
+        # Several ranks may share one CPU; waiting ranks must yield instead of busy-polling.
+        '--mca', 'mpi_yield_when_idle', '1')
 # Open MPI splits application context lines on spaces and reads them into a fixed buffer.
 _LINE_LIMIT = 4000
 _PLACEMENT = 'AFB_PLACEMENT '
@@ -230,36 +232,26 @@ def _probe_node(host: Host | None) -> Node:
     return Node(name, host, root, python, json.loads(done.stdout))
 
 
-def capacity(node: Node, cpus_per_task: int = 1, oversubscribe: int = 1) -> int:
-    return len(node.cpus) // cpus_per_task * oversubscribe
+def allocate(nodes: Sequence[Node], tasks: int, cpus_per_task: int = 1) -> tuple[Slot, ...]:
+    """Deal tasks round-robin over nodes, then over each node's CPU groups.
 
-
-def allocate(nodes: Sequence[Node], tasks: int | None, cpus_per_task: int = 1,
-             oversubscribe: int = 1) -> tuple[Slot, ...]:
-    """Fill nodes in order; within a node use every CPU group once before reusing any.
-
-    `tasks=None` fills the whole capacity. A node with fewer CPUs than `cpus_per_task`
-    contributes nothing; a request above capacity is an error, never a smaller run.
+    Node i gets `tasks // len(nodes)` tasks plus one if `i < tasks % len(nodes)`; within a
+    node the sorted CPUs are cut into groups of `cpus_per_task` and task k takes group
+    `k % groups`, so group loads differ by at most one. Slots are contiguous per node.
     """
-    for value, name in ((cpus_per_task, 'cpus_per_task'), (oversubscribe, 'oversubscribe')):
+    for value, name in ((tasks, 'tasks'), (cpus_per_task, 'cpus_per_task')):
         if type(value) is not int or value < 1:
             raise ValueError(f'{name} must be a positive integer')
-    total = sum(capacity(node, cpus_per_task, oversubscribe) for node in nodes)
-    count = total if tasks is None else tasks
-    if type(count) is not int or not 1 <= count <= total:
-        raise ValueError(f'tasks must be between 1 and {total}: capacity of '
-                         f'{", ".join(node.name for node in nodes)} at {cpus_per_task} CPU(s) '
-                         f'per task and {oversubscribe} task(s) per CPU group')
     slots: list[Slot] = []
-    for node in nodes:
+    for index, node in enumerate(nodes):
+        count = tasks // len(nodes) + (index < tasks % len(nodes))
         cpus = sorted(node.cpus)
         groups = [tuple(cpus[start:start + cpus_per_task])
                   for start in range(0, len(cpus) - cpus_per_task + 1, cpus_per_task)]
-        for _ in range(oversubscribe):
-            for group in groups:
-                if len(slots) == count:
-                    return tuple(slots)
-                slots.append(Slot(node, group))
+        if count and not groups:
+            raise ValueError(f'{node.name} has {len(cpus)} CPU(s), fewer than '
+                             f'cpus_per_task={cpus_per_task}')
+        slots += [Slot(node, groups[k % len(groups)]) for k in range(count)]
     return tuple(slots)
 
 
@@ -325,7 +317,7 @@ def check_placement(label: str, proofs: Sequence[dict[str, Any]],
 
 def run_tasks(ctx, args, *, label: str = 'tasks') -> None:
     """Run the workload's `task(t)` once per allocated task, in one Open MPI job."""
-    slots = allocate(ctx.pool.nodes, args.tasks, args.cpus_per_task, args.oversubscribe)
+    slots = allocate(ctx.pool.nodes, args.tasks, args.cpus_per_task)
     spec = {
         'module': f'agent_fs_bench.benchmarks.{ctx.benchmark.replace("-", "_")}',
         'benchmark': ctx.benchmark, 'run_id': ctx.run_id,

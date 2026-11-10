@@ -26,15 +26,14 @@ Each client is one single-threaded mdtest task. K is the **total number of direc
 
 `CONFIG['tasks']`:
 
-- `None` (default): N is every available logical CPU of the selected machines, one client each.
-- Positive integer: measure only that N. Machines fill in order, and only machines that receive clients start a lifecycle worker. N above the probed total capacity is an error; the run never oversubscribes or shrinks the experiment.
-- "Available logical CPU" comes from each machine's `os.sched_getaffinity(0)`, not physical core count. Real CPU IDs are kept and assigned in ascending order. Before exec, the cluster wrapper pins each task to one CPU and verifies the actual hostname, global rank and affinity; any mismatch with the plan fails the run.
+- A positive integer N (default 64), one single-threaded client per task. Clients are dealt round-robin over the selected machines (each gets `N // M`, the first `N % M` one more), then round-robin over each machine's logical CPUs. N above a machine's CPU count puts several clients on one CPU, e.g. 1024 clients on one 64-CPU machine run 16 per CPU. Only machines that receive clients start a lifecycle worker.
+- "Available logical CPU" comes from each machine's `os.sched_getaffinity(0)`, not physical core count. Real CPU IDs are kept and assigned in ascending order. Before exec, the cluster wrapper pins each task to its CPU and verifies the actual hostname, global rank and affinity; any mismatch with the plan fails the run. With shared CPUs the `cpu` column of `ranks` is not a client identity; `sample` is.
 
-Default full-core placement is one task per available logical CPU; it does not guarantee 100% CPU utilization, because filesystem waits can leave a CPU idle. No core is reserved for the controller: Python, MPI, the kernel and filesystem daemons still share CPUs with tasks. Formal experiments should fix cpuset, SMT, NUMA, machine model and background load.
+One task per CPU does not guarantee 100% CPU utilization, because filesystem waits can leave a CPU idle. No core is reserved for the controller: Python, MPI, the kernel and filesystem daemons still share CPUs with tasks. Formal experiments should fix cpuset, SMT, NUMA, machine model and background load.
 
 For example, take 64 available logical CPUs on the controller and 64 on each of two listed machines.
-- `overflow` mode: the default N is 192. An explicit `tasks = 100` allocates controller=64 and first machine=36; the second machine does not participate.
-- `remote` mode: the same request allocates 64 on the first machine and 36 on the second.
+- `overflow` mode: `tasks = 100` allocates 34 on the controller, 33 on the first machine and 33 on the second.
+- `remote` mode: the same request allocates 50 on each listed machine.
 
 To draw a scaling curve, choose N explicitly in separate runs and pool them with `plot --vary tasks`; this implementation does not decide paper sweep points.
 
@@ -118,7 +117,7 @@ uv run python -m agent_fs_bench run mount-scale --mode local \
   --dirs /tmp/mdtest-directory-smoke -- --directory-smoke
 ```
 
-`--directory-smoke` keeps its ordinary data inside the staging work directory, so it runs on one machine only: its two tasks must fit on the first machine of the mode. If that machine has fewer than two available logical CPUs, the tasks would span machines or exceed capacity, and the run fails before starting workers/MPI; it never shrinks to N=1. This checks `sched_getaffinity`, not a container CPU-time quota.
+`--directory-smoke` keeps its ordinary data inside the staging work directory, so it runs on one machine only: use `--mode local` (or a mode with one machine). Its two tasks are dealt round-robin, so a mode with two or more machines spans them and the run fails before starting workers/MPI. Two tasks on a one-CPU machine share that CPU.
 
 ## Execution and timing boundaries
 

@@ -96,10 +96,10 @@ uv run python -m agent_fs_bench run agent-replay --dirs /mnt/fs-a --mode local
 uv run python -m agent_fs_bench run agent-replay --dirs /mnt/fs-a --mode overflow
 ```
 
-`--mode local` runs every task on the controller; `overflow` fills the controller
-first and then the machines in `local/hosts.toml` in file order; `remote` uses
-only those machines and hosts no task on the controller. A task count above the
-probed capacity of the selected mode is an error, never a smaller run.
+`--mode local` runs every task on the controller; `overflow` deals tasks round-robin
+over the controller and the machines in `local/hosts.toml` in file order; `remote` uses
+only those machines and hosts no task on the controller. Tasks above a machine's CPU
+count share CPUs.
 
 `CONFIG` in `agent_fs_bench/benchmarks/agent_replay.py` holds all settings:
 
@@ -110,7 +110,6 @@ probed capacity of the selected mode is an error, never a smaller run.
 | `repeats` | `5` | Independent replays per task. |
 | `tasks` | `1` | Simultaneous independent replays, one per task process. |
 | `cpus_per_task` | `1` | Logical CPUs reserved per task; one replay drives one Docker task. |
-| `oversubscribe` | `1` | Tasks per CPU group. |
 
 `tasks` is the only concurrency control; there is no in-run sweep of cases,
 repeats or tasks. Several tasks may share one machine: the replay starts

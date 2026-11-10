@@ -9,7 +9,7 @@ Push a client to its throughput ceiling with the unmodified **IOR mdtest 4.0.0**
 Prerequisites match [`mdtest`](bench-mdtest.md): the same `mdtest` 4.0.0 on every task machine, Open MPI 4.1, and targets mounted externally. Machine placement follows [run modes](run-modes.md).
 
 ```sh
-# Default: fill the --mode machines at two tasks per logical CPU.
+# Default: 128 tasks dealt round-robin over the --mode machines and their CPUs.
 uv run python -m agent_fs_bench run mdtest-peak --mode local --dirs /mnt/fs-a /mnt/fs-b
 
 # Small real end-to-end check (16 files/task, one repeat); not a result.
@@ -25,11 +25,10 @@ One run measures one task count and one file size. A peak curve is several runs 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `mdtest_bin` | `mdtest` | Native IOR 4.0.0 executable, the same on every machine |
-| `tasks` | `None` | N; `None` fills the capacity of the `--mode` machines |
+| `tasks` | `128` | N, a positive integer; tasks above a machine's CPU count share CPUs, and oversubscribed points are intended |
 | `cpus_per_task` | `1` | One pinned logical CPU per task |
-| `oversubscribe` | `2` | Up to two tasks per CPU, so the default N is 2× the available CPUs; oversubscribed points are intended |
 | `file_size_bytes` | `4096` | Bytes written and read per file (one size per run) |
-| `items_per_task` | `None` | Files per task; `None` takes the per-size default (0 B and 4 KiB 8192, 64 KiB 2048, 1 MiB 256), which keeps the 2× CPU point within a few tens of GiB per launch; an integer overrides it, and another size needs one |
+| `items_per_task` | `None` | Files per task; `None` takes the per-size default (0 B and 4 KiB 8192, 64 KiB 2048, 1 MiB 256), which keeps 128 tasks within a few tens of GiB per launch; an integer overrides it, and another size needs one |
 | `repeats` | 3 | Fresh launch and working directories per repeat |
 | `layout` | `private` | `private`: one directory per machine with per-task trees (`-u`); `shared`: one common directory |
 

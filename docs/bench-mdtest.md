@@ -24,7 +24,7 @@ Edit the single `CONFIG` dictionary in `agent_fs_bench/benchmarks/mdtest.py`:
 | --- | --- | --- |
 | `mdtest_bin` | `mdtest` | Native IOR 4.0.0 executable, the same on every machine |
 | `tasks` | `1` | N single-threaded mdtest tasks of this run |
-| `cpus_per_task`, `oversubscribe` | `1`, `1` | One pinned logical CPU per task, never shared |
+| `cpus_per_task` | `1` | One pinned logical CPU per task; tasks above a machine's CPU count share CPUs |
 | `total_items` | 65536 | Fixed aggregate objects in each phase, not objects per task |
 | `repeats` | 5 | Independent launches with fresh working directories |
 | `layout` | `private` | `private`: one directory per machine with per-task trees (`-u`); `shared`: one common directory |

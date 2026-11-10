@@ -62,9 +62,10 @@ uv run python -m agent_fs_bench run mdtest --mode remote --dirs /mnt/fs-a    # l
 
 Each workload's `CONFIG['tasks']` is the external concurrency of one run (N
 simultaneous tasks); draw curves over N from several runs with `plot --vary tasks`.
-Tasks are pinned to logical CPU groups (`cpus_per_task`), machines fill in order and
-a request above capacity is an error. List remote machines in `local/hosts.toml`
-(see `experiments/hosts.example.toml`); every machine needs the same checkout.
+Tasks are pinned to logical CPU groups (`cpus_per_task`) and dealt round-robin over the
+machines, then over each machine's groups; tasks above the CPU count share CPUs. List
+remote machines in `local/hosts.toml` (see `experiments/hosts.example.toml`); every
+machine needs the same checkout.
 Setup, placement and launcher settings: [run modes](docs/run-modes.md).
 
 ## Workloads
