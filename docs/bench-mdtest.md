@@ -27,11 +27,11 @@ Edit the single `CONFIG` dictionary in `agent_fs_bench/benchmarks/mdtest.py`:
 | `cpus_per_task`, `oversubscribe` | `1`, `1` | One pinned logical CPU per task, never shared |
 | `total_items` | 65536 | Fixed aggregate objects in each phase, not objects per task |
 | `repeats` | 5 | Independent launches with fresh working directories |
-| `layout` | `private` | `private`: per-task directories; `shared`: one common directory |
+| `layout` | `private` | `private`: one directory per machine with per-task trees (`-u`); `shared`: one common directory |
 | `subset` | `file` | `file` or `dir`, one per run |
 
 Each launch uses `-a POSIX -i 1 -n total_items/N`, with `-F` or `-D`. Total work must divide evenly and leave at least two items per task.
-- **Private layout:** each task gets its own `-d` directory `<work>/<node>/<case>/task-NNNN` plus `-u`. The directory is created on that task's machine, with mdtest's `test-dir.0-0` precreated.
+- **Private layout:** the tasks of one machine share one `-d` directory `<work>/<node>/<case>` plus `-u`, so each task creates its own `mdtest_tree.<rank>.0` there, as in a single-machine mdtest run. mdtest creates its `test-dir.0-0` only for rank 0, so each machine precreates its own.
 - **Shared layout:** every task gets one `-d` directory `<work>/<case>`, still with rank-unique names, **not** `-S` shared-file access. Across machines the experimenter must provide a target that every machine sees as one directory.
 
 Directory-tree management remains outside the reported operation phases. `--smoke` changes only total objects to 128 and repeats to 2.
@@ -69,7 +69,7 @@ Before emitting a phase row, the wrapper checks:
 - the workload size;
 - the exit status and operation warnings.
 
-The known zero-byte read notice is expected. Launcher logs stay outside the target under the result directory. Task 0's machine returns the rank CSV through the launcher output, so no machine needs a shared result directory. mdtest removes the files and directories it creates; the empty per-repeat directories stay under the run directory. A failed launch keeps its diagnostics and stops the run.
+The known zero-byte read notice is expected. Launcher logs stay outside the target under the result directory. Task 0's machine returns the rank CSV through the launcher output, so no machine needs a shared result directory. mdtest removes the files and directories it creates; the empty per-repeat directories, and the precreated `test-dir.0-0` on every machine but task 0's, stay under the run directory. A failed launch keeps its diagnostics and stops the run.
 
 Cache state is **create-then-access-no-drop**, not guaranteed warm residency or cold NAS access. Stat/open follow creation without cache eviction; metadata may be served by client caches. Completion is ordinary operation return: no extra `-y`/`-Y`, no per-operation tail latency or crash-durability claim.
 

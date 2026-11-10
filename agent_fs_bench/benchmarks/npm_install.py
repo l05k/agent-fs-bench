@@ -562,7 +562,6 @@ def prepare_node(t: cluster.Task) -> dict[str, Any]:
     return {
         "target_fstype": target_type,
         "prep_fstype": prep_type,
-        "cpu_count": os.cpu_count() or 0,
         "tool_versions": versions,
         "seed_input_sha256": fingerprints,
     }

@@ -29,9 +29,9 @@ One run measures one task count and one file size. A peak curve is several runs 
 | `cpus_per_task` | `1` | One pinned logical CPU per task |
 | `oversubscribe` | `2` | Up to two tasks per CPU, so the default N is 2× the available CPUs; oversubscribed points are intended |
 | `file_size_bytes` | `4096` | Bytes written and read per file (one size per run) |
-| `items_per_task` | `8192` | Files per task; former per-size defaults: 0 B and 4 KiB 8192, 64 KiB 2048, 1 MiB 256 |
+| `items_per_task` | `None` | Files per task; `None` takes the per-size default (0 B and 4 KiB 8192, 64 KiB 2048, 1 MiB 256), which keeps the 2× CPU point within a few tens of GiB per launch; an integer overrides it, and another size needs one |
 | `repeats` | 3 | Fresh launch and working directories per repeat |
-| `layout` | `private` | `private`: `-u` per-task directories; `shared`: one common directory |
+| `layout` | `private` | `private`: one directory per machine with per-task trees (`-u`); `shared`: one common directory |
 
 Each launch is `mdtest -a POSIX -F -i 1 -n <n> -w S -e S -y [-u]`:
 
@@ -59,7 +59,7 @@ Each run writes one flat CSV per record kind plus a `manifest.json`:
 | `ops_per_s` | ops / elapsed_s |
 | `mib_per_s` | create/read with S>0 only: ops×S / MiB / elapsed_s (logical bytes); empty elsewhere |
 
-`run` also writes `summary/phases.csv` (n and the median of each metric per target and dimension). Timing, validation, the per-task directories and the IOR 4.0.0 CSV item-count caveat are identical to [`mdtest`](bench-mdtest.md#timing-and-results); launch checks and helpers are shared with that module. The manifest records each machine's CPUs (`nodes`) and every launch's verified placement.
+`run` also writes `summary/phases.csv` (n and the median of each metric per target and dimension). Timing, validation, the per-machine directories and the IOR 4.0.0 CSV item-count caveat are identical to [`mdtest`](bench-mdtest.md#timing-and-results); launch checks and helpers are shared with that module. The manifest records each machine's CPUs (`nodes`) and every launch's verified placement.
 
 ## Default figures
 

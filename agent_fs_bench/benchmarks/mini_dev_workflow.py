@@ -488,7 +488,6 @@ def task(t: cluster.Task) -> None:
     t.log(f"task {t.index} on {t.node}: worktree ready in {preparation_ms} ms")
 
     t.barrier()
-    started = time.perf_counter_ns()
     summary = run_workflow(
         worktree,
         source_repo,
@@ -498,8 +497,6 @@ def task(t: cluster.Task) -> None:
         preparation_ms=preparation_ms,
         source_setup_ms=source_setup_ms,
     )
-    t.barrier()
-    batch_ms = elapsed_ms(started)
 
     results = t.gather((t.node, summary))
     if t.leader:
@@ -515,7 +512,6 @@ def task(t: cluster.Task) -> None:
     t.info({
         "jobs": args.jobs,
         "cpus_per_task": args.cpus_per_task,
-        "batch_ms": batch_ms,
         "base_commit": first["base_commit"],
     })
     for sample, (host, result) in enumerate(results):

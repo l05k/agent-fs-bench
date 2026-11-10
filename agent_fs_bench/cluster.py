@@ -52,7 +52,8 @@ from .targets import Target
 
 MODES = ('local', 'overflow', 'remote')
 
-# Launcher settings of this controller and network. Not recorded in the manifest; keep
+# Launcher settings of this controller and network. The keys that change measurements
+# (mpiexec, mpiexec_args, env) enter the manifest only as `config.launcher_sha256`; keep
 # private values out of commits.
 CONFIG = {
     'hosts': PROJECT_ROOT / 'local' / 'hosts.toml',
@@ -161,6 +162,13 @@ def launcher() -> dict[str, str]:
     return {'name': Path(command[0]).name, 'version': '.'.join(match.groups())}
 
 
+def launcher_digest() -> str:
+    """SHA-256 of the launcher settings that change measurements, without their values."""
+    settings = {key: list(CONFIG[key]) if key != 'env' else dict(CONFIG[key])
+                for key in ('mpiexec', 'mpiexec_args', 'env')}
+    return hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+
+
 def open_pool(mode: str) -> Pool:
     """Probe the machines `mode` may use, in fill order."""
     if mode not in MODES:
@@ -212,8 +220,10 @@ def _probe_node(host: Host | None) -> Node:
     argv = command if host is None else [
         *ssh_argv(host, CONFIG['connect_timeout_s']),
         f'cd {shlex.quote(str(root))} && exec {shlex.join(command)}']
+    # stdin closed: ssh would otherwise read the caller's stdin (e.g. a piped script).
     done = subprocess.run(argv, cwd=PROJECT_ROOT if host is None else None,
-                          capture_output=True, text=True, timeout=CONFIG['probe_timeout_s'])
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                          timeout=CONFIG['probe_timeout_s'])
     if done.returncode:
         raise RuntimeError(f'{name}: probe failed with exit code {done.returncode}: '
                            f'{tail(done.stderr or done.stdout, 5)}')

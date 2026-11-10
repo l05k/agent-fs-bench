@@ -114,7 +114,8 @@ class RunCommandTests(unittest.TestCase):
         run = self.run_dir()
         manifest = json.loads((run / 'manifest.json').read_text())
         self.assertEqual(manifest['config'], {'repeats': 3, 'fixture': '/data/fixture',
-                                              'mode': 'local'})
+                                              'mode': 'local',
+                                              'launcher_sha256': cluster.launcher_digest()})
         self.assertEqual(manifest['targets'], [
             {'name': 'a', 'path': str(self.dirs[0]), 'info': {'fstype': 'tmpfs'}},
             {'name': 'b', 'path': str(self.dirs[1]), 'info': {'fstype': 'tmpfs'}},

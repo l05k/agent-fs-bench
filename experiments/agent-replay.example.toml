@@ -4,8 +4,9 @@
 # local disk of that machine, outside the measured targets. Docker images must
 # already be present there. Only accepted cassettes (record -> validate once) are
 # used for measurements.
-# tasks, cpus_per_task, oversubscribe and repeats are configured in
-# agent_fs_bench/benchmarks/agent_replay.py, not here.
+# One run replays one case: CONFIG['case'] in agent_fs_bench/benchmarks/agent_replay.py
+# names it (None requires exactly one [[cases]] entry). tasks, cpus_per_task,
+# oversubscribe and repeats are configured there too, not here.
 
 [[cases]]
 name = "task-a"

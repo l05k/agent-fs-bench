@@ -72,22 +72,22 @@ class WorkloadPlanTests(unittest.TestCase):
         self.assertEqual(args.repeats, 2)
         self.assertEqual(args.tasks, clone.CONFIG['tasks'])
 
-    def test_non_positive_dimensions_are_rejected(self):
-        for name in ('files', 'file_size_bytes', 'files_per_dir', 'repeats', 'tasks'):
+    def test_non_positive_dimensions_are_rejected_and_tasks_is_left_to_allocation(self):
+        for name in ('files', 'file_size_bytes', 'files_per_dir', 'repeats'):
             args = argparse.Namespace(**{**clone.CONFIG, name: 0})
             with self.subTest(name=name), self.assertRaisesRegex(BenchmarkError, name):
                 build_plan(args)
+        build_plan(argparse.Namespace(**{**clone.CONFIG, 'tasks': None}))
 
-    def test_copier_selection_fails_instead_of_measuring_nothing(self):
-        base = argparse.Namespace(target_copiers={'fs': []}, copiers=['cp-r'],
-                                  commands={'cp-r': 'cp -r {src} {dst}'})
-        with self.assertRaisesRegex(BenchmarkError, 'no copiers configured'):
-            clone.resolve_copiers(base, 'fs')
-        for commands in ({}, {'cp-r': 'not-an-installed-command-xyz {src} {dst}'}):
-            with self.subTest(commands=commands), self.assertRaisesRegex(
-                    BenchmarkError, 'no command configured|executable not found'):
-                clone.resolve_copiers(
-                    argparse.Namespace(target_copiers={}, copiers=['cp-r'], commands=commands), 'fs')
+    def test_copier_selection_fails_instead_of_measuring_something_else(self):
+        commands = {'cp-r': 'cp -r {src} {dst}'}
+        for selection, commands, message in (
+                ({'copier': 'cp-r', 'target_copiers': {'fs': 'lakebase'}}, commands,
+                 'no command configured'),
+                ({'copier': 'cp-r', 'target_copiers': {}},
+                 {'cp-r': 'not-an-installed-command-xyz {src} {dst}'}, 'executable not found')):
+            with self.subTest(message=message), self.assertRaisesRegex(BenchmarkError, message):
+                clone.resolve_copier(argparse.Namespace(**selection, commands=commands), 'fs')
 
 class DatasetShapeTests(unittest.TestCase):
     def setUp(self):

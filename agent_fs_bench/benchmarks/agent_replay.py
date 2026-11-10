@@ -1,9 +1,10 @@
 """Replay accepted Harbor agent traces against fresh task-data mounts on Linux.
 
-Each task runs its own independent replay of every case and repeat on its own
-machine: it restores its own initial-data copies under its task directory and
-starts together with every other task through one global Open MPI job. Replay
-output and logs are diagnostics and stay in this node's checkout.
+One run replays one case (`CONFIG['case']`) at one task count. Each task runs its own
+independent replay of every repeat on its own machine: it restores its own initial-data
+copies under its task directory and starts together with every other task through one
+global Open MPI job. Replay output and logs are diagnostics and stay in this node's
+checkout.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ from agent_fs_bench.results import PROJECT_ROOT, RunContext
 CONFIG = {
     # Relative names resolve in each machine's own checkout, never on the controller.
     "cases_file": "local/agent-replay.toml",
+    # One case per run; None selects the only case of the cases file.
+    "case": None,
     "repeats": 5,
     "tasks": 1,
     "cpus_per_task": 1,  # One Harbor trial per task; Docker containers run outside the pin.
@@ -99,6 +102,19 @@ def load_cases(config: Path) -> list[ReplayCase]:
     if not cases:
         raise ValueError("at least one replay case is required")
     return cases
+
+def select_case(cases: list[ReplayCase], name: str | None) -> ReplayCase:
+    """The one case this run replays."""
+    if name is None:
+        if len(cases) != 1:
+            raise ValueError("the cases file lists several cases; set CONFIG['case'] to one of "
+                             f"{', '.join(case.name for case in cases)}")
+        return cases[0]
+    for case in cases:
+        if case.name == name:
+            return case
+    raise ValueError(f"unknown replay case {name!r}; cases: "
+                     f"{', '.join(case.name for case in cases)}")
 
 def fingerprint(root: Path, paths: list[Path] | None = None) -> str:
     """Hash input bytes, modes, symlinks and hard-link topology, not host paths."""
@@ -245,11 +261,8 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
 
 def task(t: cluster.Task) -> None:
     cases_file = cases_path(t.args.cases_file)
-    cases = load_cases(cases_file)
-    names = t.gather([case.name for case in cases])
-    if t.index == 0 and any(entry != names[0] for entry in names):
-        raise RuntimeError(f"every machine must list the same replay cases: {names}")
-    facts = node_facts(t, cases, cases_file) if t.leader else None
+    case = select_case(load_cases(cases_file), t.args.case)
+    facts = node_facts(t, [case], cases_file) if t.leader else None
     facts = t.node_comm.bcast(facts, root=0)
     t.node_info(facts if t.leader else None)
     t.node_barrier()
@@ -257,20 +270,19 @@ def task(t: cluster.Task) -> None:
     if t.index == 0:
         check_consistent([entry for entry in entries if entry is not None])
     hosts = t.gather(t.node)
-    for case in cases:
-        expected = {mount["container"]: mount["initial_sha256"]
-                    for mount in facts["cases"][case.name]["mounts"]}
-        for repeat in range(1, t.args.repeats + 1):
-            wall, results = t.batch(replay_once, case, repeat, expected)
-            if t.index != 0:
-                continue
-            for sample, result in enumerate(results):
-                keys = {"case": case.name, "tasks": t.count, "repeat": repeat,
-                        "sample": sample, "host": hosts[sample]}
-                t.emit("replays", keys,
-                       {"elapsed_s": result["elapsed_s"],
-                        "model_requests": result["model_requests"]})
-                for phase, seconds in result["phases"].items():
-                    t.emit("phases", {**keys, "phase": phase}, {"seconds": seconds})
-            t.log(f"[{t.target.name}/{case.name}] repeat {repeat}: {t.count} task(s), "
-                  f"wall={wall:.3f}s")
+    expected = {mount["container"]: mount["initial_sha256"]
+                for mount in facts["cases"][case.name]["mounts"]}
+    for repeat in range(1, t.args.repeats + 1):
+        wall, results = t.batch(replay_once, t, case, repeat, expected)
+        if t.index != 0:
+            continue
+        for sample, result in enumerate(results):
+            keys = {"case": case.name, "tasks": t.count, "repeat": repeat,
+                    "sample": sample, "host": hosts[sample]}
+            t.emit("replays", keys,
+                   {"elapsed_s": result["elapsed_s"],
+                    "model_requests": result["model_requests"]})
+            for phase, seconds in result["phases"].items():
+                t.emit("phases", {**keys, "phase": phase}, {"seconds": seconds})
+        t.log(f"[{t.target.name}/{case.name}] repeat {repeat}: {t.count} task(s), "
+              f"wall={wall:.3f}s")

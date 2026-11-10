@@ -31,8 +31,10 @@ def run_benchmark(argv: list[str]) -> int:
     options = parser.parse_args(argv[:split])
     workload_argv = argv[split + 1:]
     module = analysis.workload(options.benchmark)
-    # The mode is part of the experiment: plot pools runs of one mode unless --vary mode.
-    config = {**vars(module.parse_args(workload_argv)), 'mode': options.mode}
+    # Mode and launcher settings are part of the experiment: plot pools runs of one mode
+    # and one launcher configuration unless --vary names them.
+    config = {**vars(module.parse_args(workload_argv)), 'mode': options.mode,
+              'launcher_sha256': cluster.launcher_digest()}
     targets = load_targets(TARGETS_FILE, options.dirs)
     # A misspelled override would silently measure cp-r; check before --target filtering.
     unknown = set(config.get('target_copiers', {})) - {target.name for target in targets}

@@ -35,40 +35,41 @@ same checkout and its own `uv sync --locked` environment.
 | `files` | `10000` | Files in one complete directory request. |
 | `file_size_bytes` | `4096` | Bytes per file; `files × file_size_bytes` is the request size. |
 | `files_per_dir` | `128` | Consecutive files per generated `d_i` directory. |
-| `repeats` | `5` | Independent fresh-destination batches per copier. |
+| `repeats` | `5` | Independent fresh-destination batches. |
 | `tasks` | `1` | Simultaneous independent requests, one per task process. |
 | `cpus_per_task` | `1` | Logical CPUs reserved per task; `cp` is single-threaded. |
 | `oversubscribe` | `1` | Tasks per CPU group. |
-| `copiers` | `["cp-r"]` | Default ordered copier names for each target. |
-| `target_copiers` | `{}` | Explicit target-alias overrides, including multiple operations on one filesystem. |
+| `copier` | `"cp-r"` | Copier name of every target without an override. |
+| `target_copiers` | `{}` | Target alias → copier name override; one copier per target and run. |
 | `commands` | `cp-r` and `lakebase` templates | Shell-quoted argv containing `{src}` and `{dst}`; executed without a shell. Only selected executables must exist. |
 | `keep_scratch` | `False` | Retain generated source and destination trees for inspection. |
 
 `tasks` is the only concurrency control; there is no in-run sweep of `files`,
-`file_size_bytes`, `tasks` or copiers. A run with `tasks=16` starts 16 identical
-requests, split across the participating machines by the placement plan. A task
-count above the probed capacity of the selected mode is an error, never a smaller
-run.
+`file_size_bytes`, `tasks` or copiers: a run uses one copier per target. A run with
+`tasks=16` starts 16 identical requests, split across the participating machines by
+the placement plan; `tasks=None` fills the capacity of the selected mode. A task
+count above that capacity is an error, never a smaller run.
 
 Example with registered aliases `LakeBase` and `NFS`:
 
 ```python
-CONFIG["copiers"] = ["cp-r"]
-CONFIG["target_copiers"] = {"LakeBase": ["lakebase", "cp-r"]}
+CONFIG["copier"] = "cp-r"
+CONFIG["target_copiers"] = {"LakeBase": "lakebase"}
 CONFIG["commands"] = {
     "cp-r": "cp -r {src} {dst}",
     "lakebase": "lakebase-client clone {src} {dst}",
 }
 ```
 
-All other targets use `cp-r`. Running both operations on LakeBase separates
-native-clone benefits from ordinary filesystem access performance. Use exact
-registered target names, or the directory basenames when using `--dirs`; only
-selected copiers need installed executables. Before creating a run, every
-`target_copiers` key is checked case-sensitively against the complete target
-catalog (or all `--dirs` basenames). An unknown key is an error, never an
-implicit switch to `cp-r`; the check precedes `--target` filtering, so valid
-overrides for unselected targets are allowed.
+All other targets use `cp-r`. To separate native-clone benefits from ordinary
+filesystem access on LakeBase, run once with this override and once without it,
+then pool the two runs with `plot --vary target_copiers`; the `target/copier`
+series keeps them apart. Use exact registered target names, or the directory
+basenames when using `--dirs`; only the selected copier needs an installed
+executable. Before creating a run, every `target_copiers` key is checked
+case-sensitively against the complete target catalog (or all `--dirs` basenames).
+An unknown key is an error, never an implicit switch to `cp-r`; the check precedes
+`--target` filtering, so valid overrides for unselected targets are allowed.
 
 A command must return only when the copied tree is complete and available to
 filesystem operations; a command that only submits an asynchronous job is not
@@ -88,7 +89,7 @@ actual path outside measurement when interpreting results.
 selection, command templates, layout, `tasks` and retention:
 
 - 32 files of 4096 B, one empty directory, and two repeats.
-- `batches.csv` gets one row per copier × repeat; `requests.csv` gets `tasks`
+- `batches.csv` gets one row per repeat; `requests.csv` gets `tasks`
   rows per batch.
 
 At most 128 KiB of source payload is present per node in a smoke case. The
@@ -100,12 +101,13 @@ benchmark is needed to check correctness or plotting.
 Every machine generates its own source tree; no directory is shared between
 machines and no machine reads data prepared on another machine.
 
-1. **Per node, on the leader task** (outside timing): resolve the selected copier
-   executables on that machine and validate each once in a tiny scratch fixture
-   (full content, empty directories, bidirectional source/destination write
-   independence); check free space for `local_count` destination copies plus the
-   source; generate and sync one source tree in `t.node_dir`; record the
-   filesystem type and copier executable SHA-256 digests in
+1. **Per node, on the leader task** (outside timing), after every task directory
+   exists: resolve the target's copier executable on that machine and validate it
+   once in a tiny scratch fixture (full content, empty directories, bidirectional
+   source/destination write independence); check free space for `local_count`
+   destination copies plus the source; generate and sync one source tree in
+   `t.node_dir`; fsync the node directory and every ancestor up to the target root;
+   record the filesystem type and copier executable SHA-256 digest in
    `targets[].info.hosts[<node>]`; then wait at the node barrier.
 2. **Per batch** (outside timing): every task removes its previous destination
    and creates a fresh destination parent in its own `t.task_dir`; every task
@@ -117,7 +119,6 @@ machines and no machine reads data prepared on another machine.
    shutdown, verification, emission and cleanup are outside time.
 4. Every task verifies its own copied tree against the node's source inventory
    (structure and sizes; contents were checked during validation).
-5. Copier order rotates between repeats, so no copier is always first.
 
 There is no `threads` parameter: one task runs one external copy command, and
 `tasks` counts independent commands. This measures simultaneous template clones,
@@ -147,7 +148,7 @@ The runner writes `results/clone/<run-id>/`:
 - `manifest.json`: configuration and per-node facts under
   `targets[].info.hosts[<node>]`, including the filesystem type and copier
   executable SHA-256 digests.
-- `batches.csv`: one row per target × copier × repeat, for the run's one shape.
+- `batches.csv`: one row per target × repeat, for the run's one shape and copier.
 - `requests.csv`: one row per task request within a batch.
 - `summary/batches.csv`, `summary/requests.csv`: `n` and median metrics per
   target × dimension.
@@ -184,8 +185,8 @@ A `target/copier` pair identifies a series, e.g. `LakeBase/lakebase`,
 `LakeBase/cp-r`, `NFS/cp-r`; operations cannot merge into one filesystem row.
 The `plot` command pools several runs only when their source fingerprints and
 manifest configurations match apart from `--vary`. Because one run holds one
-shape and one `tasks` value, draw scaling curves from several runs and pass the
-varying keys explicitly.
+shape, one copier per target and one `tasks` value, draw scaling curves and
+copier comparisons from several runs and pass the varying keys explicitly.
 
 ## Default figures
 

@@ -44,13 +44,17 @@ CONFIG: dict[str, Any] = {
     "tasks": None,
     "cpus_per_task": 1,
     "oversubscribe": 2,
-    # One file size per run. Former per-size defaults for files per task:
-    # 0 B and 4 KiB: 8192; 64 KiB: 2048; 1 MiB: 256.
+    # One file size per run.
     "file_size_bytes": 4096,
-    "items_per_task": 8192,
+    # None: files per task from ITEMS_PER_TASK for this size; an int overrides it.
+    "items_per_task": None,
     "repeats": 3,
     "layout": "private",
 }
+
+# Larger files get fewer items per task, so the 2x-CPU default stays within a few tens
+# of GiB per launch (128 tasks × 256 × 1 MiB = 32 GiB).
+ITEMS_PER_TASK = {0: 8192, 4096: 8192, 65536: 2048, 1048576: 256}
 
 # mdtest's "File read" column is a real data read here; rename its phase.
 OPERATION_NAMES = {"file-create": "file-create", "file-stat": "file-stat",
@@ -108,6 +112,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     if parsed.smoke:
         settings.update(items_per_task=16, repeats=1)
     args = argparse.Namespace(**settings, **vars(parsed))
+    if args.items_per_task is None:
+        if args.file_size_bytes not in ITEMS_PER_TASK:
+            raise BenchmarkError(f"no default items_per_task for {args.file_size_bytes} B; "
+                                 f"set it explicitly (defaults: {ITEMS_PER_TASK})")
+        args.items_per_task = ITEMS_PER_TASK[args.file_size_bytes]
     if (args.repeats < 1 or args.layout not in ("private", "shared")
             or type(args.items_per_task) is not int or args.items_per_task < 1
             or type(args.file_size_bytes) is not int or args.file_size_bytes < 0):

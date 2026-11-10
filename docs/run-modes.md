@@ -59,7 +59,7 @@ access to each other. The inventory is never written to results.
 ## Launcher settings
 
 `CONFIG` at the top of `agent_fs_bench/cluster.py` describes the controller and its
-network; it is not an experiment parameter and is not written to the manifest:
+network; its values are not written to the manifest:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -71,7 +71,9 @@ network; it is not an experiment parameter and is not written to the manifest:
 
 The manifest records the launcher name and version (`launcher`) and every machine's
 probed facts (`nodes`: name, hostname, CPU affinity list, kernel, architecture, Python,
-mpi4py and Open MPI library).
+mpi4py and Open MPI library). `mpiexec`, `mpiexec_args` and `env` change measurements,
+so `config.launcher_sha256` holds their SHA-256 without the values: `plot` pools runs
+with different launcher settings only with `--vary launcher_sha256`.
 
 On machines with several interfaces, or with identical bridge addresses (`docker0`,
 `virbr0`), Open MPI may dial the wrong address and hang. Restrict it to the shared
@@ -107,11 +109,11 @@ mdtest-peak 2):
 
 For example, with 8 CPUs on the controller and 8 on `node-a` in `overflow` mode:
 
-- `tasks = 12` places 8 tasks on the controller's CPUs 0–7 and 4 on node-a's CPUs 0–3.
-- With `cpus_per_task = 4`, the controller runs two tasks on CPUs {0–3} and {4–7}, and
-  node-a runs one.
-- With `oversubscribe = 2`, the controller takes 16 tasks, two per CPU, before node-a is
-  used.
+- `tasks = 12`: 8 tasks on the controller's CPUs 0–7 and 4 on node-a's CPUs 0–3.
+- `tasks = 3` with `cpus_per_task = 4`: the controller runs two tasks on CPUs {0–3}
+  and {4–7}, node-a one on {0–3}. The capacity is 4, so `tasks = 12` is an error.
+- `tasks = 16` with `oversubscribe = 2`: all 16 run on the controller, two per CPU,
+  and node-a is unused; `tasks = None` places 16 on each machine.
 
 ## Launch and placement proof
 
@@ -135,7 +137,9 @@ The controller compares every report with the plan and stores it per job under
     which gives the batch wall time.
   - Clocks of different machines are never compared; per-task durations are measured
     by each task on its own machine.
-- **Native MPI programs** (mdtest, mdtest-peak, mount-scale) run one MPI job per phase.
+- **Native MPI programs** run their own jobs: mdtest and mdtest-peak one MPI job per
+  repeat; mount-scale one job per shared fixture, then per repeat one warm-up job per
+  shared resource, the private job and one job per shared resource.
   - The wrapper reports the binary's SHA-256 and then execs it; every task must run
     the same binary.
   - mdtest's rank CSV is written on task 0's machine, and the wrapper returns its text

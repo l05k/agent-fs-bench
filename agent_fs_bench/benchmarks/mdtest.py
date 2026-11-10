@@ -2,10 +2,11 @@
 
 Each repeat is one global mdtest (IOR 4.0.0) job of ``tasks`` single-threaded MPI tasks,
 placed and pinned by ``agent_fs_bench.cluster``: ``-a POSIX -n total_items/N -i 1`` plus
-``-F`` (files) or ``-D`` (directories). The private layout gives every task its own
-``-d`` directory on its own machine plus ``-u``; the shared layout gives all tasks one
-``-d`` directory, so across machines the experimenter must provide a target that every
-machine sees as one directory. Every run keeps the same ``total_items`` aggregate work.
+``-F`` (files) or ``-D`` (directories). The private layout gives every machine one ``-d``
+directory plus ``-u``, so each task creates its own tree in that machine's directory;
+the shared layout gives all tasks one ``-d`` directory, so across machines the
+experimenter must provide a target that every machine sees as one directory. Every run
+keeps the same ``total_items`` aggregate work.
 No file data is written or read: mdtest's read_bytes keeps its default 0, so its "File
 read" phase only opens and closes each file.
 
@@ -20,7 +21,8 @@ exactly ``N`` tasks and the planned machine count. mdtest's known zero-byte read
 is expected and any other warning fails the run; a nonzero exit fails immediately, with
 no retry. Launcher logs stay in ``ctx.result_dir``; task 0's node returns the rank CSV
 through the launcher output. mdtest removes the files and directories it creates; the
-empty per-repeat directories stay under the run directory.
+empty per-repeat directories (and the precreated test directory on every machine but
+task 0's) stay under the run directory.
 
 Only --smoke is exposed on the workload CLI; edit CONFIG for a deliberate experiment.
 Targets are mounted externally.
@@ -165,14 +167,15 @@ def launch(ctx: RunContext, slots: Sequence[cluster.Slot], binary: str, options:
            layout: str, name: str) -> tuple[str, str]:
     """Run one mdtest job; return its stdout and task 0's rank CSV.
 
-    Private tasks get a fresh ``<work>/<node>/<name>/task-NNNN`` with mdtest's test
-    directory precreated on their own machine; shared tasks get ``<work>/<name>``.
+    Private tasks share one ``<work>/<node>/<name>`` per machine, with mdtest's test
+    directory precreated there (mdtest creates it only for rank 0); shared tasks get
+    ``<work>/<name>``.
     """
     capture = Path('/tmp') / f'agent-fs-bench-{ctx.run_id}-{ctx.target.name}-{name}.csv'
     directories, fresh, mkdirs = [], [], []
-    for index, slot in enumerate(slots):
+    for slot in slots:
         if layout == 'private':
-            directory = ctx.work_dir / slot.node.name / name / f'task-{index:04d}'
+            directory = ctx.work_dir / slot.node.name / name
             fresh.append([directory / TEST_DIR])
             mkdirs.append([])
         else:

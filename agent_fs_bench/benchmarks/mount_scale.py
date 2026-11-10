@@ -153,6 +153,10 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     # One single-threaded client per logical CPU, never oversubscribed.
     slots = cluster.allocate(ctx.pool.nodes, args.tasks, 1, 1)
     nodes = list(dict.fromkeys(slot.node for slot in slots))
+    if profile is None and len(nodes) > 1:
+        raise ValueError('--directory-smoke keeps its data in one machine\'s staging and runs on '
+                         f'one machine only; its {len(slots)} tasks span '
+                         f'{", ".join(node.name for node in nodes)}')
     count = len(slots)
     token = secrets.token_hex(16)
     workers: list[Worker] = []

@@ -17,9 +17,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 def source_digest() -> str:
     """Identify the Python sources and fixed inputs, including local edits.
 
-    Each module's top-level CONFIG literal is excluded: the manifest records its
-    values as `config`, so one sweep can edit CONFIG per run (e.g. `tasks`) while any
-    other source change still yields a new fingerprint.
+    Each module's top-level CONFIG literal is excluded: the manifest records a
+    workload's values as `config` (the launcher CONFIG of `cluster.py` only as
+    `config.launcher_sha256`), so one sweep can edit CONFIG per run (e.g. `tasks`)
+    while any other source change still yields a new fingerprint.
     """
     digest = hashlib.sha256()
     paths = list((PROJECT_ROOT / 'agent_fs_bench').rglob('*.py'))

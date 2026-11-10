@@ -282,10 +282,10 @@ column holds the fixture commit for commit-specific steps and is empty otherwise
 The manifest records the run configuration and per-target facts. Each node's
 `targets[].info.hosts[<node>]` entry holds `fixture_sha256` and the Git, Make and
 compiler versions of that machine. The target's `info` holds `jobs`,
-`cpus_per_task`, `batch_ms` (the barrier-to-barrier wall time of the whole task
-batch, including each task's untimed compiler probe and cleanup), `base_commit`,
-and (kernel workload) `tree_assertions`, the verified tree hash of every
-replayed commit. The compiler version is read through the makefile-selected
+`cpus_per_task`, `base_commit`, and (kernel workload) `tree_assertions`, the
+verified tree hash of every replayed commit. All instances start together, so the
+largest `elapsed_ms` of a run approximates its batch time. The compiler version is
+read through the makefile-selected
 `$(CC)`, not a Python guess based on environment `CC`. Collection is outside
 workload and cleanup timers. No full fixture body, kernel config, inherited
 build-variable dictionary, resolved make variables, or environment record is

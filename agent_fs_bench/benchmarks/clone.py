@@ -6,10 +6,11 @@ one global Open MPI job starts all requests together. Curves over tasks come fro
 several runs pooled with `plot --vary tasks`.
 
 Only --smoke is exposed on the workload CLI. Edit CONFIG for a deliberate
-experiment; targets are mounted externally. Every request runs one command,
-fsyncs its entire destination tree, then fsyncs the prepared destination parent.
-Per-node preparation, per-repeat preread, task startup and verification are not
-timed. A successful fsync is the experiment's persistence boundary.
+experiment; targets are mounted externally. A run uses one copier per target. Every
+request runs one command, fsyncs its entire destination tree, then fsyncs the
+prepared destination parent. Per-node preparation, per-repeat preread, task startup
+and verification are not timed. A successful fsync is the experiment's persistence
+boundary.
 """
 
 from __future__ import annotations
@@ -50,12 +51,12 @@ FIGURES = [
            xlabel="Total files", ylabel="Clone latency (s)", name="latency-files"),
 ]
 
-# Commands run without a shell. Only selected commands must be installed.
-# Example: target_copiers={"LakeBase": ["lakebase", "cp-r"]}; other targets
-# retain the default cp-r. Target names are the shared runner's explicit aliases.
+# Commands run without a shell. Only the selected command must be installed.
+# One copier per run: `copier`, or the target's entry in target_copiers, e.g.
+# target_copiers={"LakeBase": "lakebase"}. Target names are the runner's aliases.
 CONFIG: dict[str, Any] = {
     "repeats": 5,
-    "copiers": ["cp-r"],
+    "copier": "cp-r",
     "target_copiers": {},
     "commands": {
         "cp-r": "cp -r {src} {dst}",
@@ -190,21 +191,16 @@ def warm_source(source: Path, expected_bytes: int) -> None:
     if read_bytes != expected_bytes:
         raise BenchmarkError(f"source preread: {read_bytes} bytes, expected {expected_bytes}")
 
-def resolve_copiers(args: argparse.Namespace, target_name: str) -> list[Copier]:
-    """Expand the selected copier names into executable argv templates."""
-    names = args.target_copiers.get(target_name, args.copiers)
-    if not names:
-        raise BenchmarkError(f"no copiers configured for {target_name}")
-    copiers = []
-    for name in dict.fromkeys(names):
-        if name not in args.commands:
-            raise BenchmarkError(f"no command configured for copier {name!r}")
-        argv = shlex.split(args.commands[name])
-        executable = shutil.which(argv[0]) if argv else None
-        if executable is None:
-            raise BenchmarkError(f"{name}: executable not found: {argv[0] if argv else ''}")
-        copiers.append(Copier(name, (executable, *argv[1:])))
-    return copiers
+def resolve_copier(args: argparse.Namespace, target_name: str) -> Copier:
+    """The one copier this target uses, as an executable argv template."""
+    name = args.target_copiers.get(target_name, args.copier)
+    if name not in args.commands:
+        raise BenchmarkError(f"no command configured for copier {name!r}")
+    argv = shlex.split(args.commands[name])
+    executable = shutil.which(argv[0]) if argv else None
+    if executable is None:
+        raise BenchmarkError(f"{name}: executable not found: {argv[0] if argv else ''}")
+    return Copier(name, (executable, *argv[1:]))
 
 def copy_request(source: Path, destination: Path, copier: Copier) -> RequestResult:
     """Copy one complete tree into an absent destination, including persistence."""
@@ -256,8 +252,8 @@ def validate_copier(copier: Copier, scratch: Path) -> None:
         shutil.rmtree(root)
 
 def build_plan(args: argparse.Namespace) -> Workload:
-    """Validate the one directory shape and concurrency this run measures."""
-    for name in ("files", "file_size_bytes", "files_per_dir", "repeats", "tasks"):
+    """Validate the one directory shape this run measures; `cluster.allocate` checks tasks."""
+    for name in ("files", "file_size_bytes", "files_per_dir", "repeats"):
         value = getattr(args, name)
         if type(value) is not int or value < 1:
             raise BenchmarkError(f"{name} must be a positive integer: {value!r}")
@@ -267,19 +263,30 @@ def executable_sha256(path: str) -> str:
     with open(path, "rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
+def fsync_ancestors(directory: Path, target: Path) -> None:
+    """Persist `directory` and every ancestor entry up to the target root."""
+    directory, target = directory.resolve(), target.resolve()
+    if not directory.is_relative_to(target):
+        raise BenchmarkError(f"{directory} escapes target {target}")
+    while directory != target:
+        fsync_dir(directory)
+        directory = directory.parent
+    fsync_dir(target)
+
 def _prepare_node(
     t: cluster.Task, args: argparse.Namespace, spec: Workload,
-) -> tuple[list[Copier], dict[str, int | None]]:
-    """One node's copiers, source tree and facts; every task receives them."""
-    copiers: list[Copier] | None = None
+) -> tuple[Copier, dict[str, int | None]]:
+    """One node's copier, source tree and facts; every task receives them."""
+    copier: Copier | None = None
     inventory: dict[str, int | None] | None = None
     info: dict[str, Any] | None = None
+    # Every task directory exists before the run tree is persisted.
+    t.node_barrier()
     if t.leader:
         scratch = t.node_dir / "scratch"
         scratch.mkdir()
-        copiers = resolve_copiers(args, t.target.name)
-        for copier in copiers:
-            validate_copier(copier, scratch)
+        copier = resolve_copier(args, t.target.name)
+        validate_copier(copier, scratch)
         entries = spec.files + (spec.files + args.files_per_dir - 1) // args.files_per_dir + 2
         need = (t.local_count + 1) * (spec.total_bytes + entries * 4096) + 256 * MIB
         free = shutil.disk_usage(t.node_dir).free
@@ -289,15 +296,16 @@ def _prepare_node(
         t.log(f"[{t.target.name}/{t.node}] generate {spec.files} files x "
               f"{spec.file_size_bytes} B = {spec.total_bytes / MIB:g} MiB per request")
         gen_dataset(spec, t.node_dir / "source", args.files_per_dir)
+        # The run tree created by the framework is durable before any timing.
+        fsync_ancestors(t.node_dir, t.target.path)
         inventory = tree_inventory(t.node_dir / "source")
         info = {"fstype": fstype(t.target.path),
-                "copier_sha256": {copier.name: executable_sha256(copier.argv[0])
-                                  for copier in copiers}}
+                "copier_sha256": {copier.name: executable_sha256(copier.argv[0])}}
     prepared = t.node_comm.bcast(
-        {"copiers": copiers, "inventory": inventory} if t.leader else None, root=0)
+        {"copier": copier, "inventory": inventory} if t.leader else None, root=0)
     t.node_info(info)
     t.node_barrier()
-    return prepared["copiers"], prepared["inventory"]
+    return prepared["copier"], prepared["inventory"]
 
 def _cleanup(t: cluster.Task, keep_scratch: bool) -> None:
     if keep_scratch:
@@ -310,29 +318,26 @@ def task(t: cluster.Task) -> None:
     args = t.args
     spec = build_plan(args)
     source = t.node_dir / "source"
-    copiers, inventory = _prepare_node(t, args, spec)
+    copier, inventory = _prepare_node(t, args, spec)
     hosts = t.gather(t.node)
     for repeat in range(1, args.repeats + 1):
-        # Rotate operations to avoid making one copier first on every repeat.
-        offset = (repeat - 1) % len(copiers)
-        for copier in (*copiers[offset:], *copiers[:offset]):
-            destination = prepare_destination(t.task_dir)
-            warm_source(source, spec.total_bytes)
-            wall, results = t.batch(copy_request, source, destination, copier)
-            verify_tree(source, destination, inventory)
-            if t.index != 0:
-                continue
-            keys = {"copier": copier.name, "files": spec.files,
-                    "file_size_bytes": spec.file_size_bytes,
-                    "total_bytes": spec.total_bytes, "tasks": t.count, "repeat": repeat}
-            t.emit("batches", keys, {"wall_s": wall, "clones_s": t.count / wall})
-            for sample, result in enumerate(results):
-                t.emit("requests", {**keys, "sample": sample, "host": hosts[sample]},
-                       {"copy_s": result.copy_s, "fsync_s": result.fsync_s,
-                        "latency_s": result.latency_s})
-            t.log(f"[{t.target.name}/{copier.name}] {spec.files}x{spec.file_size_bytes} "
-                  f"tasks={t.count} rep{repeat}: batch={wall:.4f}s, "
-                  f"{t.count / wall:.2f} clones/s")
+        destination = prepare_destination(t.task_dir)
+        warm_source(source, spec.total_bytes)
+        wall, results = t.batch(copy_request, source, destination, copier)
+        verify_tree(source, destination, inventory)
+        if t.index != 0:
+            continue
+        keys = {"copier": copier.name, "files": spec.files,
+                "file_size_bytes": spec.file_size_bytes,
+                "total_bytes": spec.total_bytes, "tasks": t.count, "repeat": repeat}
+        t.emit("batches", keys, {"wall_s": wall, "clones_s": t.count / wall})
+        for sample, result in enumerate(results):
+            t.emit("requests", {**keys, "sample": sample, "host": hosts[sample]},
+                   {"copy_s": result.copy_s, "fsync_s": result.fsync_s,
+                    "latency_s": result.latency_s})
+        t.log(f"[{t.target.name}/{copier.name}] {spec.files}x{spec.file_size_bytes} "
+              f"tasks={t.count} rep{repeat}: batch={wall:.4f}s, "
+              f"{t.count / wall:.2f} clones/s")
     _cleanup(t, args.keep_scratch)
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:

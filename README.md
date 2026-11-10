@@ -122,10 +122,12 @@ Columns, summaries and plot options: [results and analysis](docs/results-and-ana
 
 - Archive the checkout, `uv.lock`, `local/` configs (with the launcher `CONFIG` of
   `agent_fs_bench/cluster.py`) and result directories. The source fingerprint covers
-  uncommitted changes (except each module's `CONFIG` literal, recorded as `config`)
-  but does not replace a source archive.
+  uncommitted changes, except each module's `CONFIG` literal. A workload's `CONFIG`
+  is recorded as `config`; the launcher `CONFIG` only as `config.launcher_sha256`, a
+  hash of `mpiexec`, `mpiexec_args` and `env`. Neither replaces a source archive.
 - `plot` pools runs only when their source fingerprints match and their `config`
-  matches apart from keys given to `--vary`; `mode` is part of `config`. It does not
+  matches apart from keys given to `--vary`; `mode` and `launcher_sha256` are part of
+  `config`. It does not
   compare tool versions (in each target's `info`), kernel, mount options or host
   environment; keep those consistent yourself. The manifest records each machine's
   probed facts (`nodes`) and every job's verified task placement.

@@ -118,7 +118,7 @@ uv run python -m agent_fs_bench run mount-scale --mode local \
   --dirs /tmp/mdtest-directory-smoke -- --directory-smoke
 ```
 
-`--directory-smoke` keeps its ordinary data inside the staging work directory, so it runs on one machine only. It needs at least two available logical CPUs on the selected machines; otherwise it fails before starting workers/MPI and never shrinks to N=1. This checks `sched_getaffinity`, not a container CPU-time quota.
+`--directory-smoke` keeps its ordinary data inside the staging work directory, so it runs on one machine only: its two tasks must fit on the first machine of the mode. If that machine has fewer than two available logical CPUs, the tasks would span machines or exceed capacity, and the run fails before starting workers/MPI; it never shrinks to N=1. This checks `sched_getaffinity`, not a container CPU-time quota.
 
 ## Execution and timing boundaries
 

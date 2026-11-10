@@ -21,7 +21,7 @@ measurement. A failed check emits no row.
 | --- | --- |
 | `benchmark`, `run_id` | Workload; UTC run ID with microseconds |
 | `source_sha256` | Fingerprint of benchmark sources and fixed inputs, including uncommitted edits; each workload's `CONFIG` literal is excluded because `config` records it |
-| `config` | The workload's settings: `CONFIG` plus workload flags, and the run `mode` |
+| `config` | The workload's settings: `CONFIG` plus workload flags, the run `mode`, and `launcher_sha256` (SHA-256 of the launcher's `mpiexec`, `mpiexec_args` and `env`, without their values) |
 | `launcher` | Name and version of the Open MPI launcher |
 | `nodes` | Each machine of the mode: name, hostname, CPU affinity list, kernel, architecture, Python, mpi4py, Open MPI library |
 | `targets[]` | `name`, `path` and `info` of each finished target: tool versions, binary hashes and fstype (per machine under `hosts`), and the verified task placement of every job (`placement`) |

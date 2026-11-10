@@ -155,7 +155,7 @@ they bound lifecycle scripts, registry requests and workspace tasks, while the t
    `prep_dir` existence and placement checks, the tool version check, then the seed under that
    machine's `source/` (npm cache; pnpm store plus XDG cache) from the committed inputs. The seed
    verifies the lockfile is unchanged, copies manifest plus lockfile into `template/`, and the leader
-   records `target_fstype`, `prep_fstype`, `cpu_count`, `tool_versions` and `seed_input_sha256` as
+   records `target_fstype`, `prep_fstype`, `tool_versions` and `seed_input_sha256` as
    this node's manifest facts. Nothing touches the target. With `seed_only` every task stops here
    and the sources stay on their machines.
 2. **Per-repeat preparation (untimed).** Per task: copy the machine's whole source into
@@ -245,7 +245,7 @@ inside the task that produced it, and the only cross-task time is the barrier wa
 launcher's own barriers delimit.
 
 Discovered facts live in `manifest.json`: `targets[].info.hosts[<node>]` holds that machine's
-`target_fstype`, `prep_fstype`, `cpu_count`, `tool_versions` and `seed_input_sha256` of the committed
+`target_fstype`, `prep_fstype`, `tool_versions` and `seed_input_sha256` of the committed
 template inputs; `targets[].path` holds the target directory, `run_id` the run, and `config` the run
 settings (`fixture`, `pm`, `repeats`, `tasks`, `cpus_per_task`, `oversubscribe`, `concurrency`,
 `prep_dir`, `ignore_scripts`, `flush`, `keep_node_modules`, `seed_only`, executable names, version

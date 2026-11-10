@@ -7,10 +7,11 @@ model responses. Only the task data directories live on the target filesystem.
 online adaptive agent. The agent, shell commands, verifier and artifact
 collection still run for real, so I/O may differ between runs.
 
-Each run measures **one** cases file, **one** repeat count and **one** external
-concurrency (`tasks`). Every task replays every case and repeat independently on
-its own machine, and one global Open MPI job starts all tasks together. Curves
-over tasks come from separate runs pooled with `plot --vary tasks`.
+Each run measures **one** case, **one** repeat count and **one** external
+concurrency (`tasks`). Every task replays every repeat of that case independently
+on its own machine, and one global Open MPI job starts all tasks together. Curves
+over tasks, and comparisons of cases, come from separate runs pooled with
+`plot --vary tasks` or `--vary case`.
 
 ## Requirements
 
@@ -105,7 +106,8 @@ probed capacity of the selected mode is an error, never a smaller run.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `cases_file` | `local/agent-replay.toml` | Cases file, resolved in each machine's checkout. |
-| `repeats` | `5` | Independent replays per case per task. |
+| `case` | `None` | Name of the one case to replay; `None` requires the cases file to list exactly one. |
+| `repeats` | `5` | Independent replays per task. |
 | `tasks` | `1` | Simultaneous independent replays, one per task process. |
 | `cpus_per_task` | `1` | Logical CPUs reserved per task; one replay drives one Docker task. |
 | `oversubscribe` | `1` | Tasks per CPU group. |
@@ -123,10 +125,10 @@ confdir, which costs startup time outside the measured window.
 
 ## Data preparation and timing
 
-Each target runs all cases in file order; each case runs its repeats in order.
-The node leader checks the replay executable, the Python/Harbor/mitmproxy
-versions and every input fingerprint once per node, before any measurement, and
-records them in the manifest. The facts of all nodes must agree.
+Each target replays the selected case; its repeats run in order. The node leader
+checks the replay executable, the Python/Harbor/mitmproxy versions and every
+input fingerprint of that case once per node, before any measurement, and records
+them in the manifest. The facts of all nodes must agree.
 
 Before every repeat, each task restores all inputs into a fresh
 `<target>/agent-fs-bench/agent-replay/<run-id>/<node>/task-NNNN/<case>/repeat-N/mount-I`
@@ -160,11 +162,11 @@ for that replay. Because both tables have a `repeat` column,
 `summary/<table>.csv` holds the median of each metric per target, case, tasks and
 host, with `n` samples.
 
-`figures/` holds `replay-time-tasks.pdf` (box plot of `elapsed_s` per tasks
-value, one panel per case) and one `replay-phases-<case>-<tasks>.pdf` per case
-and tasks value (box plot of `seconds` per Harbor phase; punctuation in the value
-becomes `_`). Pooled runs need `plot --vary tasks` (and any other key that
-differs); `python -m agent_fs_bench plot <run-dir>...` re-renders them.
+`figures/` holds `replay-time-tasks-<case>.pdf` (box plot of `elapsed_s` per tasks
+value) and one `replay-phases-<case>-<tasks>.pdf` per case and tasks value (box
+plot of `seconds` per Harbor phase; punctuation in the value becomes `_`). Pooled
+runs need `plot --vary tasks` (and `case` or any other key that differs);
+`python -m agent_fs_bench plot <run-dir>...` re-renders them.
 
 Per-node facts — Python/Harbor/mitmproxy versions, the submodule source hash, the
 model name, and the SHA-256 of the task, cassette and each initial mount — are in
