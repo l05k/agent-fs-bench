@@ -22,9 +22,9 @@ BENCHMARKS = (
 )
 RESULTS_DIR = PROJECT_ROOT / 'results'
 TARGETS_FILE = PROJECT_ROOT / 'local' / 'targets.toml'
-# No harness code draws random numbers that shape a measurement, so there is no seed to fix;
-# config.json records that explicitly. Workload content generators keep their own fixed inputs.
-SEED = None
+# The one random seed of every run: workloads that generate input content (clone's file
+# bytes) draw it from `random.Random(args.seed)`; config.json records it as `config.seed`.
+SEED = 20261110
 
 
 def parse_run_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
@@ -60,10 +60,15 @@ def select_targets(options: argparse.Namespace, config: dict[str, Any]) -> list[
     return targets
 
 
+def workload_args(module, workload_argv: list[str]) -> argparse.Namespace:
+    """The workload's parameters plus the run seed, parsed once per target."""
+    return argparse.Namespace(**vars(module.parse_args(workload_argv)), seed=SEED)
+
+
 def snapshot(benchmark: str, run_id: str, config: dict[str, Any], pool: cluster.Pool,
              tables: Tables, targets: list[dict[str, Any]]) -> dict[str, Any]:
-    """Parameters, seed and environment baseline of one run (config.json)."""
-    return {'benchmark': benchmark, 'run_id': run_id, 'seed': SEED,
+    """Parameters (incl. seed) and environment baseline of one run (config.json)."""
+    return {'benchmark': benchmark, 'run_id': run_id,
             'git_commit': git_commit(), 'source_sha256': source_digest(), 'config': config,
             'mpi_version': pool.mpi_version, 'nodes': pool.manifest(),
             'targets': targets, 'tables': tables.schemas}
@@ -77,7 +82,7 @@ def run_target(module, workload_argv: list[str], benchmark: str, run_id: str, ru
     context = RunContext(benchmark, run_id, target,
                          target.path / 'agent-fs-bench' / benchmark / run_id, result_dir,
                          tables, pool=pool)
-    module.run(context, module.parse_args(workload_argv))
+    module.run(context, workload_args(module, workload_argv))
     print(f'  {context.rows} rows', flush=True)
     return {'name': target.name, 'path': str(target.path), 'info': context.info}
 
@@ -86,7 +91,7 @@ def run_benchmark(argv: list[str]) -> int:
     options, workload_argv = parse_run_args(argv)
     module = analysis.workload(options.benchmark)
     launcher = cluster.Launcher(**cluster.CONFIG)
-    config = {**vars(module.parse_args(workload_argv)), 'mode': options.mode,
+    config = {**vars(workload_args(module, workload_argv)), 'mode': options.mode,
               'launcher': launcher.record()}
     targets = select_targets(options, config)
     pool = cluster.open_pool(options.mode, launcher)

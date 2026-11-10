@@ -12,8 +12,13 @@ Each repeat is one global mdtest (IOR 4.0.0) job: ``-a POSIX -n W/N -i 1`` plus 
 (files) or ``-D`` (directories). The private layout gives every machine one ``-d``
 directory plus ``-u``, so each task creates its own tree; the shared layout gives all
 tasks one ``-d`` directory, which across machines must be one shared directory. No file
-data is written or read ("File read" only opens and closes). There is no warm-up: every
-repeat is measured, and its cache state is create-then-access without drops.
+data is written or read ("File read" only opens and closes).
+
+Warm-up, then sampling: ``warmup_repeats`` identical launches run first, are validated
+like measured ones, and their timings are discarded. Every measured repeat therefore
+starts from the same cache state: target mounted, directories, client caches and MPI
+launch paths already exercised by an identical job, no cache drop. mdtest removes its
+own objects, so each repeat still creates fresh files.
 
 IOR 4.0.0 overwrites aggregate directory create/stat item counts with rank 0's local
 counts, so CSV rate/item fields are never used; X_p always divides the fixed W.
@@ -37,7 +42,7 @@ from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import RunContext
 
 MDTEST_VERSION = "4.0.0"
-CACHE_STATE = "create-then-access-no-drop"
+CACHE_STATE = "after-warmup-create-then-access-no-drop"
 COMPLETION = "operation-return"
 # mdtest creates its test directory only for rank 0; every private machine gets it first.
 TEST_DIR = "test-dir.0-0"
@@ -48,6 +53,7 @@ CONFIG: dict[str, Any] = {
     "mdtest_bin": "mdtest",
     "tasks": 1,
     "total_items": 65536,
+    "warmup_repeats": 1,  # Discarded launches before the measured repeats.
     "repeats": 5,
     "layout": "private",
     "subset": "file",
@@ -187,6 +193,15 @@ def binary_info(launcher: cluster.Launcher, placement: cluster.Placement,
             'placement': cluster.placement_record(placement)}
 
 
+def warm_up(ctx: RunContext, placement: cluster.Placement, binary: str, options: Sequence[str],
+            layout: str, subset: str, total_items: int, label: str, count: int) -> None:
+    """Warm-up phase: `count` full launches, validated, timings discarded."""
+    for number in range(1, count + 1):
+        name = f"{label}-warmup{number}"
+        stdout, _text = launch(ctx, placement, binary, options, layout, name)
+        validate(stdout, subset, len(placement), total_items, name)
+
+
 def write_repeat(ctx: RunContext, keys: dict[str, Any], placement: cluster.Placement,
                  phases: list[tuple[str, int, float, float]],
                  ranks: dict[str, list[float]]) -> None:
@@ -205,8 +220,11 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     options = ["-a", "POSIX", "-n", str(items), "-i", "1", "-F" if args.subset == "file" else "-D"]
     ctx.info.update(mdtest_version=MDTEST_VERSION, cache_state=CACHE_STATE, completion=COMPLETION,
                     **binary_info(ctx.pool.launcher, placement, args.mdtest_bin))
+    label = f"{args.subset}-{args.layout}-N{tasks}"
+    warm_up(ctx, placement, args.mdtest_bin, options, args.layout, args.subset,
+            args.total_items, label, args.warmup_repeats)
     for repeat in range(1, args.repeats + 1):
-        name = f"{args.subset}-{args.layout}-N{tasks}-rep{repeat}"
+        name = f"{label}-rep{repeat}"
         print(f"  {name}: {items} items/task", flush=True)
         stdout, text = launch(ctx, placement, args.mdtest_bin, options, args.layout, name)
         validate(stdout, args.subset, tasks, args.total_items, name)
@@ -225,9 +243,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parsed = parser.parse_args(argv)
     settings = dict(CONFIG)
     if parsed.smoke:
-        settings.update(total_items=128, repeats=2)
+        settings.update(total_items=128, warmup_repeats=1, repeats=2)
     args = argparse.Namespace(**settings, **vars(parsed))
     assert args.repeats >= 1, f"repeats: expected >= 1, measured {args.repeats}"
+    assert args.warmup_repeats >= 1, \
+        f"warmup_repeats: expected >= 1, measured {args.warmup_repeats}"
     assert args.layout in ("private", "shared"), \
         f"layout: expected private or shared, measured {args.layout!r}"
     assert args.subset in ("file", "dir"), f"subset: expected file or dir, measured {args.subset!r}"

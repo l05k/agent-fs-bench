@@ -28,7 +28,8 @@ One run measures one task count and one file size. A peak curve is several runs 
 | `tasks` | `128` | N, a positive integer; tasks above a machine's CPU count share CPUs, and oversubscribed points are intended |
 | `file_size_bytes` | `4096` | Bytes written and read per file (one size per run) |
 | `items_per_task` | `None` | Files per task; `None` takes the per-size default (0 B and 4 KiB 8192, 64 KiB 2048, 1 MiB 256), which keeps 128 tasks within a few tens of GiB per launch; an integer overrides it, and another size needs one |
-| `repeats` | 3 | Fresh launch and working directories per repeat |
+| `warmup_repeats` | 1 | Identical launches before the measured repeats; validated, timings discarded |
+| `repeats` | 3 | Measured launches with fresh working directories |
 | `layout` | `private` | `private`: one directory per machine with per-task trees (`-u`); `shared`: one common directory |
 
 Each launch is `mdtest -a POSIX -F -i 1 -n <n> -w S -e S -y [-u]`:
@@ -40,7 +41,7 @@ Each launch is `mdtest -a POSIX -F -i 1 -n <n> -w S -e S -y [-u]`:
 | `file-read` | open, read S bytes, close |
 | `file-unlink` | unlink |
 
-`-y` makes mdtest fsync after each write. IOR 4.0.0 skips the write for S=0, so the 0 B create has no fsync; it measures pure create/close metadata cost. Reads follow writes in the same launch with **no cache drop** (`cache_state = write-then-read-same-launch-no-drop`), so read MiB/s can come from the client page cache. Do not report it as storage-server read bandwidth.
+`-y` makes mdtest fsync after each write. IOR 4.0.0 skips the write for S=0, so the 0 B create has no fsync; it measures pure create/close metadata cost. Measured repeats follow `warmup_repeats` identical, discarded launches, and reads follow writes in the same launch with **no cache drop** (`cache_state = after-warmup-write-then-read-same-launch-no-drop`), so read MiB/s can come from the client page cache. Do not report it as storage-server read bandwidth.
 
 ## Results
 
@@ -52,7 +53,7 @@ Each run writes one flat CSV per record kind plus a `config.json`:
 | `bandwidth` | `operation`, `layout`, `tasks`, `repeat`, `file_size_bytes`, `items_per_task` | `bytes`, `elapsed_s`, `mib_per_s` |
 | `ranks` | `operation`, `layout`, `tasks`, `repeat`, `file_size_bytes`, `items_per_task`, `sample`, `host` | `elapsed_s` |
 
-`bandwidth` holds only create and read with S>0. A `ranks` row is one task's phase time before the end barrier, from mdtest's per-rank CSV rows. There is no warm-up launch: every repeat is measured.
+`bandwidth` holds only create and read with S>0. A `ranks` row is one task's phase time before the end barrier, from mdtest's per-rank CSV rows. Warm-up launches emit no row.
 
 | Metric | Definition |
 | --- | --- |

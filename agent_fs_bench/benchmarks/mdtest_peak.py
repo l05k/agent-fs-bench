@@ -20,7 +20,8 @@ size ``S``:
 | t_{p,r} | Rank r's phase time before the end barrier (table `ranks`) |
 
 Reads follow writes in the same launch without cache drops, so they may be served by the
-client page cache. There is no warm-up: every repeat is measured. Tasks above the CPU
+client page cache. ``warmup_repeats`` identical launches run first and are discarded, so
+every measured repeat starts from the same post-warm-up cache state. Tasks above the CPU
 count oversubscribe (round-robin per machine); a peak curve is several runs with
 different ``tasks`` (for example powers of two up to 2x CPUs) pooled with
 ``plot --vary tasks``.
@@ -34,11 +35,12 @@ from typing import Any, Sequence
 from agent_fs_bench import cluster
 from agent_fs_bench.analysis import Figure
 from agent_fs_bench.benchmarks.mdtest import (
-    MDTEST_VERSION, binary_info, launch, read_phases, read_rank_times, validate, write_repeat,
+    MDTEST_VERSION, binary_info, launch, read_phases, read_rank_times, validate, warm_up,
+    write_repeat,
 )
 from agent_fs_bench.results import RunContext
 
-CACHE_STATE = "write-then-read-same-launch-no-drop"
+CACHE_STATE = "after-warmup-write-then-read-same-launch-no-drop"
 COMPLETION = "fsync-per-file-after-write"
 MIB = 1024 * 1024
 
@@ -49,6 +51,7 @@ CONFIG: dict[str, Any] = {
     "file_size_bytes": 4096,
     # None: files per task from ITEMS_PER_TASK for this size; an int overrides it.
     "items_per_task": None,
+    "warmup_repeats": 1,  # Discarded launches before the measured repeats.
     "repeats": 3,
     "layout": "private",
 }
@@ -92,8 +95,11 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
                "-y"]
     ctx.info.update(mdtest_version=MDTEST_VERSION, cache_state=CACHE_STATE, completion=COMPLETION,
                     **binary_info(ctx.pool.launcher, placement, args.mdtest_bin))
+    label = f"S{size}-{args.layout}-N{tasks}"
+    warm_up(ctx, placement, args.mdtest_bin, options, args.layout, "file", total, label,
+            args.warmup_repeats)
     for repeat in range(1, args.repeats + 1):
-        name = f"S{size}-{args.layout}-N{tasks}-rep{repeat}"
+        name = f"{label}-rep{repeat}"
         print(f"  {name}: {items} files/task of {size} B", flush=True)
         stdout, text = launch(ctx, placement, args.mdtest_bin, options, args.layout, name)
         validate(stdout, "file", tasks, total, name)
@@ -125,6 +131,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             f"measured {args.file_size_bytes} B; set items_per_task explicitly"
         args.items_per_task = ITEMS_PER_TASK[args.file_size_bytes]
     assert args.repeats >= 1, f"repeats: expected >= 1, measured {args.repeats}"
+    assert args.warmup_repeats >= 1, \
+        f"warmup_repeats: expected >= 1, measured {args.warmup_repeats}"
     assert args.layout in ("private", "shared"), \
         f"layout: expected private or shared, measured {args.layout!r}"
     assert type(args.items_per_task) is int and args.items_per_task >= 1, \

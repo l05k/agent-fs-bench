@@ -103,7 +103,8 @@ machines and no machine reads data prepared on another machine.
    once in a tiny scratch fixture (full content, empty directories, bidirectional
    source/destination write independence); check free space for `local_count`
    destination copies plus the source; generate and sync one source tree in
-   `t.node_dir`; fsync the node directory and every ancestor up to the target root;
+   `t.node_dir` from `random.Random(config.seed)` (byte-identical for the same seed on
+   every machine and run); fsync the node directory and every ancestor up to the target root;
    record the filesystem type and copier executable SHA-256 digest in
    `targets[].info.hosts[<node>]`; then wait at the node barrier.
 2. **Per batch** (outside timing): every task removes its previous destination

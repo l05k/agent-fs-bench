@@ -126,66 +126,6 @@ class CommandTests(unittest.TestCase):
             bench.install_command('pnpm', 'pnpm', Path('/prep/source'), False))
 
 
-class BatchMetricTests(unittest.TestCase):
-    TREES = [
-        {'files': 3, 'dirs': 1, 'symlinks': 0, 'hardlinks': 0,
-         'logical_bytes': 10, 'allocated_bytes': 10, 'du_kib': 1},
-        {'files': 5, 'dirs': 2, 'symlinks': 1, 'hardlinks': 0,
-         'logical_bytes': 20, 'allocated_bytes': 20, 'du_kib': 2},
-    ]
-
-    def test_durable_batch_takes_the_barrier_wall_and_the_slowest_install(self):
-        samples = [
-            {'host': 'local', 'install_s': 2.0, 'flush_s': 1.0, 'durable_s': 3.0,
-             'user_s': 0.4, 'sys_s': 0.2},
-            {'host': 'node-b', 'install_s': 1.6, 'flush_s': 0.2, 'durable_s': 1.8,
-             'user_s': 0.3, 'sys_s': 0.1},
-        ]
-        result = bench.batch_metrics(samples, self.TREES, wall=3.4)
-        self.assertEqual(result['batch_install_s'], 2.0)
-        self.assertEqual(result['batch_durable_s'], 3.4)
-        self.assertEqual(result['install_mean_s'], 1.8)
-        self.assertEqual(result['flush_mean_s'], 0.6)
-        self.assertEqual(result['durable_mean_s'], 2.4)
-        self.assertAlmostEqual(result['installs_per_s'], 1.0, places=6)
-        self.assertAlmostEqual(result['durable_installs_per_s'], 2 / 3.4, places=6)
-        self.assertEqual(result['user_s'], 0.7)
-        self.assertEqual(result['sys_s'], 0.3)
-        self.assertEqual(result['files'], 8)
-        self.assertEqual(result['dirs'], 3)
-        self.assertEqual(result['du_kib'], 3)
-
-    def test_install_only_batch_has_no_flush_or_durable_columns(self):
-        samples = [
-            {'host': 'local', 'install_s': 2.0, 'user_s': 0.4, 'sys_s': 0.2},
-            {'host': 'node-b', 'install_s': 1.0, 'user_s': 0.3, 'sys_s': 0.1},
-        ]
-        result = bench.batch_metrics(samples, self.TREES, wall=2.2, flush=False)
-        self.assertEqual(result['batch_install_s'], 2.0)
-        self.assertEqual(result['install_mean_s'], 1.5)
-        self.assertAlmostEqual(result['installs_per_s'], 1.0, places=6)
-        self.assertEqual(result['user_s'], 0.7)
-        self.assertEqual(result['files'], 8)
-        for key in ('flush_mean_s', 'durable_mean_s',
-                    'batch_durable_s', 'durable_installs_per_s'):
-            self.assertNotIn(key, result)
-
-    def test_one_task_batch_is_its_own_install(self):
-        samples = [{'host': 'local', 'install_s': 2.5, 'flush_s': 0.5,
-                    'durable_s': 3.0, 'user_s': 1.0, 'sys_s': 0.5}]
-        result = bench.batch_metrics(samples, self.TREES[:1], wall=3.1)
-        self.assertEqual(result['batch_install_s'], 2.5)
-        self.assertEqual(result['batch_durable_s'], 3.1)
-        self.assertAlmostEqual(result['durable_installs_per_s'], 1 / 3.1, places=6)
-
-    def test_install_rows_drop_the_removed_start_offset(self):
-        sample = {'host': 'node-b', 'install_s': 2.0, 'flush_s': 0.5, 'durable_s': 2.5,
-                  'user_s': 0.4, 'sys_s': 0.2}
-        self.assertEqual(list(bench.install_metrics(sample, True)),
-                         ['install_s', 'flush_s', 'durable_s', 'user_s', 'sys_s'])
-        self.assertEqual(list(bench.install_metrics(sample, False)),
-                         ['install_s', 'user_s', 'sys_s'])
-
 
 class TreeMetricTests(unittest.TestCase):
     def test_inventory_counts_links_without_following_them(self):

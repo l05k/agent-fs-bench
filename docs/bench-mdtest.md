@@ -25,7 +25,8 @@ Edit the single `CONFIG` dictionary in `agent_fs_bench/benchmarks/mdtest.py`:
 | `mdtest_bin` | `mdtest` | Native IOR 4.0.0 executable, the same on every machine |
 | `tasks` | `1` | N single-threaded mdtest tasks of this run |
 | `total_items` | 65536 | Fixed aggregate objects in each phase, not objects per task |
-| `repeats` | 5 | Independent launches with fresh working directories |
+| `warmup_repeats` | 1 | Identical launches before the measured repeats; validated, timings discarded |
+| `repeats` | 5 | Measured launches with fresh working directories |
 | `layout` | `private` | `private`: one directory per machine with per-task trees (`-u`); `shared`: one common directory |
 | `subset` | `file` | `file` or `dir`, one per run |
 
@@ -57,7 +58,7 @@ Each run writes one flat CSV per record kind plus a `config.json`:
 | `phases` | `operation`, `layout`, `tasks`, `repeat` | `ops`, `elapsed_s`, `ops_per_s` |
 | `ranks` | `operation`, `layout`, `tasks`, `repeat`, `sample`, `host` | `elapsed_s` |
 
-One `phases` row is one operation at one layout, task count and repeat. A `ranks` row is one task's phase time before the end barrier, from mdtest's per-rank CSV rows; `sample` is the rank index and `host` its machine. `config.json` holds the config, the mdtest version, the cache/completion policy, the executable SHA-256 shared by every machine (`mdtest_sha256`), and the task count per machine (`placement`). There is no warm-up launch: every repeat is measured.
+One `phases` row is one operation at one layout, task count and repeat. A `ranks` row is one task's phase time before the end barrier, from mdtest's per-rank CSV rows; `sample` is the rank index and `host` its machine. `config.json` holds the config, the mdtest version, the cache/completion policy, the executable SHA-256 shared by every machine (`mdtest_sha256`), and the task count per machine (`placement`). Method: `warmup_repeats` warm-up launches, then the measured repeats, all in the same cache state; warm-up launches emit no row.
 
 `elapsed_s` comes from the CSV `all` row's aggregate phase time, including the end barrier: the longest phase time across tasks, not subprocess startup or an average of task times. `ops` is the fixed total verified against mdtest's own workload report; `ops_per_s = ops / elapsed_s`.
 
@@ -72,7 +73,7 @@ After the job, before emitting a phase row, the controller checks:
 
 The known zero-byte read notice is expected. Launcher logs stay outside the target under the result directory. The controller fetches rank 0's CSV from rank 0's machine and removes it there, so no machine needs a shared result directory. mdtest removes the files and directories it creates; the empty per-repeat directories, and the `test-dir.0-0` the controller creates on each machine before the launch, stay under the run directory. A failed launch keeps its diagnostics and stops the run.
 
-Cache state is **create-then-access-no-drop**, not guaranteed warm residency or cold NAS access. Stat/open follow creation without cache eviction; metadata may be served by client caches. Completion is ordinary operation return: no extra `-y`/`-Y`, no per-operation tail latency or crash-durability claim.
+Cache state is **after-warmup-create-then-access-no-drop**: every measured repeat follows an identical warm-up job (mount, directories, client caches and MPI launch paths already exercised) with no cache drop. It is neither guaranteed warm residency nor cold NAS access: mdtest removes its objects, so each repeat creates fresh files and stat/open follow creation. Completion is ordinary operation return: no extra `-y`/`-Y`, no per-operation tail latency or crash-durability claim.
 
 ## Default figures
 

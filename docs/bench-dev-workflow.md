@@ -73,8 +73,8 @@ a local path is resolved on each machine, so use one that exists there.
 
 `tasks` is the number of simultaneous independent instances, one per task.
 `jobs` is the task's build parallelism, passed to `make -j`; tasks above a
-machine's CPU count time-share its CPUs. Mini caps `jobs` at 2, matching the
-harness's fixed build parallelism.
+machine's CPU count time-share its CPUs. Mini requires `jobs` between 1 and 2,
+the harness's fixed build parallelism; a larger value fails the run.
 
 ## Prerequisites and complete smoke commands
 
@@ -240,7 +240,7 @@ compiler version selected by make is collected after timing, before worktree
 removal/pruning. As upstream, command exit codes are checked but commit trees
 are not compared.
 
-Mini defaults to two build jobs via `CONFIG["jobs"]`, caps `jobs` at two, and
+Mini defaults to two build jobs via `CONFIG["jobs"]`, rejects more than two, and
 supports a value of one. The shipped fixture builds
 one C translation unit. A complete run writes 27 rows per task to `steps.csv`.
 Each task's source repository remains after cleanup.

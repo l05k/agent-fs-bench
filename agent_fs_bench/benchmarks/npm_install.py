@@ -60,10 +60,11 @@ CONFIG: dict[str, Any] = {
     "flush": True,
 }
 
+# Figures draw every install row (median and IQR), never a pre-computed batch mean.
 FIGURES = [
-    Figure("batches", "tasks", "install_mean_s", split=("manager",),
+    Figure("installs", "tasks", "install_s", split=("manager",),
            xlabel="Concurrent installs", ylabel="Install time (s)", logx=True),
-    Figure("batches", "tasks", "durable_mean_s", split=("manager",),
+    Figure("installs", "tasks", "durable_s", split=("manager",),
            xlabel="Concurrent installs", ylabel="Durable install time (s)", logx=True),
 ]
 
@@ -470,45 +471,17 @@ def install(
     return sample
 
 
-def install_metrics(sample: dict[str, int | float | str], flush: bool) -> dict[str, int | float]:
+def install_metrics(sample: dict[str, int | float | str], tree: dict[str, int],
+                    flush: bool) -> dict[str, int | float]:
+    """One install: its own timings, child CPU time and resulting node_modules inventory."""
     names = ("install_s", "flush_s", "durable_s") if flush else ("install_s",)
-    return {**{name: sample[name] for name in names},
-            **{name: sample[name] for name in ("user_s", "sys_s")}}
+    return {**{name: sample[name] for name in (*names, "user_s", "sys_s")}, **tree}
 
 
-def batch_metrics(
-    samples: list[dict[str, int | float | str]], trees: list[dict[str, int]],
-    wall: float, flush: bool = True,
-) -> dict[str, int | float]:
-    """Summarize one barrier-aligned batch from per-task samples.
-
-    `wall` is the batch's barrier-to-barrier time and therefore covers release
-    skew plus every task's install and flush; it is the durable batch time.
-    `batch_install_s` is the slowest task's own install duration, because a
-    start offset across machines is not observable.
-    """
-    count = len(samples)
-    phases = ("install", "flush", "durable") if flush else ("install",)
-    metrics = {
-        f"{phase}_mean_s": sum(sample[f"{phase}_s"] for sample in samples) / count
-        for phase in phases
-    }
-    install_s = max(sample["install_s"] for sample in samples)
-    metrics.update({
-        "batch_install_s": install_s,
-        "installs_per_s": count / install_s,
-        "user_s": sum(sample["user_s"] for sample in samples),
-        "sys_s": sum(sample["sys_s"] for sample in samples),
-    })
-    if flush:
-        metrics.update({
-            "batch_durable_s": wall,
-            "durable_installs_per_s": count / wall,
-        })
-    return {
-        **{key: round(value, 6) for key, value in metrics.items()},
-        **{key: sum(tree[key] for tree in trees) for key in trees[0]},
-    }
+def batch_metrics(tasks: int, wall: float) -> dict[str, float]:
+    """One barrier-aligned batch: `wall_s` from the release barrier to the barrier after
+    every task's install (and flush, with `flush`); `installs_per_s = tasks / wall_s`."""
+    return {"wall_s": wall, "installs_per_s": tasks / wall}
 
 
 def node_prep_dir(t: cluster.Task) -> Path:
@@ -591,10 +564,10 @@ def run_repeat(t: cluster.Task, args: argparse.Namespace, repeat: int, binary: s
     trees = t.gather(tree_metrics(project / "node_modules"))
     if t.index == 0:
         keys = {"manager": manager, "tasks": t.count, "repeat": repeat}
-        t.emit("batches", keys, batch_metrics(samples, trees, wall, flush=args.flush))
-        for index, sample in enumerate(samples, 1):
+        t.emit("batches", keys, batch_metrics(t.count, wall))
+        for index, (sample, tree) in enumerate(zip(samples, trees), 1):
             t.emit("installs", {**keys, "sample": index, "host": sample["host"]},
-                   install_metrics(sample, args.flush))
+                   install_metrics(sample, tree, args.flush))
     if not args.keep_node_modules:
         remove_tree(project)
     remove_tree(sandbox)

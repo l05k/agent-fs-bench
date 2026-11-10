@@ -33,10 +33,10 @@ class KernelConfigFixtureTests(unittest.TestCase):
         self.assertNotIn('CONFIG_X86_32=y', lines)
 
 class ConfigurationTests(unittest.TestCase):
-    def test_mini_caps_build_parallelism(self):
-        with mock.patch.dict(mini_dev_workflow.CONFIG, {'jobs': 9}):
-            args = mini_dev_workflow.parse_args([])
-        self.assertEqual(args.jobs, mini_dev_workflow.FIXED_JOBS)
+    def test_mini_rejects_jobs_above_the_fixed_parallelism_instead_of_clamping(self):
+        with mock.patch.dict(mini_dev_workflow.CONFIG, {'jobs': 9}), \
+                self.assertRaisesRegex(AssertionError, 'jobs'):
+            mini_dev_workflow.parse_args([])
 
 class FixtureResolutionTests(unittest.TestCase):
     def test_relative_fixture_dir_resolves_in_checkout(self):

@@ -34,7 +34,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
 from pathlib import Path
-import secrets
 import time
 from typing import Any
 
@@ -191,8 +190,10 @@ def start(ctx: RunContext, args: argparse.Namespace, profile: Profile | None,
     nodes = cluster.machines(placement)
     if profile is None:
         assert len(nodes) == 1, f'--directory-smoke machines: expected 1, measured {len(nodes)}'
-    token, launcher = secrets.token_hex(16), ctx.pool.launcher
-    workers = [Worker(node, worker_job(ctx, args, node.name, data_root, token, profile_text),
+    launcher = ctx.pool.launcher
+    # run_id is unique per run and identical on every machine: the admin-view sentinel.
+    workers = [Worker(node, worker_job(ctx, args, node.name, data_root, ctx.run_id,
+                                       profile_text),
                       ctx.result_dir / 'hosts' / node.name, args.command_timeout_s,
                       launcher.connect_timeout_s) for node in nodes]
     return Experiment('directory-smoke' if profile is None else profile.topology, profile,
@@ -260,13 +261,11 @@ def measure_repeat(ctx: RunContext, args: argparse.Namespace, experiment: Experi
                   dispatch_s, phases, [rank.node.name for rank in ranks])
 
 
-def validate_repeat(args: argparse.Namespace, experiment: Experiment, result: Repeat) -> None:
+def validate_repeat(experiment: Experiment, result: Repeat) -> None:
+    """Every placed client answered with its own alias (setup replies, not the plan)."""
     expected = len(experiment.placement)
     assert len(result.hosts) == expected, \
         f'{result.name} clients: expected {expected}, measured {len(result.hosts)}'
-    phases = 4 + 2 * (args.directories - 1)
-    assert len(result.phases) == phases, \
-        f'{result.name} phases: expected {phases}, measured {len(result.phases)}'
 
 
 def write_phases(ctx: RunContext, keys: dict[str, Any], phases: list[Phase], hosts: list[str],
@@ -346,7 +345,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     ctx.info.update(info)
     for number in range(1, args.repeats + 1):
         result = measure_repeat(ctx, args, experiment, number)
-        validate_repeat(args, experiment, result)
+        validate_repeat(experiment, result)
         write_repeat(ctx, args, experiment, result)
         clean_repeat(experiment, result)
     finish(experiment)

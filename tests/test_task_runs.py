@@ -75,7 +75,7 @@ class TaskRunTests(unittest.TestCase):
     @unittest.skipUnless(LINUX and shutil.which('cp'), 'Linux and cp are required')
     def test_clone(self):
         args = clone.parse_args(['--smoke'])
-        args.files, args.repeats = 8, 1
+        args.files, args.repeats, args.seed = 8, 1, 1
         for label, slots in LAYOUTS.items():
             with self.subTest(layout=label):
                 rows = run_tasks(clone, args, slots)

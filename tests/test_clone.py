@@ -83,14 +83,13 @@ class WorkloadPlanTests(unittest.TestCase):
         commands = {'cp-r': 'cp -r {src} {dst}'}
         for selection, commands, message in (
                 ({'copier': 'cp-r', 'target_copiers': {'fs': 'lakebase'}}, commands,
-                 'no command configured'),
+                 'copier for fs'),
                 ({'copier': 'cp-r', 'target_copiers': {'fs': ['lakebase']}}, commands,
-                 'must be one command name'),
-                ({'copier': ['cp-r'], 'target_copiers': {}}, commands,
-                 'must be one command name'),
+                 'copier for fs'),
+                ({'copier': ['cp-r'], 'target_copiers': {}}, commands, 'copier for fs'),
                 ({'copier': 'cp-r', 'target_copiers': {}},
-                 {'cp-r': 'not-an-installed-command-xyz {src} {dst}'}, 'executable not found')):
-            with self.subTest(message=message), self.assertRaisesRegex(BenchmarkError, message):
+                 {'cp-r': 'not-an-installed-command-xyz {src} {dst}'}, 'executable')):
+            with self.subTest(message=message), self.assertRaisesRegex(AssertionError, message):
                 clone.resolve_copier(argparse.Namespace(**selection, commands=commands), 'fs')
 
 class DatasetShapeTests(unittest.TestCase):
@@ -101,7 +100,7 @@ class DatasetShapeTests(unittest.TestCase):
 
     def test_dataset_groups_files_and_includes_an_empty_directory(self):
         source = self.root / 'source'
-        gen_dataset(Workload(7, 64), source, files_per_dir=3)
+        gen_dataset(Workload(7, 64), source, files_per_dir=3, seed=1)
         inventory = tree_inventory(source)
 
         files = {key: size for key, size in inventory.items() if size is not None}
@@ -112,6 +111,15 @@ class DatasetShapeTests(unittest.TestCase):
             sum(1 for size in inventory.values() if size is None),
             5,  # '.', three populated data directories, one empty directory
         )
+
+    def test_same_seed_gives_byte_identical_inputs(self):
+        trees = []
+        for name, seed in (('a', 7), ('b', 7), ('c', 8)):
+            gen_dataset(Workload(3, 4096), self.root / name, files_per_dir=2, seed=seed)
+            trees.append([(self.root / name / 'd_0' / f'f_{i}.bin').read_bytes()
+                          for i in range(2)])
+        self.assertEqual(trees[0], trees[1])
+        self.assertNotEqual(trees[0], trees[2])
 
 class DestinationTests(unittest.TestCase):
     def setUp(self):

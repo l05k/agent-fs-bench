@@ -17,7 +17,6 @@ import os
 import re
 import shlex
 import shutil
-import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -118,57 +117,6 @@ def tail(text: str, limit: int = 4000) -> str:
         return text
     return "..." + text[-limit:]
 
-
-
-
-def terminate_process_group(
-    proc: subprocess.Popen[Any],
-    *,
-    isolated_group: bool,
-) -> None:
-    if proc.poll() is not None:
-        return
-    if isolated_group:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
-        except OSError:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                return
-    else:
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            return
-    try:
-        proc.communicate(timeout=5)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    if isolated_group:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
-        except OSError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                return
-    else:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            return
-    try:
-        proc.communicate(timeout=5)
-    except subprocess.TimeoutExpired:
-        pass
-
-
 def run_command(
     argv: list[str],
     *,
@@ -179,66 +127,24 @@ def run_command(
     allow_codes: tuple[int, ...] = (0,),
     extra_env: dict[str, str] | None = None,
 ) -> CommandResult:
-    env = os.environ.copy()
-    env.update(
-        {
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_CONFIG_COUNT": "3",
-            "GIT_CONFIG_KEY_0": "core.hooksPath",
-            "GIT_CONFIG_VALUE_0": "/dev/null",
-            "GIT_CONFIG_KEY_1": "core.fsync",
-            "GIT_CONFIG_VALUE_1": "committed",
-            "GIT_CONFIG_KEY_2": "core.fsyncMethod",
-            "GIT_CONFIG_VALUE_2": "fsync",
-        }
-    )
-    if extra_env:
-        env.update(extra_env)
-
-    stdout = subprocess.PIPE if capture_stdout else (
-        None if verbose else subprocess.DEVNULL
-    )
-    stderr = None if verbose else subprocess.PIPE
-    stdin = subprocess.DEVNULL
-
+    """Run one workflow step; a failing make/git/shell command stops the run."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "3",
+           "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": "/dev/null",
+           "GIT_CONFIG_KEY_1": "core.fsync", "GIT_CONFIG_VALUE_1": "committed",
+           "GIT_CONFIG_KEY_2": "core.fsyncMethod", "GIT_CONFIG_VALUE_2": "fsync",
+           **(extra_env or {})}
     start = time.perf_counter_ns()
-    isolated_group = True
-    proc = subprocess.Popen(
-        argv,
-        cwd=cwd,
-        env=env,
-        stdin=stdin,
-        stdout=stdout,
-        stderr=stderr,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        start_new_session=isolated_group,
+    done = subprocess.run(
+        argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if capture_stdout else (None if verbose else subprocess.DEVNULL),
+        stderr=None if verbose else subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace",
     )
-
-    try:
-        captured_stdout, captured_stderr = proc.communicate()
-    except BaseException:
-        terminate_process_group(proc, isolated_group=isolated_group)
-        raise
-
-    result = CommandResult(
-        ms=elapsed_ms(start),
-        returncode=proc.returncode,
-        stdout=captured_stdout or "",
-        stderr=captured_stderr or "",
-    )
-    if proc.returncode not in allow_codes:
-        details = []
-        if result.stdout:
-            details.append(f"stdout:\n{tail(result.stdout)}")
-        if result.stderr:
-            details.append(f"stderr:\n{tail(result.stderr)}")
-        suffix = "\n" + "\n".join(details) if details else ""
-        raise WorkflowError(
-            f"{what} failed with exit code {proc.returncode}: "
-            f"{shlex.join(argv)}{suffix}"
-        )
+    result = CommandResult(elapsed_ms(start), done.returncode, done.stdout or "",
+                           done.stderr or "")
+    assert done.returncode in allow_codes, \
+        f"{what} exit status: expected {allow_codes}, measured {done.returncode}: " \
+        f"{shlex.join(argv)}\n{tail(result.stdout)}\n{tail(result.stderr)}"
     return result
 
 
@@ -601,29 +507,10 @@ def cleanup_checkout(
     base_commit: str,
     verbose: bool,
 ) -> None:
-    errors: list[str] = []
-    try:
-        run_git(
-            repo,
-            ["reset", "--hard", base_commit],
-            what="restoring checkout to fixture base commit",
-            verbose=verbose,
-        )
-    except WorkflowError as exc:
-        errors.append(str(exc))
-    try:
-        run_git(
-            repo,
-            ["clean", "-fdx"],
-            what="removing generated and untracked files",
-            verbose=verbose,
-        )
-    except WorkflowError as exc:
-        errors.append(str(exc))
-
-
-    if errors:
-        raise WorkflowError("cleanup failed: " + "; ".join(errors))
+    run_git(repo, ["reset", "--hard", base_commit],
+            what="restoring checkout to fixture base commit", verbose=verbose)
+    run_git(repo, ["clean", "-fdx"], what="removing generated and untracked files",
+            verbose=verbose)
 
 
 def begin_checkout_run(
@@ -736,151 +623,150 @@ def run_workflow(
     steps: list[dict[str, Any]] = []
     tree_assertions: list[dict[str, Any]] = []
     timed_start = time.perf_counter_ns()
-    try:
-        config_start = time.perf_counter_ns()
-        run_command(
-            ["make", "tinyconfig", f"-j{jobs}"],
-            cwd=repo,
-            what="make tinyconfig",
-            verbose=args.verbose,
-        )
-        shutil.copyfile(config_path, repo / ".config")
-        run_command(
-            ["make", "olddefconfig"],
-            cwd=repo,
-            what="make olddefconfig",
-            verbose=args.verbose,
-        )
-        steps.append({
-            "kind": "config", "name": "config", "commit": "",
-            "ms": elapsed_ms(config_start),
-        })
+    # Timed workflow; a failure stops the run and leaves the checkout for inspection.
+    config_start = time.perf_counter_ns()
+    run_command(
+        ["make", "tinyconfig", f"-j{jobs}"],
+        cwd=repo,
+        what="make tinyconfig",
+        verbose=args.verbose,
+    )
+    shutil.copyfile(config_path, repo / ".config")
+    run_command(
+        ["make", "olddefconfig"],
+        cwd=repo,
+        what="make olddefconfig",
+        verbose=args.verbose,
+    )
+    steps.append({
+        "kind": "config", "name": "config", "commit": "",
+        "ms": elapsed_ms(config_start),
+    })
 
 
-        initial = run_command(
+    initial = run_command(
+        ["make", f"-j{jobs}"],
+        cwd=repo,
+        what="initial build",
+        verbose=args.verbose,
+    )
+    steps.append({
+        "kind": "build", "name": "initial-build", "commit": "", "ms": initial.ms,
+    })
+
+
+    for commit in commits:
+        commit_id = commit["id"]
+        message = commit.get("message")
+        files = commit.get("files")
+        if not isinstance(message, str):
+            raise WorkflowError(f"{series_path}: commit {commit_id} has no message")
+        if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
+            raise WorkflowError(f"{series_path}: commit {commit_id} has invalid files")
+
+        commands: list[tuple[str, str]] = []
+        for command_file in ("search_commands", "read_commands", "edit_commands"):
+            filename = commit.get(command_file)
+            if not isinstance(filename, str) or not filename:
+                raise WorkflowError(
+                    f"{series_path}: commit {commit_id} has no {command_file}"
+                )
+            commands.append((command_file, filename))
+
+        for phase, filename in commands:
+            category = phase.removesuffix("_commands")
+            load_start = time.perf_counter_ns()
+            loaded = load_commands(fixture_dir / filename)
+            steps.append({
+                "kind": "command", "name": f"{category}-load",
+                "commit": commit_id, "ms": elapsed_ms(load_start),
+            })
+            for command in loaded:
+                result = run_shell(
+                    command,
+                    cwd=repo,
+                    what=f"{category} command for {commit_id}",
+                    verbose=args.verbose,
+                )
+                steps.append({
+                    "kind": "command", "name": category,
+                    "commit": commit_id, "ms": result.ms,
+                })
+
+        incremental = run_command(
             ["make", f"-j{jobs}"],
             cwd=repo,
-            what="initial build",
+            what=f"incremental build for {commit_id}",
             verbose=args.verbose,
         )
         steps.append({
-            "kind": "build", "name": "initial-build", "commit": "", "ms": initial.ms,
+            "kind": "build", "name": "incremental-build",
+            "commit": commit_id, "ms": incremental.ms,
         })
 
 
-        for commit in commits:
-            commit_id = commit["id"]
-            message = commit.get("message")
-            files = commit.get("files")
-            if not isinstance(message, str):
-                raise WorkflowError(f"{series_path}: commit {commit_id} has no message")
-            if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
-                raise WorkflowError(f"{series_path}: commit {commit_id} has invalid files")
+        status = run_git(
+            repo,
+            ["status", "--short"],
+            what=f"git status for {commit_id}",
+            verbose=args.verbose,
+        )
+        steps.append({
+            "kind": "git", "name": "status", "commit": commit_id, "ms": status.ms,
+        })
 
-            commands: list[tuple[str, str]] = []
-            for command_file in ("search_commands", "read_commands", "edit_commands"):
-                filename = commit.get(command_file)
-                if not isinstance(filename, str) or not filename:
-                    raise WorkflowError(
-                        f"{series_path}: commit {commit_id} has no {command_file}"
-                    )
-                commands.append((command_file, filename))
+        diff = run_git(
+            repo,
+            ["diff", "--stat", "--", *files],
+            what=f"git diff for {commit_id}",
+            verbose=args.verbose,
+        )
+        steps.append({
+            "kind": "git", "name": "diff", "commit": commit_id, "ms": diff.ms,
+        })
 
-            for phase, filename in commands:
-                category = phase.removesuffix("_commands")
-                load_start = time.perf_counter_ns()
-                loaded = load_commands(fixture_dir / filename)
-                steps.append({
-                    "kind": "command", "name": f"{category}-load",
-                    "commit": commit_id, "ms": elapsed_ms(load_start),
-                })
-                for command in loaded:
-                    result = run_shell(
-                        command,
-                        cwd=repo,
-                        what=f"{category} command for {commit_id}",
-                        verbose=args.verbose,
-                    )
-                    steps.append({
-                        "kind": "command", "name": category,
-                        "commit": commit_id, "ms": result.ms,
-                    })
+        add = run_git(
+            repo,
+            ["add", "--", *files],
+            what=f"git add for {commit_id}",
+            verbose=args.verbose,
+        )
+        steps.append({
+            "kind": "git", "name": "add", "commit": commit_id, "ms": add.ms,
+        })
 
-            incremental = run_command(
-                ["make", f"-j{jobs}"],
-                cwd=repo,
-                what=f"incremental build for {commit_id}",
-                verbose=args.verbose,
-            )
-            steps.append({
-                "kind": "build", "name": "incremental-build",
-                "commit": commit_id, "ms": incremental.ms,
-            })
+        commit_result = run_git(
+            repo,
+            [
+                "-c",
+                "user.name=Filesystem Bench",
+                "-c",
+                "user.email=bench@example.invalid",
+                "commit",
+                "--no-gpg-sign",
+                "-m",
+                message,
+            ],
+            what=f"git commit for {commit_id}",
+            verbose=args.verbose,
+        )
+        steps.append({
+            "kind": "git", "name": "commit", "commit": commit_id,
+            "ms": commit_result.ms,
+        })
 
+        verify_start = time.perf_counter_ns()
+        tree_assertions.append(verify_tree(repo, commit_id))
+        steps.append({
+            "kind": "verify", "name": "tree-verify", "commit": commit_id,
+            "ms": elapsed_ms(verify_start),
+        })
 
-            status = run_git(
-                repo,
-                ["status", "--short"],
-                what=f"git status for {commit_id}",
-                verbose=args.verbose,
-            )
-            steps.append({
-                "kind": "git", "name": "status", "commit": commit_id, "ms": status.ms,
-            })
-
-            diff = run_git(
-                repo,
-                ["diff", "--stat", "--", *files],
-                what=f"git diff for {commit_id}",
-                verbose=args.verbose,
-            )
-            steps.append({
-                "kind": "git", "name": "diff", "commit": commit_id, "ms": diff.ms,
-            })
-
-            add = run_git(
-                repo,
-                ["add", "--", *files],
-                what=f"git add for {commit_id}",
-                verbose=args.verbose,
-            )
-            steps.append({
-                "kind": "git", "name": "add", "commit": commit_id, "ms": add.ms,
-            })
-
-            commit_result = run_git(
-                repo,
-                [
-                    "-c",
-                    "user.name=Filesystem Bench",
-                    "-c",
-                    "user.email=bench@example.invalid",
-                    "commit",
-                    "--no-gpg-sign",
-                    "-m",
-                    message,
-                ],
-                what=f"git commit for {commit_id}",
-                verbose=args.verbose,
-            )
-            steps.append({
-                "kind": "git", "name": "commit", "commit": commit_id,
-                "ms": commit_result.ms,
-            })
-
-            verify_start = time.perf_counter_ns()
-            tree_assertions.append(verify_tree(repo, commit_id))
-            steps.append({
-                "kind": "verify", "name": "tree-verify", "commit": commit_id,
-                "ms": elapsed_ms(verify_start),
-            })
-
-        workflow_ms = elapsed_ms(timed_start)
-        compiler_version = read_compiler_version(repo)
-    finally:
-        cleanup_start = time.perf_counter_ns()
-        cleanup_checkout(repo, base_commit=base_commit, verbose=args.verbose)
-        cleanup_ms = elapsed_ms(cleanup_start)
+    workflow_ms = elapsed_ms(timed_start)
+    compiler_version = read_compiler_version(repo)
+    cleanup_start = time.perf_counter_ns()
+    cleanup_checkout(repo, base_commit=base_commit, verbose=args.verbose)
+    cleanup_ms = elapsed_ms(cleanup_start)
 
     unattributed_ms = max(0, workflow_ms - sum(step["ms"] for step in steps))
 
@@ -905,6 +791,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.parse_args(argv)
     args = argparse.Namespace(**CONFIG)
+    assert type(args.jobs) is int and args.jobs >= 1, \
+        f"jobs: expected a positive integer, measured {args.jobs!r}"
     return args
 
 

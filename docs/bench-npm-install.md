@@ -191,9 +191,8 @@ the node leader's `os.sync()`. Step 2 keeps its project-placement check but drop
 does not exist, and nothing in the benchmark forces the tree to stable storage. The check that a
 project lies inside the measured target is not a sync and stays unconditional.
 
-`batches.csv` carries only `install_mean_s`, `batch_install_s`, `installs_per_s`, `user_s`, `sys_s`
-and the tree inventory; `flush_*`, `durable_*` and `durable_installs_per_s` are absent, and
-`installs.csv` has no `flush_s` or `durable_s`. `config.json`'s `config` records `flush` (`true` for
+`batches.csv` keeps `wall_s` and `installs_per_s`; `installs.csv` has no `flush_s` or `durable_s`.
+`config.json`'s `config` records `flush` (`true` for
 `npm-install`, `false` here), and results live under `results/npm-install-nofsync/`. `install_s`
 still covers the whole command, including whatever the tool itself syncs; it ends at process exit,
 so it describes page-cache completion, not durability. Without the leader's `os.sync()`, writeback
@@ -210,32 +209,29 @@ the tree occupies, not how much was written. npm always unpacks from its cache i
 
 ## Tables
 
-Two flat CSV tables per run. Figures show the median with IQR of the raw rows: a `batches` figure
-pools a target and manager's repeats, and an `installs` figure pools every install sample.
+Two flat CSV tables per run, one per granularity. Nothing is aggregated in the run: means,
+medians or sums over a batch's installs come from the `installs` rows in analysis.
 
 | Table | Key columns | Metric columns |
 | --- | --- | --- |
-| `batches` | `target`, `manager`, `tasks`, `repeat` | `install_mean_s`, `flush_mean_s`, `durable_mean_s`, `batch_install_s`, `batch_durable_s`, `installs_per_s`, `durable_installs_per_s`, `user_s`, `sys_s`, `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` |
-| `installs` | `target`, `manager`, `tasks`, `repeat`, `sample`, `host` | `install_s`, `flush_s`, `durable_s`, `user_s`, `sys_s` |
+| `batches` | `target`, `manager`, `tasks`, `repeat` | `wall_s`, `installs_per_s` |
+| `installs` | `target`, `manager`, `tasks`, `repeat`, `sample`, `host` | `install_s`, `flush_s`, `durable_s`, `user_s`, `sys_s`, `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` |
 
 `repeat` is the 1-based batch index, `sample` the task index within the job and `host` the machine's
-node name (`local` for the controller), so every task's raw, unrounded sample is one `installs` row.
-`npm-install-nofsync` emits the same tables without the flush and durable columns (`flush_mean_s`,
-`durable_mean_s`, `batch_durable_s`, `durable_installs_per_s`, `flush_s`, `durable_s`).
+node name (`local` for the controller), so every task's raw sample is one `installs` row.
+`npm-install-nofsync` emits the same tables without `flush_s` and `durable_s`.
 
 | Metric | Meaning |
 | --- | --- |
-| `install_mean_s`, `flush_mean_s`, `durable_mean_s` | Mean `install_s`, `flush_s`, `durable_s` over the batch's tasks. |
-| `batch_install_s` | Slowest task's own `install_s`. Cross-machine start offsets are not observable, so this is the slowest single install rather than a wall clock from release, and it excludes release skew. |
-| `batch_durable_s` | The batch's barrier-to-barrier wall time: from the release barrier to the barrier after every task's flush, so it includes release skew and every task's flush. Only with `flush`. |
-| `installs_per_s` / `durable_installs_per_s` | `tasks / batch_install_s` / `tasks / batch_durable_s`. |
-| `user_s`, `sys_s` | Summed child CPU time, from each task's own `RUSAGE_CHILDREN` delta. |
-| `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` | Summed tree inventory over the batch's tasks. |
+| `wall_s` | The batch's barrier-to-barrier wall time: from the release barrier to the barrier after every task's install (and flush, with `flush`), so it includes release skew. |
+| `installs_per_s` | `tasks / wall_s`; durable throughput with `flush`. |
+| `install_s`, `flush_s`, `durable_s` | That install's command time, project fsync time, and their sum. |
+| `user_s`, `sys_s` | That install's child CPU time (`RUSAGE_CHILDREN` delta). |
+| `files`, `dirs`, `symlinks`, `hardlinks`, `logical_bytes`, `allocated_bytes`, `du_kib` | That install's `node_modules` inventory. |
 
-Means describe one install, batch times describe the batch, and throughput is a batch quantity,
-never a per-install latency. Clocks are never compared across machines: every duration is measured
-inside the task that produced it, and the only cross-task time is the barrier wall that the
-launcher's own barriers delimit.
+Install rows describe one install; batch rows describe the batch. Clocks are never compared across
+machines: every duration is measured inside the task that produced it, and the only cross-task time
+is the barrier wall that the launcher's own barriers delimit.
 
 Discovered facts live in `config.json`: `targets[].info.hosts[<node>]` holds that machine's
 `target_fstype`, `prep_fstype`, `tool_versions` and `seed_input_sha256` of the committed
@@ -253,10 +249,10 @@ manager.
 
 | Figure | Table | X | Y |
 | --- | --- | --- | --- |
-| `batches-install_mean_s-<manager>` | `batches` | `tasks` | `install_mean_s` |
-| `batches-durable_mean_s-<manager>` | `batches` | `tasks` | `durable_mean_s` |
+| `installs-install_s-<manager>` | `installs` | `tasks` | `install_s` |
+| `installs-durable_s-<manager>` | `installs` | `tasks` | `durable_s` |
 
-Each point is the median over repeats with IQR error bars, the x axis is logarithmic, and the series
+Each point is the median over all install rows with IQR error bars, the x axis is logarithmic, and the series
 is the target, so several targets of one run share a figure. `npm-install-nofsync` has only the
 install-time figure. Because `tasks` is one value per run, a curve needs runs pooled with
 `--vary tasks`, and a run holds only one `tasks` value. Latency and throughput stay in separate

@@ -9,6 +9,7 @@ from unittest import mock
 
 from agent_fs_bench import cluster
 from agent_fs_bench.analysis import Figure, figure_data, plot
+from agent_fs_bench import cli
 from agent_fs_bench.cli import run_benchmark
 from agent_fs_bench.results import RunContext, Tables, _without_config, read_table, write_json
 from agent_fs_bench.targets import Target, load_targets
@@ -115,10 +116,10 @@ class RunCommandTests(unittest.TestCase):
         run = self.run_dir()
         snapshot = json.loads((run / 'config.json').read_text())
         self.assertEqual(snapshot['config'], {'repeats': 3, 'fixture': '/data/fixture',
-                                              'mode': 'local',
+                                              'seed': cli.SEED, 'mode': 'local',
                                               'launcher': cluster.Launcher(
                                                   **cluster.CONFIG).record()})
-        self.assertEqual((snapshot['seed'], snapshot['git_commit']), (None, 'abc123'))
+        self.assertEqual(snapshot['git_commit'], 'abc123')
         self.assertEqual(snapshot['targets'], [
             {'name': 'a', 'path': str(self.dirs[0]), 'info': {'fstype': 'tmpfs'}},
             {'name': 'b', 'path': str(self.dirs[1]), 'info': {'fstype': 'tmpfs'}},
