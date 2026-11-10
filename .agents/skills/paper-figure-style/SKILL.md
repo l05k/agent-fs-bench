@@ -7,16 +7,6 @@ description: Create or revise system-experiment figures for papers. Use when plo
 
 Use this skill when drawing or updating system-experiment figures for papers.
 
-## Project Implementation
-
-- `agent_fs_bench/figure.py` holds the shared style (`RC`, `PALETTE`, `HATCHES`, inch-based layout). It must import only stdlib and Matplotlib: its source is copied verbatim into every exported figure script.
-- `python -m agent_fs_bench plot <run-dir>...` (also run automatically at the end of `run`) writes `<stem>.pdf`, `<stem>.png` (600 dpi) and `<stem>.py` (self-contained: style code + raw samples) for each default figure in the workload module's `FIGURES`, or for one custom figure given `--table --x --y`. Rerun `python <stem>.py` to regenerate both images without the CSVs.
-- `--targets a,b,c` fixes legend order and filters by target name or full series label (e.g. `LakeBase/cp-r`); the first entry is the primary system, and a name matching nothing is an error. Line figures sort x numerically; box figures keep first-appearance order. `--xlabel`/`--ylabel` set labels (default: column names). `--size W H` sets inches per figure (default `3.5 1.5`).
-- Legend entries are target aliases; name targets as they should appear in the paper.
-- All figure text is English, so only Arial is required; SimHei rules below do not apply to this project.
-- Hatch order puts vertical lines on the primary system so the horizontal box median stays visible.
-- Figure size and figure-specific choices may differ per experiment; the shared style rules below do not.
-
 ## Workflow
 
 1. Read the source data and any existing plotting script before editing.
@@ -62,6 +52,7 @@ Use this skill when drawing or updating system-experiment figures for papers.
 - Differentiate every series for black-and-white printing using markers or patterns.
 - For line charts, use filled markers such as circle, triangle, inverted triangle, square, or diamond.
 - For bar charts, use distinct hatches such as horizontal, vertical, forward diagonal, and backward diagonal.
+- Color in-axis subplot labels and titles, e.g. `(a) Size`, with `#8B0002` (define it once as `CAPTION_COLOR`); keep all other text black.
 
 ## Matplotlib Defaults
 
@@ -92,7 +83,7 @@ For compact multi-subplot single-column figures, define layout in inches rather 
 
 - PDF is vector and has the requested physical size.
 - Legend is above the plots and the primary system is listed first.
-- Subplot labels/titles are inside axes and do not cover important data.
+- Subplot labels/titles are inside axes, colored `#8B0002`, and do not cover important data.
 - Shared x-axis label is used when subplots have the same x-axis.
 - All subplots are boxed.
 - No gray grid/value-guide lines appear inside the plot area.
