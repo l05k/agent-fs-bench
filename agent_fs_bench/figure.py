@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 
 PALETTE = ('#64A5D3', '#F1AD54', '#94A65D', '#BC5D5A')
+CAPTION_COLOR = '#8B0002'  # in-axis subplot labels/titles only
 # Primary first gets vertical lines so the horizontal median line stays visible.
 HATCHES = ('|||||', '/////', '\\\\\\\\\\', '-----')
 MARKERS = ('o', '^', 'v', 's')
@@ -172,7 +173,8 @@ def render(data: dict, stem: Path) -> None:
         bottom, top = axes.get_ylim()
         axes.set_ylim(bottom, top * (top / bottom) ** 0.3 if data['logy']
                       else top + (top - bottom) * 0.3)
-        axes.text(0.02, 0.98, data['title'], transform=axes.transAxes, ha='left', va='top')
+        axes.text(0.02, 0.98, data['title'], transform=axes.transAxes, ha='left', va='top',
+                  color=CAPTION_COLOR)
     axes.set_xlabel(data['xlabel'])
     axes.set_ylabel(data['ylabel'])
 
