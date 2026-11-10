@@ -66,7 +66,6 @@ CONFIG: dict[str, Any] = {
     "file_size_bytes": 4096,
     "files_per_dir": 128,
     "tasks": 1,
-    "cpus_per_task": 1,
     "keep_scratch": False,
 }
 
@@ -253,7 +252,7 @@ def validate_copier(copier: Copier, scratch: Path) -> None:
         shutil.rmtree(root)
 
 def build_plan(args: argparse.Namespace) -> Workload:
-    """Validate the one directory shape this run measures; `cluster.allocate` checks tasks."""
+    """Validate the one directory shape this run measures; `cluster.place` checks tasks."""
     for name in ("files", "file_size_bytes", "files_per_dir", "repeats"):
         value = getattr(args, name)
         if type(value) is not int or value < 1:

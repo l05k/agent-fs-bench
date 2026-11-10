@@ -41,14 +41,12 @@ class TableTests(unittest.TestCase):
         self.addCleanup(tables.close)
         self.ctx = RunContext('bench', 'run', Target('fs-a', self.root), self.root, self.root, tables)
 
-    def test_rows_lead_with_target_and_leave_inapplicable_metrics_empty(self):
-        self.ctx.emit('phases', {'operation': 'create', 'fsync': True},
-                      {'ops_per_s': 2.5, 'mib_per_s': None})
+    def test_rows_lead_with_target_and_keys(self):
+        self.ctx.emit('phases', {'operation': 'create', 'fsync': True}, {'ops_per_s': 2.5})
         self.assertEqual(read_table(self.root / 'phases.csv'), [
-            {'target': 'fs-a', 'operation': 'create', 'fsync': '1',
-             'ops_per_s': '2.5', 'mib_per_s': ''}])
+            {'target': 'fs-a', 'operation': 'create', 'fsync': '1', 'ops_per_s': '2.5'}])
 
-    def test_invalid_rows_are_rejected_before_writing(self):
+    def test_incomplete_or_non_finite_observations_are_rejected_before_writing(self):
         self.ctx.emit('phases', {'operation': 'create'}, {'ops_per_s': 1.0})
         for keys, metrics in (
             ({}, {'ops_per_s': 1.0}),
@@ -56,8 +54,9 @@ class TableTests(unittest.TestCase):
             ({'operation': 'stat'}, {'ops_per_s': float('nan')}),
             ({'operation': 'stat'}, {'ops_per_s': True}),
             ({'operation': 'stat'}, {'ops_per_s': None}),
+            ({'operation': 'stat'}, {}),
         ):
-            with self.subTest(keys=keys, metrics=metrics), self.assertRaises(ValueError):
+            with self.subTest(keys=keys, metrics=metrics), self.assertRaises(AssertionError):
                 self.ctx.emit('phases', keys, metrics)
         self.assertEqual(len(read_table(self.root / 'phases.csv')), 1)
         self.assertEqual(self.ctx.rows, 1)
@@ -72,7 +71,7 @@ def fake_workload(fail_on=None):
         for procs in (1, 2):
             for repeat in range(1, args.repeats + 1):
                 ctx.emit('phases', {'procs': procs, 'repeat': repeat},
-                         {'ops_per_s': 10.0 * procs * repeat, 'mib_per_s': None})
+                         {'ops_per_s': 10.0 * procs * repeat})
                 if ctx.target.name == fail_on:
                     raise RuntimeError('mount lost')
                 for sample in (1, 2):
@@ -99,7 +98,9 @@ class RunCommandTests(unittest.TestCase):
         self.render = self.enterContext(mock.patch('agent_fs_bench.figure.render'))
         # The runner probes the machines of --mode; these tests run no MPI.
         self.enterContext(mock.patch.object(cluster, 'open_pool', return_value=cluster.Pool(
-            'local', (), {'name': 'mpiexec', 'version': '4.1.6'})))
+            'local', (), cluster.Launcher(**cluster.CONFIG), '4.1.6')))
+        self.enterContext(mock.patch.object(cluster, 'validate_pool'))
+        self.enterContext(mock.patch('agent_fs_bench.cli.git_commit', return_value='abc123'))
 
     def invoke(self, module, *args):
         with (mock.patch('agent_fs_bench.analysis.workload', return_value=module),
@@ -109,51 +110,45 @@ class RunCommandTests(unittest.TestCase):
     def run_dir(self):
         return next((self.results / 'clone').iterdir())
 
-    def test_run_writes_manifest_tables_summaries_and_default_figures(self):
+    def test_run_writes_config_snapshot_and_raw_tables_only(self):
         self.assertEqual(self.invoke(fake_workload(), '--dirs', *map(str, self.dirs)), 0)
         run = self.run_dir()
-        manifest = json.loads((run / 'manifest.json').read_text())
-        self.assertEqual(manifest['config'], {'repeats': 3, 'fixture': '/data/fixture',
+        snapshot = json.loads((run / 'config.json').read_text())
+        self.assertEqual(snapshot['config'], {'repeats': 3, 'fixture': '/data/fixture',
                                               'mode': 'local',
-                                              'launcher_sha256': cluster.launcher_digest()})
-        self.assertEqual(manifest['targets'], [
+                                              'launcher': cluster.Launcher(
+                                                  **cluster.CONFIG).record()})
+        self.assertEqual((snapshot['seed'], snapshot['git_commit']), (None, 'abc123'))
+        self.assertEqual(snapshot['targets'], [
             {'name': 'a', 'path': str(self.dirs[0]), 'info': {'fstype': 'tmpfs'}},
             {'name': 'b', 'path': str(self.dirs[1]), 'info': {'fstype': 'tmpfs'}},
         ])
-        self.assertEqual(
-            {(row['target'], row['procs']): (row['n'], row['ops_per_s'], row['mib_per_s'])
-             for row in read_table(run / 'summary' / 'phases.csv')},
-            {('a', '1'): ('3', '20', ''), ('a', '2'): ('3', '40', ''),
-             ('b', '1'): ('3', '20', ''), ('b', '2'): ('3', '40', '')})
-        self.assertEqual([(row['n'], row['latency_s'])
-                          for row in read_table(run / 'summary' / 'requests.csv')], [('6', '1.5')] * 4)
-        self.assertFalse((run / 'summary' / 'setup.csv').exists())
-        (data, stem), = [call.args for call in self.render.call_args_list]
-        self.assertEqual((data['series'], data['x']), (['a', 'b'], [1.0, 2.0]))
-        self.assertEqual(stem, run / 'figures' / 'phases-ops_per_s')
-        self.assertTrue((run / 'figures' / 'phases-ops_per_s.py').exists())
+        self.assertEqual(len(read_table(run / 'phases.csv')), 12)
+        self.assertEqual(len(read_table(run / 'requests.csv')), 24)
+        self.assertFalse((run / 'summary').exists())
+        self.assertFalse((run / 'figures').exists())
+        self.render.assert_not_called()
 
-    def test_failed_target_keeps_earlier_rows_without_summary_or_figures(self):
+    def test_failed_target_keeps_earlier_rows(self):
         with self.assertRaisesRegex(RuntimeError, 'mount lost'):
             self.invoke(fake_workload(fail_on='b'), '--dirs', *map(str, self.dirs))
         run = self.run_dir()
-        manifest = json.loads((run / 'manifest.json').read_text())
-        self.assertEqual([target['name'] for target in manifest['targets']], ['a'])
+        snapshot = json.loads((run / 'config.json').read_text())
+        self.assertEqual([target['name'] for target in snapshot['targets']], ['a'])
         self.assertEqual([row['target'] for row in read_table(run / 'phases.csv')], ['a'] * 6 + ['b'])
-        self.assertFalse((run / 'summary').exists())
-        self.assertFalse((run / 'figures').exists())
 
     def test_unknown_selected_target_fails_before_creating_run(self):
         config = self.root / 'targets.toml'
         config.write_text(f'[[targets]]\nname="a"\npath="{self.dirs[0]}"\n')
-        with mock.patch('agent_fs_bench.cli.TARGETS_FILE', config), self.assertRaises(ValueError):
+        with mock.patch('agent_fs_bench.cli.TARGETS_FILE', config), \
+                self.assertRaises(AssertionError):
             self.invoke(fake_workload(), '--target', 'missing')
         self.assertFalse(self.results.exists())
 
     def test_misspelled_target_copier_alias_fails_before_creating_run(self):
         module = fake_workload()
         module.parse_args = lambda argv: SimpleNamespace(target_copiers={'LakeBase': ['lakebase']})
-        with self.assertRaisesRegex(ValueError, 'unknown target_copiers aliases: LakeBase'):
+        with self.assertRaisesRegex(AssertionError, 'target_copiers aliases'):
             self.invoke(module, '--dirs', *map(str, self.dirs))
         self.assertFalse(self.results.exists())
 
@@ -211,9 +206,9 @@ class PlotRunsTests(unittest.TestCase):
         RunContext('mdtest', name, Target(target, run), run, run, tables).emit(
             'phases', {'procs': 1, 'repeat': 1}, {'ops_per_s': value})
         tables.close()
-        write_json(run / 'manifest.json', {'benchmark': 'mdtest', 'source_sha256': source,
-                                           'config': {'repeats': repeats},
-                                           'targets': [{'name': target}], 'tables': tables.schemas})
+        write_json(run / 'config.json', {'benchmark': 'mdtest', 'source_sha256': source,
+                                         'config': {'repeats': repeats},
+                                         'targets': [{'name': target}], 'tables': tables.schemas})
         return run
 
     def test_matching_runs_pool_in_run_order_unless_targets_reorder(self):
@@ -229,7 +224,7 @@ class PlotRunsTests(unittest.TestCase):
 
     def test_differing_configs_pool_only_for_declared_keys(self):
         runs = [self.make_run('r1', 'a', 1.0), self.make_run('r2', 'b', 2.0, repeats=5)]
-        with self.assertRaisesRegex(ValueError, 'repeats'):
+        with self.assertRaisesRegex(AssertionError, 'repeats'):
             plot(runs, [self.spec])
         self.render.assert_not_called()
         plot(runs, [self.spec], vary=('repeats',))
@@ -238,20 +233,20 @@ class PlotRunsTests(unittest.TestCase):
     def test_runs_of_different_sources_never_pool(self):
         runs = [self.make_run('r1', 'a', 1.0), self.make_run('r2', 'b', 2.0, source='t')]
         for vary in ((), ('repeats',)):
-            with self.subTest(vary=vary), self.assertRaisesRegex(ValueError, 'source_sha256'):
+            with self.subTest(vary=vary), self.assertRaisesRegex(AssertionError, 'source_sha256'):
                 plot(runs, [self.spec], vary=vary)
         self.render.assert_not_called()
 
     def test_unknown_target_names_fail_instead_of_drawing_nothing(self):
         run = self.make_run('r1', 'nfs', 1.0)
         with mock.patch('agent_fs_bench.analysis.workload', return_value=fake_workload()), \
-                self.assertRaisesRegex(ValueError, 'unknown --targets Ours'):
+                self.assertRaisesRegex(AssertionError, r'--targets: .*measured \[.Ours'):
             plot([run], targets=['Ours', 'nfs'])
         self.render.assert_not_called()
 
     def test_custom_figure_without_rows_fails(self):
         run = self.make_run('r1', 'a', 1.0)
-        with self.assertRaisesRegex(ValueError, 'no rows'):
+        with self.assertRaisesRegex(AssertionError, 'rows matching'):
             plot([run], [Figure('phases', 'procs', 'ops_per_s', where={'procs': 8})])
 
 

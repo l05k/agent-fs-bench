@@ -34,24 +34,9 @@ class KernelConfigFixtureTests(unittest.TestCase):
 
 class ConfigurationTests(unittest.TestCase):
     def test_mini_caps_build_parallelism(self):
-        with mock.patch.dict(mini_dev_workflow.CONFIG, {'jobs': 9, 'cpus_per_task': 9}):
+        with mock.patch.dict(mini_dev_workflow.CONFIG, {'jobs': 9}):
             args = mini_dev_workflow.parse_args([])
-        self.assertEqual((args.jobs, args.cpus_per_task),
-                         (mini_dev_workflow.FIXED_JOBS, mini_dev_workflow.FIXED_JOBS))
-
-    def test_mini_rejects_mismatched_build_parallelism(self):
-        with mock.patch.dict(mini_dev_workflow.CONFIG, {'jobs': 1, 'cpus_per_task': 2}):
-            with self.assertRaises(ValueError):
-                mini_dev_workflow.parse_args([])
-
-    def test_dev_workflow_rejects_mismatched_build_parallelism(self):
-        with mock.patch.dict(dev_workflow.CONFIG, {'jobs': 4, 'cpus_per_task': 8}):
-            with self.assertRaises(ValueError):
-                dev_workflow.parse_args([])
-
-    def test_build_parallelism_requires_positive_jobs(self):
-        with self.assertRaises(ValueError):
-            dev_workflow.check_build_parallelism(0, 0)
+        self.assertEqual(args.jobs, mini_dev_workflow.FIXED_JOBS)
 
 class FixtureResolutionTests(unittest.TestCase):
     def test_relative_fixture_dir_resolves_in_checkout(self):

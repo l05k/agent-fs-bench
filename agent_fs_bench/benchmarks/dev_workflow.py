@@ -51,8 +51,6 @@ CONFIG = {
     "fixture_dir": str(DEFAULT_FIXTURE_DIR),
     "require_fstype": None,
     "tasks": 1,
-    # Must equal "jobs": one pinned CPU per make job.
-    "cpus_per_task": DEFAULT_JOBS,
     "jobs": DEFAULT_JOBS,
     "verbose": False,
     "linux_url": DEFAULT_LINUX_URL,
@@ -86,17 +84,6 @@ def resolve_linux_url(value: str) -> str:
         return value
     path = Path(value).expanduser()
     return str(path if path.is_absolute() else PROJECT_ROOT / path)
-
-def check_build_parallelism(jobs: int, cpus_per_task: int) -> int:
-    """Require one make job per pinned CPU; return the build parallelism."""
-    if type(jobs) is not int or jobs < 1:
-        raise ValueError(f"jobs must be a positive integer: {jobs!r}")
-    if cpus_per_task != jobs:
-        raise ValueError(
-            f"cpus_per_task ({cpus_per_task}) must equal jobs ({jobs}): "
-            "one make job per pinned CPU"
-        )
-    return jobs
 
 CORE_COMMANDS = ("git", "bash", "make", "patch", "grep", "sed", "python3")
 KERNEL_COMMANDS = ("bc", "bison", "flex", "perl", "openssl")
@@ -918,7 +905,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.parse_args(argv)
     args = argparse.Namespace(**CONFIG)
-    check_build_parallelism(args.jobs, args.cpus_per_task)
     return args
 
 
@@ -970,7 +956,6 @@ def task(t: cluster.Task) -> None:
     first = results[0][1]
     t.info({
         "jobs": args.jobs,
-        "cpus_per_task": args.cpus_per_task,
         "base_commit": first["base_commit"],
         "tree_assertions": first["tree_assertions"],
     })

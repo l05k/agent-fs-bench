@@ -18,7 +18,7 @@ uv run python -m agent_fs_bench run mdtest --mode remote --dirs /mnt/fs-a
 Each workload's `CONFIG['tasks']` is the external concurrency of one run: the number of
 simultaneous independent tasks (mdtest ranks, clone requests, npm installs, workflow
 instances, mount-scale clients). It is one value per run; draw a curve over N from
-several runs pooled with `plot --vary tasks`. `mode` is part of the manifest `config`,
+several runs pooled with `plot --vary tasks`. `mode` is part of `config.json`'s `config`,
 so runs of different modes pool only with `--vary mode`.
 
 ## Machines
@@ -37,7 +37,7 @@ so runs of different modes pool only with `--vary mode`.
   to each listed machine, and TCP between all participating machines (Open MPI's
   daemon and transport traffic, not only port 22).
 - The workload's own tools on every machine that runs its tasks (see each workload
-  doc). Nothing is installed automatically. The controller also needs Arial for figures.
+  doc). Nothing is installed automatically. The controller also needs Arial for `plot`.
 
 ## `local/hosts.toml`
 
@@ -46,7 +46,7 @@ list the controller.
 
 | Field | Meaning |
 | --- | --- |
-| `name` | Logical machine name in results and manifests; `local` is reserved |
+| `name` | Logical machine name in results and `config.json`; `local` is reserved |
 | `address` | Hostname or IPv4 address that Open MPI uses as the host token (not an SSH-only alias) |
 | `user`, `port`, `ssh_args` | SSH account, port and extra argv tokens (e.g. `["-i", "/home/me/.ssh/key"]`) |
 | `root` | Checkout path on that machine; default: the controller's checkout path |
@@ -62,21 +62,23 @@ files before publishing results.
 ## Launcher settings
 
 `CONFIG` at the top of `agent_fs_bench/cluster.py` describes the controller and its
-network; its values are not written to the manifest:
+network. `run` builds one `Launcher` from it and passes it explicitly to every probe and
+job; nothing reads `CONFIG` afterwards:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `hosts` | `local/hosts.toml` | Machine inventory |
+| `hosts_file` | `local/hosts.toml` | Machine inventory |
 | `mpiexec` | `('mpiexec',)` | Open MPI 4.1 launcher, e.g. `('/usr/bin/mpiexec.openmpi',)` |
 | `mpiexec_args` | `()` | Extra launcher options, e.g. interface selection |
-| `env` | `{}` | Environment set in every probe and task before MPI loads |
-| `connect_timeout_s`, `probe_timeout_s` | `15`, `120` | SSH connect and machine probe timeouts |
+| `env` | `{}` | Environment of every probe, task and native program (`-x` for MPI jobs) |
+| `connect_timeout_s` | `15` | SSH connect timeout |
 
-The manifest records the launcher name and version (`launcher`) and every machine's
-probed facts (`nodes`: name, hostname, CPU affinity list, kernel, architecture, Python,
-mpi4py and Open MPI library). `mpiexec`, `mpiexec_args` and `env` change measurements,
-so `config.launcher_sha256` holds their SHA-256 without the values: `plot` pools runs
-with different launcher settings only with `--vary launcher_sha256`.
+`mpiexec`, `mpiexec_args` and `env` change measurements, so `config.json` records their
+values as `config.launcher`; `plot` pools runs with different launcher settings only
+with `--vary launcher`. Interface subnets in `mpiexec_args` therefore appear in results.
+`config.json` also records the launcher's Open MPI version (`mpi_version`) and every
+machine's probed facts (`nodes`: name, hostname, CPU model, CPU count, system, kernel,
+architecture, Python, mpi4py and Open MPI library).
 
 On machines with several interfaces, or with identical bridge addresses (`docker0`,
 `virbr0`), Open MPI may dial the wrong address and hang. Restrict it to the shared
@@ -84,80 +86,83 @@ subnet, and pin mpi4py's library where another MPI is installed:
 
 ```python
 CONFIG = {
-    'hosts': PROJECT_ROOT / 'local' / 'hosts.toml',
+    'hosts_file': PROJECT_ROOT / 'local' / 'hosts.toml',
     'mpiexec': ('/usr/bin/mpiexec.openmpi',),
     'mpiexec_args': ('--mca', 'btl_tcp_if_include', '10.0.0.0/24',
                      '--mca', 'oob_tcp_if_include', '10.0.0.0/24'),
     'env': {'MPI4PY_MPIABI': 'openmpi'},
     'connect_timeout_s': 15,
-    'probe_timeout_s': 120,
 }
 ```
 
 ## Placement
 
-A workload declares `tasks` (a positive integer) and `cpus_per_task` (default 1;
-multi-threaded tasks declare their width, e.g. npm-install 4, dev-workflow 8):
+A workload declares `tasks`, a positive integer:
 
 - Tasks are dealt round-robin over the mode's machines: machine i of M gets
   `tasks // M`, plus one if `i < tasks % M`. Every machine gets the same share
   whatever its CPU count; with fewer tasks than machines only the first ones are used.
-- Within a machine, the CPUs (its `sched_getaffinity` set, so `taskset` and cpusets
-  apply) are sorted and cut into groups of `cpus_per_task`, and its tasks are dealt
-  round-robin over the groups: group loads differ by at most one.
-- There is no capacity limit. Tasks above a machine's group count share CPU groups;
-  that is how one CPU runs several tasks. MPI ranks are contiguous per machine.
-- A machine that receives a task but has fewer CPUs than `cpus_per_task` is an error.
-- Shared CPUs need `mpi_yield_when_idle` (always set) so ranks waiting in a barrier do
-  not spin. Many tasks per machine also need high enough `ulimit -u` / `ulimit -n`;
-  Python workloads cost one interpreter per task.
+  MPI ranks are contiguous per machine.
+- Tasks are not bound to CPUs. The kernel schedules each machine's tasks over its CPUs
+  (its `sched_getaffinity` set, so `taskset` and cpusets apply). Tasks are filesystem
+  clients that block on I/O; letting a runnable task move to an idle CPU is how N real
+  concurrent clients behave. There is no capacity limit: tasks above the CPU count
+  oversubscribe the machine.
+- A task's internal parallelism (dev-workflow's `make -j`, npm-install's thread pool)
+  is the workload's own setting (`jobs`, `concurrency`), not a placement setting.
+- Waiting ranks yield (`mpi_yield_when_idle`, always set): the appfile declares exactly
+  each machine's tasks, so Open MPI does not detect oversubscription itself. Many tasks
+  per machine need high enough `ulimit -u` / `ulimit -n`; Python workloads cost one
+  interpreter per task.
 - No CPU is reserved for the controller, Python, MPI or filesystem daemons. Formal runs
   should fix cpuset, SMT, NUMA, machine model and background load.
 
 For example, with 8 CPUs on the controller and 64 on `node-a` in `overflow` mode:
 
-- `tasks = 1`: one task on the controller's CPU 0; node-a is unused.
-- `tasks = 16`: 8 on the controller (one per CPU) and 8 on node-a's CPUs 0–7.
-- `tasks = 144`: 72 on each machine: the controller runs 9 per CPU, node-a 2 on
-  CPUs 0–7 and 1 on the rest.
-- `remote` with only node-a and `tasks = 1024`: 16 tasks per CPU.
+- `tasks = 1`: one task on the controller; node-a is unused.
+- `tasks = 144`: 72 tasks on each machine, about 9 per CPU on the controller and about
+  1.1 on node-a.
+- `remote` with only node-a and `tasks = 1024`: 1024 tasks over 64 CPUs.
 
-## Launch and placement proof
+## Launch and validity
 
-One launch is one global Open MPI MPMD job with one application context per task, so
-`--host` pins each task to its machine. Before the task runs, a wrapper:
+One launch is one global Open MPI MPMD job with one appfile line per task
+(`-np 1 --host <machine>`), so the rank is the line number and its machine is fixed by
+the plan. The run stops at the first failed assertion, with label, expected and measured
+value:
 
-1. checks the actual MPI rank and hostname;
-2. requires the planned CPUs to be inside the machine's affinity set;
-3. pins them and reads the affinity back;
-4. reports that measured placement.
+| Check | When | Expected |
+| --- | --- | --- |
+| pool | after probing | ≥ 1 machine, distinct hostnames, one architecture, Linux, the controller's source fingerprint, mpi4py loading the launcher's Open MPI 4.1 |
+| tasks | placement | positive integer |
+| placement | after a Python job | every rank's hostname equals its planned machine |
+| job | after every job | exit status 0; Python jobs also the completion message |
+| binary | before native jobs | one SHA-256 of the native binary on every participating machine |
 
-The controller compares every report with the plan and stores it per job under
-`targets[].info.placement`; a mismatch fails the run.
+`targets[].info.placement` records the task count per machine.
 
 - **Python workloads** (clone, npm-install, kvtest, sqlite-speedtest, dev-workflow,
-  mini-dev-workflow, agent-replay) run one MPI job per target, and every task calls the
-  workload's `task(t)`.
-  - Task 0 receives the job on stdin and streams result rows to the controller on
-    stdout.
+  mini-dev-workflow, agent-replay) run one MPI job per target, and every task runs
+  `python -m agent_fs_bench.cluster task`, which calls the workload's `task(t)`.
+  - Task 0 receives the `JobSpec` on stdin and streams result messages to the
+    controller on stdout; the protocol table is in the `cluster.py` docstring.
   - mpi4py barriers start a batch on all tasks together and end it after the slowest,
     which gives the batch wall time.
   - Clocks of different machines are never compared; per-task durations are measured
     by each task on its own machine.
-- **Native MPI programs** run their own jobs: mdtest and mdtest-peak one MPI job per
-  repeat; mount-scale one job per shared fixture, then per repeat one warm-up job per
-  shared resource, the private job and one job per shared resource.
-  - The wrapper reports the binary's SHA-256 and then execs it; every task must run
-    the same binary.
-  - mdtest's rank CSV is written on task 0's machine, and the wrapper returns its text
-    through the launcher output.
+- **Native MPI programs** are started by `mpiexec` directly: mdtest and mdtest-peak one
+  MPI job per repeat; mount-scale one job per shared fixture, then per repeat one warm-up
+  job per shared resource, the private job and one job per shared resource.
+  - Before a job the controller creates the directories mdtest expects on each machine
+    (`mkdir -p` over SSH); after it, the controller fetches rank 0's CSV from rank 0's
+    machine.
   - mount-scale also keeps one lifecycle worker per participating machine (over SSH
     for remote machines) for mounts, sampling and cleanup between the jobs.
 
 ## Directories and data
 
-- **Controller:** `results/<bench>/<run-id>/` holds the manifest, tables, summaries and
-  figures. Launcher logs (appfiles, stdout and stderr) go in `<target>/`.
+- **Controller:** `results/<bench>/<run-id>/` holds `config.json` and the tables. Launcher
+  logs (appfiles, stdout and stderr) go in `<target>/`; `plot` writes `figures/` there.
 - **Each task machine:** work goes to `<target>/agent-fs-bench/<bench>/<run-id>/<node>/`,
   with one `task-NNNN/` directory per Python task.
   - Diagnostics stay in that machine's checkout under

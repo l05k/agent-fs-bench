@@ -29,8 +29,8 @@ from test_sqlite_speedtest import SPEEDTEST_STDOUT
 LINUX = sys.platform.startswith('linux')
 
 LAYOUTS = {
-    'one machine': [('local', 'host-a', (0,)), ('local', 'host-a', (1,))],
-    'two machines': [('local', 'host-a', (0,)), ('node-a', 'host-b', (0,))],
+    'one machine': [('local', 'host-a'), ('local', 'host-a')],
+    'two machines': [('local', 'host-a'), ('node-a', 'host-b')],
 }
 
 

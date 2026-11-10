@@ -21,7 +21,6 @@ from agent_fs_bench.results import PROJECT_ROOT, RunContext
 from .build_settings import read_compiler_version
 from .dev_workflow import (
     WorkflowError,
-    check_build_parallelism,
     elapsed_ms,
     fixture_hashes,
     git_text,
@@ -46,7 +45,7 @@ DEFAULT_BUNDLE = "source-repo.bundle"
 SOURCE_REPO_SUFFIX = "-source"
 
 # Keep this harness's configured parallelism; upstream invokes plain make.
-# Both "jobs" and "cpus_per_task" are capped here for a deliberate experiment.
+# "jobs" is capped here for a deliberate experiment.
 FIXED_JOBS = 2
 
 WORKFLOW_METRICS = (
@@ -61,8 +60,6 @@ CONFIG = {
     "fixture_dir": str(DEFAULT_FIXTURE_DIR),
     "require_fstype": None,
     "tasks": 1,
-    # Must equal "jobs": one pinned CPU per make job.
-    "cpus_per_task": FIXED_JOBS,
     "jobs": FIXED_JOBS,
     "verbose": False,
 }
@@ -459,8 +456,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.parse_args(argv)
     args = argparse.Namespace(**CONFIG)
     args.jobs = resolve_jobs(args.jobs)
-    args.cpus_per_task = resolve_jobs(args.cpus_per_task)
-    check_build_parallelism(args.jobs, args.cpus_per_task)
     return args
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
@@ -510,7 +505,6 @@ def task(t: cluster.Task) -> None:
     first = results[0][1]
     t.info({
         "jobs": args.jobs,
-        "cpus_per_task": args.cpus_per_task,
         "base_commit": first["base_commit"],
     })
     for sample, (host, result) in enumerate(results):

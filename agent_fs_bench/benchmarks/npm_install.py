@@ -1,7 +1,7 @@
 """Offline npm/pnpm materialization from prewarmed external local sources.
 
-Every task installs into its own project at the same time, on its own machine and
-CPU set. Each machine seeds its own source from the registry; each task copies
+Every task installs into its own project at the same time, on its assigned machine.
+Each machine seeds its own source from the registry; each task copies
 that source into a private sandbox for every repeat, so no task reads a cache,
 store, home or project another task wrote. The command and, when
 ``CONFIG['flush']`` is set, a full project fsync are timed; source preparation,
@@ -49,9 +49,6 @@ CONFIG: dict[str, Any] = {
     "repeats": 10,
     # External concurrency: simultaneous independent installs, never swept in one run.
     "tasks": 1,
-    # Keep cpus_per_task equal to the pool width below: each install gets the CPUs
-    # its file materialization can actually use.
-    "cpus_per_task": 4,
     "concurrency": 4,
     "prep_dir": "/dev/shm",
     "npm_bin": "npm",

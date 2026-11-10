@@ -4,9 +4,8 @@
 checkouts. `mini-dev-workflow` replays the same search/read/edit/build/commit
 shape against a tiny C project using real Git worktrees. Both are Python
 standard-library workloads in `agent_fs_bench/benchmarks/`. One run launches
-`tasks` independent instances at once, each pinned to a machine and CPU set;
-curves over the task count come from separate runs pooled with
-`plot --vary tasks`.
+`tasks` independent instances at once; curves over the task count come from
+separate runs pooled with `plot --vary tasks`.
 
 The project being edited is independent of the filesystem being measured. Mini
 edits a tiny C program; kernel edits five historical patches under Linux's
@@ -60,7 +59,6 @@ workload; edit them in source for a deliberate experiment. Defaults are:
 | `fixture_dir` | `data/dev-workflow` | `data/mini-dev-workflow` |
 | `require_fstype` | `None` | `None` |
 | `tasks` | `1` | `1` |
-| `cpus_per_task` | `8` | `2` (hard maximum 2) |
 | `jobs` | `8` | `2` (hard maximum 2) |
 | `verbose` | `False` | `False` |
 | `linux_url` | `https://github.com/torvalds/linux.git` | not used |
@@ -74,10 +72,9 @@ shows command output. Kernel `linux_url` may be a Git URL or a local mirror path
 a local path is resolved on each machine, so use one that exists there.
 
 `tasks` is the number of simultaneous independent instances, one per task.
-`cpus_per_task` is the number of logical CPUs each task is pinned to and must
-equal `jobs`: one `make` job per pinned CPU. Change both keys together. Mini caps
-both values at 2, matching the harness's fixed build parallelism. Tasks above a
-machine's CPU group count share groups.
+`jobs` is the task's build parallelism, passed to `make -j`; tasks above a
+machine's CPU count time-share its CPUs. Mini caps `jobs` at 2, matching the
+harness's fixed build parallelism.
 
 ## Prerequisites and complete smoke commands
 
@@ -121,8 +118,8 @@ machine's checkout.
 Both workflows follow [perf-eval at `bc32d083`](https://github.com/YoloFS/perf-eval/tree/bc32d083):
 invoke `make` with the inherited environment. The runner does not turn environment
 variables into command-line make assignments, clear build overrides, or choose a
-compiler itself. The configured `-j` value is the task's pinned CPU count
-(`cpus_per_task`) and remains this harness's experiment setting.
+compiler itself. The configured `-j` value is the task's build parallelism
+(`jobs`) and remains this harness's experiment setting.
 
 - Kernel Kbuild chooses its GCC/LLVM/cross tools. An environment-only `CC` can
   be overridden by the kernel Makefile, unlike mini's `CC ?=`. Normal make
@@ -227,8 +224,8 @@ resolved to a full commit ID before measurement.
 
 The shipped fixture has five commits, 15 search + 10 read + 41 edit commands,
 one full build and five incremental builds per task.
-Build parallelism is `CONFIG["jobs"]` (default eight) and equals
-`cpus_per_task`, so each task's `make -j8` stays on its eight pinned CPUs.
+Build parallelism is `CONFIG["jobs"]` (default eight), so each task's
+`make -j8` runs eight build processes on its machine's CPUs.
 
 ### Mini
 
@@ -243,8 +240,8 @@ compiler version selected by make is collected after timing, before worktree
 removal/pruning. As upstream, command exit codes are checked but commit trees
 are not compared.
 
-Mini defaults to two build jobs via `CONFIG["jobs"]`, caps both `jobs` and
-`cpus_per_task` at two, and supports a value of one. The shipped fixture builds
+Mini defaults to two build jobs via `CONFIG["jobs"]`, caps `jobs` at two, and
+supports a value of one. The shipped fixture builds
 one C translation unit. A complete run writes 27 rows per task to `steps.csv`.
 Each task's source repository remains after cleanup.
 `tools/gen_mini_source_repo.py` is fixture maintenance only, not a runtime
@@ -259,7 +256,7 @@ python3 tools/gen_mini_source_repo.py --force
 ## Tables and figures
 
 Every successful target writes one `workflow` row per task and one `steps` row
-per task and measured step. Tables live next to the manifest in
+per task and measured step. Tables live next to `config.json` in
 `results/<benchmark>/<run-id>/`; a run's targets share them, and the `target`
 column identifies each row.
 
@@ -270,17 +267,16 @@ column identifies each row.
 
 `tasks` repeats the run's task count, `sample` is the task index and `host` is
 the node name (`local` or the `hosts.toml` name). Both tables therefore have a
-pooled sample index, and the runner writes `summary/<table>.csv` grouping by the
-remaining key columns and pooling tasks. `kind` groups steps for figures:
-`config`, `build`, `command`, `git` and `verify` for the kernel workload;
+pooled sample index, so figures pool every task's rows. `kind` groups steps for
+figures: `config`, `build`, `command`, `git` and `verify` for the kernel workload;
 `worktree`, `build`, `command` and `git` for mini. `name` is the concrete
 operation (`initial-build`, `search-load`, `search`, `commit`, ...). The `commit`
 column holds the fixture commit for commit-specific steps and is empty otherwise.
 
-The manifest records the run configuration and per-target facts. Each node's
+`config.json` records the run configuration and per-target facts. Each node's
 `targets[].info.hosts[<node>]` entry holds `fixture_sha256` and the Git, Make and
 compiler versions of that machine. The target's `info` holds `jobs`,
-`cpus_per_task`, `base_commit`, and (kernel workload) `tree_assertions`, the
+`base_commit`, and (kernel workload) `tree_assertions`, the
 verified tree hash of every replayed commit. All instances start together, so the
 largest `elapsed_ms` of a run approximates its batch time. The compiler version is
 read through the makefile-selected
@@ -301,14 +297,14 @@ The default figures are `figures/step-duration-tasks-<N>.pdf` (with `.png` and a
 standalone `.py` script): a box plot of step durations by `kind`, one box per
 target, split by `tasks`; and `figures/workflow-duration.pdf`: a box plot of
 per-task workflow time at each `tasks` value, which stays meaningful when runs
-with different task counts are pooled. Re-render default or custom figures from
-finished runs with `python -m agent_fs_bench plot <run-dir>...`; pool runs with
+with different task counts are pooled. `python -m agent_fs_bench plot
+<run-dir>...` draws them from finished runs; pool runs with
 `--vary tasks` and split or use `tasks` in custom figures.
 
 Targets run sequentially, while a target's tasks run concurrently in one MPI
 job. Any failing task raises, which aborts the whole job: the target emits no
-`workflow` or `steps` rows, later targets are not attempted, and no figures are
-rendered. Rows from earlier successful targets remain in the run directory.
+`workflow` or `steps` rows, later targets are not attempted, and no row exists
+to plot. Rows from earlier successful targets remain in the run directory.
 
 ## Durability, limitations and provenance
 

@@ -11,7 +11,7 @@ replay. It complements `kvtest`'s controlled BLOB transaction experiment.
 
 ```sh
 uv run python -m agent_fs_bench run sqlite-speedtest --mode local --dirs /mnt/fs-a /mnt/fs-b
-# Smoke test: two tasks, two repeats and scale 1; needs two logical CPUs.
+# Smoke test: two tasks, two repeats and scale 1.
 uv run python -m agent_fs_bench run sqlite-speedtest --mode local --dirs /mnt/fs-a -- --smoke
 ```
 
@@ -30,7 +30,6 @@ real workload. Mount targets externally. Change `CONFIG` in
 | `nosync` | `False` | FULL synchronization, pinned by the build |
 | `repeats` | `5` | Complete suite invocations per task, each on a fresh database |
 | `tasks` | `1` | Independent single-connection instances started together |
-| `cpus_per_task` | `1` | Each instance is single-threaded |
 | `build_dir` | `None` | Default `build/sqlite-speedtest/` in each checkout |
 | `force_download` | `False` | Refresh sources and rebuild when True |
 
@@ -73,9 +72,9 @@ The run writes two flat tables:
 | `stages` | `jmode`, `sync` (`full`/`off`), `size`, `page_size`, `cache_size_kib`, `stage` (official stage ID), `description`, `tasks`, `repeat`, `sample` (task index), `host` (node) | `elapsed_s` |
 | `totals` | `jmode`, `sync`, `size`, `page_size`, `cache_size_kib`, `tasks`, `repeat`, `sample` (task index), `host` (node) | `official_total_s`, `wall_s` |
 
-`summary/stages.csv` and `summary/totals.csv` pool repeats per target, setting
-and task host (stages also per stage) and report `n` and each metric's median.
-The manifest's `targets[].info` holds the pinned SQLite version; each node
+Figures show the median and IQR of the raw rows: `stages` per target, setting,
+task host and stage, and `totals` per target, setting and task host.
+`config.json`'s `targets[].info` holds the pinned SQLite version; each node
 leader's compiler version, source/binary hashes and SQLite version are under
 `targets[].info.hosts.<node>`.
 
@@ -99,7 +98,7 @@ Databases remain under
 The default figures are a box plot of `official_total_s` with `tasks` on x, one
 figure per journal mode, and a line of median `elapsed_s` by stage ID, one
 figure per `tasks` value; `uv run python -m agent_fs_bench plot <run-dir>...`
-re-renders them, and `--vary tasks` pools runs with different task counts.
+draws them, and `--vary tasks` pools runs with different task counts.
 Source and binary fingerprints identify the actual official build.
 
 ## NAS comparison and paper figures

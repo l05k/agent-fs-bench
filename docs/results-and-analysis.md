@@ -1,33 +1,34 @@
-# Results, summaries and figures
+# Results and figures
 
 ## Layout
 
 ```text
 results/<bench>/<run-id>/
-  manifest.json        # run-level facts
-  <table>.csv          # one row per measurement or raw sample
-  summary/<table>.csv  # derived: n and medians per target × dimensions
-  figures/             # derived: default figures (.pdf, .png, .py)
+  config.json          # run-level facts and configuration
+  <table>.csv          # one row per observation
   <target>/            # per-target launcher logs (appfiles, stdout, stderr) and diagnostics
 ```
 
-Each workload doc lists its tables and default figures. Rows are appended and
-flushed one at a time outside timed regions, so a crash keeps every completed
-measurement. A failed check emits no row.
+`run` writes only raw data. Each workload doc lists its tables and default
+figures; figures come only from `plot`. Rows are appended and flushed one at a
+time outside timed regions, so a crash keeps every completed measurement. A
+failed check emits no row.
 
-## manifest.json
+## config.json
 
 | Field | Meaning |
 | --- | --- |
 | `benchmark`, `run_id` | Workload; UTC run ID with microseconds |
+| `seed` | Always `null`: no harness code draws random numbers that shape a measurement |
+| `git_commit` | `git rev-parse HEAD` of the checkout |
 | `source_sha256` | Fingerprint of benchmark sources and fixed inputs, including uncommitted edits; each workload's `CONFIG` literal is excluded because `config` records it |
-| `config` | The workload's settings: `CONFIG` plus workload flags, the run `mode`, and `launcher_sha256` (SHA-256 of the launcher's `mpiexec`, `mpiexec_args` and `env`, without their values) |
-| `launcher` | Name and version of the Open MPI launcher |
-| `nodes` | Each machine of the mode: name, hostname, CPU affinity list, kernel, architecture, Python, mpi4py, Open MPI library |
-| `targets[]` | `name`, `path` and `info` of each finished target: tool versions, binary hashes and fstype (per machine under `hosts`), and the verified task placement of every job (`placement`) |
+| `config` | The workload's settings: `CONFIG` plus workload flags, the run `mode`, and the launcher settings as `launcher` (`mpiexec`, `mpiexec_args`, `env`) |
+| `mpi_version` | Open MPI version of the launcher |
+| `nodes` | Each machine of the mode: name, hostname, cpu_model (lscpu "Model name"), cpu_count, system, kernel, machine (architecture), python, mpi4py, mpi_library |
+| `targets[]` | `name`, `path` and `info` of each finished target: tool versions, binary hashes and fstype (per machine under `hosts`), and the task count per machine (`placement`) |
 | `tables` | `keys` and `metrics` columns of each table |
 
-The manifest is rewritten after each target. A failed target is absent; its
+`config.json` is rewritten after each target. A failed target is absent; its
 partial rows stay in the CSV.
 
 ## Tables
@@ -35,23 +36,18 @@ partial rows stay in the CSV.
 Columns are `target`, then key columns, then metric columns (numbers whose names
 carry units). Key columns are dimensions (such as `operation` or `tasks`) plus
 the pooled keys `repeat` (1-based repetition) and `sample` (index of one raw
-sample within a measurement, e.g. a request or a worker). An empty cell means
-the metric does not apply to that row. Booleans are `0`/`1`.
-
-## summary/
-
-Written once all targets succeed. For each table with a `repeat` or `sample`
-column: one row per target × dimensions with `n` (pooled rows) and the median of
-each metric (6 significant digits). Compute other statistics from the tables.
+sample within a measurement, e.g. a request or a worker). Every metric cell is a
+finite number; a metric that does not apply to an observation is carried by
+another table. Booleans are `0`/`1`.
 
 ## plot
 
-`run` renders the workload's default figures (`FIGURES` in its module) into
-`figures/` after the last target. Re-render them, pool runs, or draw a custom
-figure:
+`plot` writes the workload's default figures (`FIGURES` in its module) into
+`figures/`; there is no automatic rendering. Render them, pool runs, or draw
+a custom figure:
 
 ```sh
-# Default figures again, primary system first in the legend
+# Default figures, primary system first in the legend
 uv run python -m agent_fs_bench plot results/mdtest/<run-id> --targets ours,nfs,ext4
 
 # Pool repeated runs; their configs and source fingerprints must match

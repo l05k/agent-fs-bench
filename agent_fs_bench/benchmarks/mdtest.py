@@ -1,33 +1,25 @@
 """Fixed-work metadata operations in IOR's mdtest at one task count per run.
 
-Each repeat is one global mdtest (IOR 4.0.0) job of ``tasks`` single-threaded MPI tasks,
-placed and pinned by ``agent_fs_bench.cluster``: ``-a POSIX -n total_items/N -i 1`` plus
-``-F`` (files) or ``-D`` (directories). The private layout gives every machine one ``-d``
-directory plus ``-u``, so each task creates its own tree in that machine's directory;
-the shared layout gives all tasks one ``-d`` directory, so across machines the
-experimenter must provide a target that every machine sees as one directory. Every run
-keeps the same ``total_items`` aggregate work.
-No file data is written or read: mdtest's read_bytes keeps its default 0, so its "File
-read" phase only opens and closes each file.
+| Symbol | Definition |
+| --- | --- |
+| N | `tasks`: single-threaded MPI tasks of one mdtest job, placed by `agent_fs_bench.cluster` |
+| W | `total_items`: fixed aggregate objects per phase; each task handles W/N |
+| T_p | Phase time: mdtest's aggregate `all` row, the maximum task time including the end barrier |
+| t_{p,r} | Rank r's time for phase p before the end barrier (per-rank rows) |
+| X_p | Throughput `ops_per_s = W / T_p` |
 
-mdtest times each phase between barriers. The CSV's aggregate ``all`` row provides
-max(time) over tasks; throughput is the fixed total_items / max(time). IOR 4.0.0
-overwrites aggregate directory create/stat item counts with rank 0's local counts, so CSV
-rate/item fields are not used. Completion is an operation returning, without extra sync
-or cache drops between phases.
+Each repeat is one global mdtest (IOR 4.0.0) job: ``-a POSIX -n W/N -i 1`` plus ``-F``
+(files) or ``-D`` (directories). The private layout gives every machine one ``-d``
+directory plus ``-u``, so each task creates its own tree; the shared layout gives all
+tasks one ``-d`` directory, which across machines must be one shared directory. No file
+data is written or read ("File read" only opens and closes). There is no warm-up: every
+repeat is measured, and its cache state is create-then-access without drops.
 
-Before a repeat emits anything, mdtest's launch banner must report the pinned version and
-exactly ``N`` tasks. Placement is proved per task by the wrapper (hostname and CPU), not
-by mdtest's own node count, which counts MPI shared-memory domains and is therefore not
-compared. mdtest's known zero-byte read notice
-is expected and any other warning fails the run; a nonzero exit fails immediately, with
-no retry. Launcher logs stay in ``ctx.result_dir``; task 0's node returns the rank CSV
-through the launcher output. mdtest removes the files and directories it creates; the
-empty per-repeat directories (and the test directory each machine's wrapper creates
-before the launch) stay under the run directory.
+IOR 4.0.0 overwrites aggregate directory create/stat item counts with rank 0's local
+counts, so CSV rate/item fields are never used; X_p always divides the fixed W.
 
-Only --smoke is exposed on the workload CLI; edit CONFIG for a deliberate experiment.
-Targets are mounted externally.
+Tables: `phases` (one row per repeat × operation: T_p, X_p) and `ranks` (one row per
+repeat × operation × rank: t_{p,r}).
 """
 
 from __future__ import annotations
@@ -47,16 +39,14 @@ from agent_fs_bench.results import RunContext
 MDTEST_VERSION = "4.0.0"
 CACHE_STATE = "create-then-access-no-drop"
 COMPLETION = "operation-return"
-# mdtest's TEST_DIR plus prep_testdir's ".<iteration>-<dir_iter>" for -i 1; mdtest creates it
-# only for rank 0, so every private task creates it if absent on its own machine.
+# mdtest creates its test directory only for rank 0; every private machine gets it first.
 TEST_DIR = "test-dir.0-0"
 
 # mdtest_bin must name the same binary on every machine (an absolute path is safest:
-# Open MPI does not read shell profiles). total_items is the fixed aggregate work.
+# Open MPI does not read shell profiles). total_items is the fixed aggregate work W.
 CONFIG: dict[str, Any] = {
     "mdtest_bin": "mdtest",
     "tasks": 1,
-    "cpus_per_task": 1,
     "total_items": 65536,
     "repeats": 5,
     "layout": "private",
@@ -85,45 +75,26 @@ FIGURES = [
 ]
 
 
-class BenchmarkError(RuntimeError):
-    pass
-
+# Validation ----------------------------------------------------------------------------------
 
 def check_banner(text: str, tasks: int, label: str) -> None:
-    """Require mdtest's own report of version and task count.
-
-    The banner's node count is not compared: mdtest counts MPI shared-memory domains
-    (IOR 4.0.0 ``GetNumNodes`` under MPI >= 3), and the wrapper already proves every
-    task's machine.
-    """
+    """mdtest's own version and task count; its node count counts shared-memory domains."""
     matches = BANNER.findall(text)
-    if len(matches) != 1:
-        raise BenchmarkError(f"{label}: expected one mdtest launch banner, found {len(matches)}")
-    version, launched, _reported = matches[0]
-    if version != MDTEST_VERSION:
-        raise BenchmarkError(
-            f"{label}: mdtest reported version {version}, expected {MDTEST_VERSION}"
-        )
-    if int(launched) != tasks:
-        raise BenchmarkError(
-            f"{label}: mdtest launched {launched} task(s), expected {tasks}"
-        )
+    assert len(matches) == 1, f"{label} launch banners: expected 1, measured {len(matches)}"
+    version, launched, _domains = matches[0]
+    assert version == MDTEST_VERSION, \
+        f"{label} mdtest version: expected {MDTEST_VERSION}, measured {version}"
+    assert int(launched) == tasks, f"{label} tasks: expected {tasks}, measured {launched}"
 
 
 def check_workload(text: str, subset: str, tasks: int, total_items: int, label: str) -> None:
-    """Require the reported task count, total work and object type to match."""
     workload = re.findall(r"^(\d+) tasks, (\d+) (files|directories)$", text, re.MULTILINE)
-    expected = (str(tasks), str(total_items), "files" if subset == "file" else "directories")
-    if workload != [expected]:
-        raise BenchmarkError(f"{label}: mdtest did not report the expected fixed work")
+    expected = [(str(tasks), str(total_items), "files" if subset == "file" else "directories")]
+    assert workload == expected, f"{label} work: expected {expected}, measured {workload}"
 
 
 def unexpected_warnings(text: str) -> list[str]:
-    """mdtest's own warnings other than the expected zero-byte read notice.
-
-    mdtest writes its log, including warnings, to stdout; the MPI launcher's
-    stderr is not mdtest output.
-    """
+    """mdtest's own warnings (on stdout) other than the expected zero-byte read notice."""
     return sorted({
         line[len("WARNING:"):].strip()
         for line in text.splitlines()
@@ -131,94 +102,118 @@ def unexpected_warnings(text: str) -> list[str]:
     })
 
 
-def read_phases(text: str, subset: str, expected_ops: int) -> list[tuple[str, int, float, float]]:
-    """Use aggregate phase times, not IOR 4.0.0's corrupted CSV item counts.
-
-    Every successful phase operates on the fixed total work. Per-rank rows and
-    the non-operation Directory read / Tree columns are not measurements here.
-    """
-    rows = list(csv.reader(io.StringIO(text)))
-    if not rows:
-        raise BenchmarkError("empty mdtest CSV")
-    columns = {name: position for position, name in enumerate(rows[0])}
-    if rows[0][:2] != ["rank", "items"] or len(columns) != len(rows[0]):
-        raise BenchmarkError("unexpected mdtest CSV header")
-    aggregates = [row for row in rows[1:] if row[:1] == ["all"]]
-    if len(aggregates) != 1:
-        raise BenchmarkError(
-            f"expected exactly one aggregate 'all' row, found {len(aggregates)}"
-        )
-    row = aggregates[0]
-    if len(row) < len(rows[0]):
-        raise BenchmarkError("aggregate 'all' row is incomplete")
-    phases = []
-    for operation, column, phase_subset in PHASES:
-        if phase_subset != subset:
-            continue
-        time_column = f"time-{column}"
-        if time_column not in columns:
-            raise BenchmarkError(f"no {time_column} column")
-        time_text = row[columns[time_column]]
-        if not time_text:
-            raise BenchmarkError(f"{column} phase did not run")
-        elapsed = float(time_text)
-        if not math.isfinite(elapsed) or elapsed <= 0:
-            raise BenchmarkError(f"{column} has no usable time: {time_text}")
-        phases.append((operation, expected_ops, elapsed, expected_ops / elapsed))
-    return phases
+def validate(stdout: str, subset: str, tasks: int, total_items: int, label: str) -> None:
+    check_banner(stdout, tasks, label)
+    check_workload(stdout, subset, tasks, total_items, label)
+    warnings = unexpected_warnings(stdout)
+    assert not warnings, f"{label} mdtest warnings: expected none, measured {warnings}"
 
 
-def launch(ctx: RunContext, slots: Sequence[cluster.Slot], binary: str, options: Sequence[str],
+# Parsing and metrics (pure) ------------------------------------------------------------------
+
+def _seconds(text: str, label: str) -> float:
+    assert text, f"{label}: expected a phase time, measured an empty cell"
+    value = float(text)
+    assert math.isfinite(value) and value > 0, f"{label}: expected time > 0, measured {text}"
+    return value
+
+
+def _csv(text: str) -> tuple[dict[str, int], list[list[str]]]:
+    rows = [row for row in csv.reader(io.StringIO(text)) if row]
+    assert rows and rows[0][:2] == ["rank", "items"], \
+        f"mdtest CSV header: expected rank,items,..., measured {rows[:1]}"
+    return {name: position for position, name in enumerate(rows[0])}, rows[1:]
+
+
+def subset_phases(subset: str) -> list[tuple[str, str]]:
+    return [(operation, column) for operation, column, kind in PHASES if kind == subset]
+
+
+def read_phase_times(text: str, subset: str) -> dict[str, float]:
+    """T_p of every operation of `subset` from the aggregate `all` row."""
+    columns, rows = _csv(text)
+    aggregates = [row for row in rows if row[0] == "all"]
+    assert len(aggregates) == 1, f"aggregate 'all' rows: expected 1, measured {len(aggregates)}"
+    return {operation: _seconds(aggregates[0][columns[f"time-{column}"]], f"{column} time")
+            for operation, column in subset_phases(subset)}
+
+
+def read_rank_times(text: str, subset: str, tasks: int) -> dict[str, list[float]]:
+    """t_{p,r} of every operation of `subset`, in rank order."""
+    columns, rows = _csv(text)
+    ranks = [row for row in rows if row[0] != "all"]
+    assert [row[0] for row in ranks] == [str(rank) for rank in range(tasks)], \
+        f"rank rows: expected 0..{tasks - 1}, measured {[row[0] for row in ranks]}"
+    return {operation: [_seconds(row[columns[f"time-{column}"]], f"rank {row[0]} {column} time")
+                        for row in ranks]
+            for operation, column in subset_phases(subset)}
+
+
+def throughput(total_items: int, elapsed_s: float) -> float:
+    """X_p = W / T_p."""
+    return total_items / elapsed_s
+
+
+def read_phases(text: str, subset: str, total_items: int) -> list[tuple[str, int, float, float]]:
+    """(operation, W, T_p, X_p) for every operation of `subset`."""
+    return [(operation, total_items, elapsed, throughput(total_items, elapsed))
+            for operation, elapsed in read_phase_times(text, subset).items()]
+
+
+# Run and output ------------------------------------------------------------------------------
+
+def launch(ctx: RunContext, placement: cluster.Placement, binary: str, options: Sequence[str],
            layout: str, name: str) -> tuple[str, str]:
-    """Run one mdtest job; return its stdout and task 0's rank CSV.
-
-    Private tasks share one ``<work>/<node>/<name>`` per machine, with mdtest's test
-    directory created there if absent (mdtest creates it only for rank 0); shared tasks
-    get ``<work>/<name>``.
-    """
+    """Run one mdtest job; return its stdout and rank 0's CSV."""
+    launcher = ctx.pool.launcher
     capture = Path('/tmp') / f'agent-fs-bench-{ctx.run_id}-{ctx.target.name}-{name}.csv'
-    directories, mkdirs = [], []
-    for slot in slots:
-        if layout == 'private':
-            directory = ctx.work_dir / slot.node.name / name
-            mkdirs.append([directory / TEST_DIR])
-        else:
-            directory = ctx.work_dir / name
-            mkdirs.append([directory])
-        directories.append(directory)
-    programs = [[binary, *options, *(['-u'] if layout == 'private' else []), '-d', str(directory),
-                 f'--saveRankPerformanceDetails={capture}'] for directory in directories]
-    result = cluster.run_native(slots, programs, ctx.result_dir, name, mkdirs=mkdirs,
-                                within=ctx.target.path, capture=capture)
-    if ctx.info.setdefault('mdtest_sha256', result.sha256) != result.sha256:
-        raise BenchmarkError(f'{name}: the mdtest binary changed during the run')
-    ctx.info.setdefault('placement', {})[name] = result.placement
-    return result.stdout, result.capture
+    directory = {node: ctx.work_dir / node.name / name if layout == 'private'
+                 else ctx.work_dir / name for node in cluster.machines(placement)}
+    cluster.make_directories(launcher, {
+        node: [path / TEST_DIR if layout == 'private' else path]
+        for node, path in directory.items()})
+    programs = [[binary, *options, *(['-u'] if layout == 'private' else []),
+                 '-d', directory[node], f'--saveRankPerformanceDetails={capture}']
+                for node in placement]
+    run = cluster.run_program(placement, launcher, programs, ctx.result_dir, name)
+    cluster.validate_exit(run)
+    return run.stdout, cluster.fetch_file(placement[0], launcher, capture)
+
+
+def binary_info(launcher: cluster.Launcher, placement: cluster.Placement,
+                binary: str) -> dict[str, Any]:
+    digests = cluster.binary_digests(cluster.machines(placement), launcher, binary)
+    return {'mdtest_sha256': cluster.validate_binary(binary, digests),
+            'placement': cluster.placement_record(placement)}
+
+
+def write_repeat(ctx: RunContext, keys: dict[str, Any], placement: cluster.Placement,
+                 phases: list[tuple[str, int, float, float]],
+                 ranks: dict[str, list[float]]) -> None:
+    for operation, ops, elapsed, rate in phases:
+        ctx.emit("phases", {"operation": operation, **keys},
+                 {"ops": ops, "elapsed_s": elapsed, "ops_per_s": rate})
+        for sample, elapsed_rank in enumerate(ranks[operation]):
+            ctx.emit("ranks", {"operation": operation, **keys, "sample": sample,
+                               "host": placement[sample].name}, {"elapsed_s": elapsed_rank})
 
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
-    slots = cluster.allocate(ctx.pool.nodes, args.tasks, args.cpus_per_task)
-    tasks = len(slots)
-    if args.total_items % tasks or args.total_items // tasks < 2:
-        raise BenchmarkError(f"total_items {args.total_items} must divide into at least two "
-                             f"items per task for {tasks} tasks")
+    placement = cluster.place(ctx.pool.nodes, args.tasks)
+    tasks = len(placement)
     items = args.total_items // tasks
     options = ["-a", "POSIX", "-n", str(items), "-i", "1", "-F" if args.subset == "file" else "-D"]
-    ctx.info.update(mdtest_version=MDTEST_VERSION, cache_state=CACHE_STATE, completion=COMPLETION)
+    ctx.info.update(mdtest_version=MDTEST_VERSION, cache_state=CACHE_STATE, completion=COMPLETION,
+                    **binary_info(ctx.pool.launcher, placement, args.mdtest_bin))
     for repeat in range(1, args.repeats + 1):
         name = f"{args.subset}-{args.layout}-N{tasks}-rep{repeat}"
         print(f"  {name}: {items} items/task", flush=True)
-        stdout, text = launch(ctx, slots, args.mdtest_bin, options, args.layout, name)
-        check_banner(stdout, tasks, name)
-        check_workload(stdout, args.subset, tasks, args.total_items, name)
-        warnings = unexpected_warnings(stdout)
-        if warnings:
-            raise BenchmarkError(f"{name}: unexpected mdtest warnings: {'; '.join(warnings)}")
+        stdout, text = launch(ctx, placement, args.mdtest_bin, options, args.layout, name)
+        validate(stdout, args.subset, tasks, args.total_items, name)
         phases = read_phases(text, args.subset, args.total_items)
-        for operation, ops, elapsed, rate in phases:
-            ctx.emit("phases", {"operation": operation, "layout": args.layout, "tasks": tasks,
-                                "repeat": repeat},
-                     {"ops": ops, "elapsed_s": elapsed, "ops_per_s": rate})
+        ranks = read_rank_times(text, args.subset, tasks)
+        write_repeat(ctx, {"layout": args.layout, "tasks": tasks, "repeat": repeat},
+                     placement, phases, ranks)
         print(f"  {name}: " + ", ".join(f"{operation} {rate:.1f} ops/s"
                                         for operation, _ops, _elapsed, rate in phases), flush=True)
 
@@ -232,11 +227,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     if parsed.smoke:
         settings.update(total_items=128, repeats=2)
     args = argparse.Namespace(**settings, **vars(parsed))
-    # A typo would run the wrong layout/subset under its own label, or no phase at all.
-    if (args.repeats < 1 or args.layout not in ("private", "shared")
-            or args.subset not in ("file", "dir")):
-        raise BenchmarkError("layout must be private or shared, subset file or dir, repeats >= 1")
-    if (type(args.tasks) is not int or args.tasks < 1 or args.total_items % args.tasks
-            or args.total_items // args.tasks < 2):
-        raise BenchmarkError("total_items must divide evenly into at least two items per task")
+    assert args.repeats >= 1, f"repeats: expected >= 1, measured {args.repeats}"
+    assert args.layout in ("private", "shared"), \
+        f"layout: expected private or shared, measured {args.layout!r}"
+    assert args.subset in ("file", "dir"), f"subset: expected file or dir, measured {args.subset!r}"
+    assert (type(args.tasks) is int and args.tasks >= 1 and args.total_items % args.tasks == 0
+            and args.total_items // args.tasks >= 2), \
+        f"total_items / tasks: expected an integer >= 2, measured {args.total_items} / {args.tasks}"
     return args

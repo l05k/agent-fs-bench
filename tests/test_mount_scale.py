@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from agent_fs_bench.benchmarks import mount_scale
-from agent_fs_bench.benchmarks.mount_scale_mdtest import Mdtest, Phase
+from agent_fs_bench.benchmarks.mount_scale_mdtest import Phase, check_banner, read_timings
 from agent_fs_bench.benchmarks.mount_scale_mounts import Layout, Profile, _run
 from agent_fs_bench.results import RunContext, Tables, read_table
 from agent_fs_bench.targets import Target
@@ -111,36 +111,41 @@ all,32,,,,,,,,,,,4.9618383734e+04,1.2898445129e-03,1.1046726584e+06,5.7935714722
 '''
     BANNER = 'mdtest-4.0.0 was launched with 2 total task(s) on 1 node(s)\n'
 
-    def parse(self, csv, banner=None):
-        return Mdtest._parse('private', self.BANNER if banner is None else banner,
-                             csv, ('File creation',), 2)
+    def parse(self, csv):
+        return read_timings('private', csv, ('File creation',), 2)
 
     def test_aggregate_uses_barrier_time_not_average_rank_time(self):
-        _, items, times, ranks = self.parse(self.CSV)
-        self.assertEqual(items, 32)
-        self.assertEqual(times['File creation'], 1.2898445129e-03)
-        self.assertEqual(ranks['File creation'], [1.2857913971e-03, 9.6893310547e-04])
-        self.assertGreater(times['File creation'], max(ranks['File creation']))
+        timings = self.parse(self.CSV)
+        self.assertEqual(timings.items, 32)
+        self.assertEqual(timings.phase_s['File creation'], 1.2898445129e-03)
+        self.assertEqual(timings.rank_s['File creation'], [1.2857913971e-03, 9.6893310547e-04])
+        self.assertGreater(timings.phase_s['File creation'], max(timings.rank_s['File creation']))
 
     def test_missing_client_measurement_is_fatal(self):
         incomplete = '\n'.join(self.CSV.splitlines()[:-1]) + '\n'
-        with self.assertRaisesRegex(RuntimeError, 'rank rows'):
+        with self.assertRaisesRegex(AssertionError, 'rank rows'):
             self.parse(incomplete)
 
     def test_nonfinite_native_phase_cannot_be_reported(self):
-        with self.assertRaisesRegex(RuntimeError, 'no time'):
+        with self.assertRaisesRegex(AssertionError, 'expected time > 0'):
             self.parse(self.CSV.replace('1.2898445129e-03', 'nan'))
+
+    def test_phase_that_did_not_run_is_fatal_instead_of_zero(self):
+        with self.assertRaises(ValueError):
+            read_timings('private', self.CSV, ('Directory creation',), 2)
 
     def test_mdtest_node_count_is_not_compared_with_the_plan(self):
         # mdtest counts MPI shared-memory domains, so unequal per-machine task counts
-        # make its node count differ from the planned machine count. Placement is
-        # proved per task by the wrapper instead.
-        multi = self.BANNER.replace('1 node(s)', '3 node(s)')
-        self.assertEqual(self.parse(self.CSV, multi)[1], 32)
+        # make its node count differ from the planned machine count.
+        check_banner('private', self.BANNER.replace('1 node(s)', '3 node(s)'), 2)
 
     def test_launcher_output_interleaved_with_the_banner_is_tolerated(self):
-        banner = '[node-a:1234] ' + self.BANNER
-        self.assertEqual(self.parse(self.CSV, banner)[1], 32)
+        check_banner('private', '[node-a:1234] ' + self.BANNER, 2)
+
+    def test_wrong_task_count_is_fatal(self):
+        with self.assertRaisesRegex(AssertionError, 'tasks: expected 4'):
+            check_banner('private', self.BANNER, 4)
+
 
 class TableEmissionTests(unittest.TestCase):
     def setUp(self):
@@ -160,51 +165,55 @@ class TableEmissionTests(unittest.TestCase):
                 'mount_entries': 4, 'sample_elapsed_s': 1.0, 'cpu_busy_s': 0.5,
                 'cpu_busy_cores': 0.5, 'cpu_busy_percent': 50.0}
 
-    def test_host_samples_become_lifecycle_agent_and_resource_rows(self):
-        mount = {'mount_elapsed_s': 0.2, 'measured_mounts': 3,
-                 'agent_elapsed_s': (0.1, 0.2)}
-        unmount = {'unmount_elapsed_s': 0.1, 'remaining_mounts': 0,
-                   'agent_elapsed_s': (0.05, 0.05)}
+    def test_host_samples_become_one_table_per_granularity(self):
+        mount = {'mount_elapsed_s': 0.2, 'measured_mounts': 3, 'agent_elapsed_s': (0.1, 0.2)}
         workload = {'sample_elapsed_s': 2.0, 'cpu_busy_s': 1.0, 'cpu_busy_cores': 0.5,
-                    'cpu_busy_percent': 50.0, 'peak_used_bytes': 20,
-                    'peak_used_bytes_delta': 10}
-        mount_scale._emit_host(self.ctx, 'multi-mount', 2, 'local', 1, self.levels(),
-                               self.levels(), self.levels(), workload, mount, unmount)
-        lifecycle = read_table(self.root / 'lifecycle.csv')
-        self.assertEqual(
-            [(row['action'], row['elapsed_s'], row['measured_mounts'], row['remaining_mounts'])
-             for row in lifecycle],
-            [('mount', '0.2', '3', ''), ('unmount', '0.1', '', '0')])
-        agents = read_table(self.root / 'agents.csv')
-        self.assertEqual([(row['action'], row['sample'], row['elapsed_s']) for row in agents],
-                         [('mount', '0', '0.1'), ('mount', '1', '0.2'),
-                          ('unmount', '0', '0.05'), ('unmount', '1', '0.05')])
-        resources = read_table(self.root / 'resources.csv')
-        self.assertEqual([row['state'] for row in resources],
-                         ['baseline', 'mounted-idle', 'released-idle', 'workload'])
-        self.assertEqual(resources[0]['used_bytes_delta'], '')
-        self.assertEqual(resources[1]['used_bytes_delta'], '0')
-        self.assertEqual(resources[3]['used_bytes'], '')
-        self.assertEqual(resources[3]['peak_used_bytes'], '20')
-        self.assertEqual(resources[3]['peak_used_bytes_delta'], '10')
+                    'cpu_busy_percent': 50.0,
+                    **{f'peak_{key}': 20 for key in mount_scale.PEAKS},
+                    **{f'peak_{key}_delta': 10 for key in mount_scale.PEAKS}}
+        keys = {'topology': 'multi-mount', 'tasks': 2, 'repeat': 1}
+        mount_scale.write_lifecycle(self.ctx, keys, 'local', 'mount', mount)
+        mount_scale.write_resources(self.ctx, keys, 'local', self.levels(),
+                                    {**self.levels(), 'used_bytes': 15}, self.levels(), workload)
+        self.assertEqual([(row['elapsed_s'], row['measured_mounts'])
+                          for row in read_table(self.root / 'host_mounts.csv')], [('0.2', '3')])
+        self.assertEqual([(row['action'], row['sample'], row['elapsed_s'])
+                          for row in read_table(self.root / 'agents.csv')],
+                         [('mount', '0', '0.1'), ('mount', '1', '0.2')])
+        self.assertEqual([row['state'] for row in read_table(self.root / 'resource_levels.csv')],
+                         ['baseline', 'mounted-idle', 'released-idle'])
+        self.assertEqual([(row['state'], row['used_bytes_delta'])
+                          for row in read_table(self.root / 'resource_deltas.csv')],
+                         [('mounted-idle', '5'), ('released-idle', '0')])
+        workload_rows = read_table(self.root / 'resource_workload.csv')
+        self.assertEqual((workload_rows[0]['peak_used_bytes'],
+                          workload_rows[0]['peak_used_bytes_delta']), ('20', '10'))
 
-    def test_phase_rows_and_rank_samples_share_the_phase_identity(self):
+    def test_incomplete_workload_sample_fails_instead_of_leaving_empty_cells(self):
+        keys = {'topology': 'multi-mount', 'tasks': 2, 'repeat': 1}
+        with self.assertRaises(KeyError):
+            mount_scale.write_resources(self.ctx, keys, 'local', self.levels(), self.levels(),
+                                        self.levels(), {'sample_elapsed_s': 1.0})
+        self.assertFalse((self.root / 'resource_workload.csv').exists())
+
+    def test_rank_samples_and_bandwidth_share_the_phase_identity(self):
         phases = [Phase('private/create', 4, 0.5, [0.2, 0.3]),
                   Phase('private/stat', 4, 0.25, [0.1, 0.15])]
-        mapping = [{'host': 'local', 'cpu': 0}, {'host': 'node-a', 'cpu': 4}]
-        mount_scale._emit_phases(self.ctx, 'multi-mount', 2, 1, phases, mapping, 4096)
+        keys = {'topology': 'multi-mount', 'tasks': 2, 'repeat': 1}
+        mount_scale.write_phases(self.ctx, keys, phases, ['local', 'node-a'], 4096)
         rows = read_table(self.root / 'phases.csv')
         self.assertEqual([row['phase'] for row in rows], ['private/create', 'private/stat'])
-        self.assertEqual(rows[0]['bytes'], str(4 * 4096))
-        self.assertEqual(rows[1]['bytes'], '')
+        self.assertEqual([(row['phase'], row['bytes'])
+                          for row in read_table(self.root / 'bandwidth.csv')],
+                         [('private/create', str(4 * 4096))])
         ranks = read_table(self.root / 'ranks.csv')
         self.assertEqual(
-            [(row['phase'], row['sample'], row['host'], row['cpu'], row['elapsed_s'])
+            [(row['phase'], row['sample'], row['host'], row['elapsed_s'])
              for row in ranks],
-            [('private/create', '0', 'local', '0', '0.2'),
-             ('private/create', '1', 'node-a', '4', '0.3'),
-             ('private/stat', '0', 'local', '0', '0.1'),
-             ('private/stat', '1', 'node-a', '4', '0.15')])
+            [('private/create', '0', 'local', '0.2'),
+             ('private/create', '1', 'node-a', '0.3'),
+             ('private/stat', '0', 'local', '0.1'),
+             ('private/stat', '1', 'node-a', '0.15')])
 
 if __name__ == '__main__':
     unittest.main()

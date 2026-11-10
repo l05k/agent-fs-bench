@@ -1,13 +1,20 @@
-"""Single entry point: run a workload on explicit targets, or re-plot finished runs."""
+"""Single entry point: run a workload on explicit targets, or plot finished runs.
+
+`run` writes only raw observations: `results/<bench>/<run-id>/config.json` (parameter
+snapshot) and one `<table>.csv` per observation kind. Summaries and figures come from
+the separate `plot` command.
+"""
 
 import argparse
 from datetime import datetime, timezone
+from pathlib import Path
 import signal
 import sys
+from typing import Any
 
 from . import analysis, cluster
-from .results import PROJECT_ROOT, RunContext, Tables, source_digest, write_json
-from .targets import load_targets
+from .results import PROJECT_ROOT, RunContext, Tables, git_commit, source_digest, write_json
+from .targets import Target, load_targets
 
 BENCHMARKS = (
     'clone', 'dev-workflow', 'mini-dev-workflow', 'npm-install', 'npm-install-nofsync',
@@ -15,9 +22,12 @@ BENCHMARKS = (
 )
 RESULTS_DIR = PROJECT_ROOT / 'results'
 TARGETS_FILE = PROJECT_ROOT / 'local' / 'targets.toml'
+# No harness code draws random numbers that shape a measurement, so there is no seed to fix;
+# config.json records that explicitly. Workload content generators keep their own fixed inputs.
+SEED = None
 
 
-def run_benchmark(argv: list[str]) -> int:
+def parse_run_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(prog='agent-fs-bench run',
         description='Run one workload sequentially on explicit target directories. '
                     'Put workload flags after --; use -- --help for workload help.')
@@ -28,63 +38,74 @@ def run_benchmark(argv: list[str]) -> int:
                         help='local: this machine only; overflow: this machine first, then '
                              'local/hosts.toml in order; remote: local/hosts.toml only')
     split = argv.index('--') if '--' in argv else len(argv)
-    options = parser.parse_args(argv[:split])
-    workload_argv = argv[split + 1:]
-    module = analysis.workload(options.benchmark)
-    # Mode and launcher settings are part of the experiment: plot pools runs of one mode
-    # and one launcher configuration unless --vary names them.
-    config = {**vars(module.parse_args(workload_argv)), 'mode': options.mode,
-              'launcher_sha256': cluster.launcher_digest()}
+    return parser.parse_args(argv[:split]), argv[split + 1:]
+
+
+def select_targets(options: argparse.Namespace, config: dict[str, Any]) -> list[Target]:
     targets = load_targets(TARGETS_FILE, options.dirs)
-    # A misspelled override would silently measure cp-r; check before --target filtering.
-    unknown = set(config.get('target_copiers', {})) - {target.name for target in targets}
-    if unknown:
-        raise ValueError(f'unknown target_copiers aliases: {", ".join(sorted(unknown))}; '
-                         f'targets: {", ".join(target.name for target in targets)}')
+    names = {target.name for target in targets}
+    copiers = set(config.get('target_copiers', {}))
+    assert copiers <= names, f'target_copiers aliases: expected within {names}, measured {copiers}'
     if options.target:
-        unknown = set(options.target) - {target.name for target in targets}
-        if unknown:
-            raise ValueError(f'unknown targets: {", ".join(sorted(unknown))}')
+        assert set(options.target) <= names, \
+            f'targets: expected within {names}, measured {options.target}'
         targets = [target for target in targets if target.name in options.target]
     if options.mode != 'remote':
         # Remote machines check their own target; the controller only where it runs tasks.
         for target in targets:
-            if not target.path.is_dir():
-                raise ValueError(f'target directory does not exist: {target.path}; mount it first')
-            if RESULTS_DIR.is_relative_to(target.path.resolve()):
-                raise ValueError('results must be outside every measured target directory')
-    pool = cluster.open_pool(options.mode)
+            assert target.path.is_dir(), f'target {target.name}: expected a mounted directory, ' \
+                                         f'measured {target.path}'
+            assert not RESULTS_DIR.is_relative_to(target.path.resolve()), \
+                f'results: expected outside {target.path}, measured {RESULTS_DIR}'
+    return targets
+
+
+def snapshot(benchmark: str, run_id: str, config: dict[str, Any], pool: cluster.Pool,
+             tables: Tables, targets: list[dict[str, Any]]) -> dict[str, Any]:
+    """Parameters, seed and environment baseline of one run (config.json)."""
+    return {'benchmark': benchmark, 'run_id': run_id, 'seed': SEED,
+            'git_commit': git_commit(), 'source_sha256': source_digest(), 'config': config,
+            'mpi_version': pool.mpi_version, 'nodes': pool.manifest(),
+            'targets': targets, 'tables': tables.schemas}
+
+
+def run_target(module, workload_argv: list[str], benchmark: str, run_id: str, run_dir: Path,
+               target: Target, tables: Tables, pool: cluster.Pool) -> dict[str, Any]:
+    print(f'[{benchmark}] {target.name}: {target.path}', flush=True)
+    result_dir = run_dir / target.name
+    result_dir.mkdir()
+    context = RunContext(benchmark, run_id, target,
+                         target.path / 'agent-fs-bench' / benchmark / run_id, result_dir,
+                         tables, pool=pool)
+    module.run(context, module.parse_args(workload_argv))
+    print(f'  {context.rows} rows', flush=True)
+    return {'name': target.name, 'path': str(target.path), 'info': context.info}
+
+
+def run_benchmark(argv: list[str]) -> int:
+    options, workload_argv = parse_run_args(argv)
+    module = analysis.workload(options.benchmark)
+    launcher = cluster.Launcher(**cluster.CONFIG)
+    config = {**vars(module.parse_args(workload_argv)), 'mode': options.mode,
+              'launcher': launcher.record()}
+    targets = select_targets(options, config)
+    pool = cluster.open_pool(options.mode, launcher)
+    cluster.validate_pool(pool, source_digest())
     print(f'[{options.benchmark}] mode {options.mode}: ' + ', '.join(
-        f'{node.name} ({node.hostname}, {len(node.cpus)} CPUs)' for node in pool.nodes), flush=True)
+        f'{node.name} ({node.hostname}, {node.facts["cpu_count"]} CPUs)' for node in pool.nodes),
+        flush=True)
     run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
     run_dir = RESULTS_DIR / options.benchmark / run_id
     run_dir.mkdir(parents=True)
-    tables = Tables(run_dir)
-    manifest = {'benchmark': options.benchmark, 'run_id': run_id,
-                'source_sha256': source_digest(), 'config': config,
-                'launcher': pool.launcher, 'nodes': pool.manifest(),
-                'targets': [], 'tables': tables.schemas}
-    write_json(run_dir / 'manifest.json', manifest)
-    try:
-        for target in targets:
-            # Each participating machine creates its own <work_dir>/<node>/ when it starts.
-            work_dir = target.path / 'agent-fs-bench' / options.benchmark / run_id
-            result_dir = run_dir / target.name
-            result_dir.mkdir()
-            context = RunContext(options.benchmark, run_id, target, work_dir, result_dir, tables,
-                                 pool=pool)
-            print(f'[{options.benchmark}] {target.name}: {target.path}', flush=True)
-            # A fresh Namespace per target keeps workload setup from leaking state.
-            module.run(context, module.parse_args(workload_argv))
-            print(f'  {context.rows} rows', flush=True)
-            manifest['targets'].append({'name': target.name, 'path': str(target.path),
-                                        'info': context.info})
-            write_json(run_dir / 'manifest.json', manifest)
-    finally:
-        tables.close()
-    analysis.summarize(run_dir)
-    for stem in analysis.plot([run_dir]):
-        print(f'Figure: {stem}.pdf')
+    tables, finished = Tables(run_dir), []
+    write_json(run_dir / 'config.json',
+               snapshot(options.benchmark, run_id, config, pool, tables, finished))
+    for target in targets:
+        finished.append(run_target(module, workload_argv, options.benchmark, run_id, run_dir,
+                                   target, tables, pool))
+        write_json(run_dir / 'config.json',
+                   snapshot(options.benchmark, run_id, config, pool, tables, finished))
+    tables.close()
     print(f'Results: {run_dir}', flush=True)
     return 0
 
@@ -93,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     def terminate(signum, frame):
         raise KeyboardInterrupt
 
-    # SIGTERM unwinds like Ctrl-C so workloads still unmount and clean up.
+    # SIGTERM unwinds like Ctrl-C so workloads still clean up.
     signal.signal(signal.SIGTERM, terminate)
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog='agent-fs-bench')

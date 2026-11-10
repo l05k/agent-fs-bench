@@ -6,7 +6,6 @@ fails instead of hanging. Single-task runs cannot detect any of that.
 """
 
 import io
-import json
 from pathlib import Path
 import tempfile
 import threading
@@ -153,34 +152,34 @@ class World(Comm):
             exchange.abort(error)
 
 
-def run_tasks(module, args, slots, *, timeout=TIMEOUT, node_args=None):
-    """Run `module.task` for every slot; return the emitted rows per table.
+def run_tasks(module, args, placement, *, timeout=TIMEOUT, node_args=None):
+    """Run `module.task` for every task; return the emitted rows per table.
 
-    `slots` is a list of ``(node, hostname, cpus)`` as in the real job spec. Rows pass
-    the controller's own validation (`RunContext.emit`). The target sits under HOME, not
-    /tmp, so its filesystem differs from tmpfs preparation dirs.
+    `placement` is a list of ``(node, hostname)`` per task as in the real `JobSpec`. Rows
+    pass the controller's own validation (`RunContext.emit`). The target sits under HOME,
+    not /tmp, so its filesystem differs from tmpfs preparation dirs.
 
     `node_args(node)` may return that machine's args for paths production gives each
     machine separately (its own filesystem); by default every task shares `args`.
     """
-    world = World(len(slots), timeout)
+    world = World(len(placement), timeout)
     benchmark = module.__name__.rsplit('.', 1)[-1].replace('_', '-')
     with tempfile.TemporaryDirectory(dir=Path.home()) as directory:
         root = Path(directory)
         target = root / 'target'
         target.mkdir()
-        protocols = [io.StringIO() for _slot in slots]
+        protocols = [io.StringIO() for _task in placement]
         errors = []
 
         def run(index, node):
             # Task construction calls Split, a world collective, so it runs here too.
             world.attach(index)
             try:
-                spec = {'slots': list(slots),
-                        'args': args if node_args is None else node_args(node),
-                        'benchmark': benchmark, 'run_id': root.name,
-                        'target': ('t', str(target))}
-                task = cluster.Task(world, spec, index, protocols[index])
+                spec = cluster.JobSpec(module.__name__, benchmark, root.name,
+                                       Target('t', target),
+                                       args if node_args is None else node_args(node),
+                                       tuple(placement))
+                task = cluster.Task(world, spec, protocols[index])
                 task.log_dir = root / 'logs' / node
                 task.setup()
                 module.task(task)
@@ -189,7 +188,7 @@ def run_tasks(module, args, slots, *, timeout=TIMEOUT, node_args=None):
                 world.abort(error)
 
         threads = [threading.Thread(target=run, args=(index, node), name=f'task-{index}')
-                   for index, (node, _hostname, _cpus) in enumerate(slots)]
+                   for index, (node, _hostname) in enumerate(placement)]
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -201,10 +200,8 @@ def run_tasks(module, args, slots, *, timeout=TIMEOUT, node_args=None):
         ctx = RunContext(benchmark, root.name, Target('t', target), target,
                          root / 'tables', tables)
         for protocol in protocols:
-            for line in protocol.getvalue().splitlines():
-                kind, _, payload = line.partition(' ')
-                if kind == 'AFB_ROW':
-                    ctx.emit(*json.loads(payload))
+            for table, keys, metrics in cluster.parse_messages(protocol.getvalue()).rows:
+                ctx.emit(table, keys, metrics)
         tables.close()
         return {table: read_table(root / 'tables' / f'{table}.csv') for table in tables.schemas}
 
