@@ -16,13 +16,15 @@ overwrites aggregate directory create/stat item counts with rank 0's local count
 rate/item fields are not used. Completion is an operation returning, without extra sync
 or cache drops between phases.
 
-Before a repeat emits anything, mdtest's launch banner must report the pinned version,
-exactly ``N`` tasks and the planned machine count. mdtest's known zero-byte read notice
+Before a repeat emits anything, mdtest's launch banner must report the pinned version and
+exactly ``N`` tasks. Placement is proved per task by the wrapper (hostname and CPU), not
+by mdtest's own node count, which counts MPI shared-memory domains and is therefore not
+compared. mdtest's known zero-byte read notice
 is expected and any other warning fails the run; a nonzero exit fails immediately, with
 no retry. Launcher logs stay in ``ctx.result_dir``; task 0's node returns the rank CSV
 through the launcher output. mdtest removes the files and directories it creates; the
-empty per-repeat directories (and the precreated test directory on every machine but
-task 0's) stay under the run directory.
+empty per-repeat directories (and the test directory each machine's wrapper creates
+before the launch) stay under the run directory.
 
 Only --smoke is exposed on the workload CLI; edit CONFIG for a deliberate experiment.
 Targets are mounted externally.
@@ -46,7 +48,7 @@ MDTEST_VERSION = "4.0.0"
 CACHE_STATE = "create-then-access-no-drop"
 COMPLETION = "operation-return"
 # mdtest's TEST_DIR plus prep_testdir's ".<iteration>-<dir_iter>" for -i 1; mdtest creates it
-# only for rank 0, so every private task gets it precreated on its own machine.
+# only for rank 0, so every private task creates it if absent on its own machine.
 TEST_DIR = "test-dir.0-0"
 
 # mdtest_bin must name the same binary on every machine (an absolute path is safest:
@@ -88,20 +90,24 @@ class BenchmarkError(RuntimeError):
     pass
 
 
-def check_banner(text: str, tasks: int, nodes: int, label: str) -> None:
-    """Require mdtest's own report of version, task count and machine count."""
+def check_banner(text: str, tasks: int, label: str) -> None:
+    """Require mdtest's own report of version and task count.
+
+    The banner's node count is not compared: mdtest counts MPI shared-memory domains
+    (IOR 4.0.0 ``GetNumNodes`` under MPI >= 3), and the wrapper already proves every
+    task's machine.
+    """
     matches = BANNER.findall(text)
     if len(matches) != 1:
         raise BenchmarkError(f"{label}: expected one mdtest launch banner, found {len(matches)}")
-    version, launched, reported = matches[0]
+    version, launched, _reported = matches[0]
     if version != MDTEST_VERSION:
         raise BenchmarkError(
             f"{label}: mdtest reported version {version}, expected {MDTEST_VERSION}"
         )
-    if int(launched) != tasks or int(reported) != nodes:
+    if int(launched) != tasks:
         raise BenchmarkError(
-            f"{label}: mdtest launched {launched} task(s) on {reported} node(s), "
-            f"expected {tasks} task(s) on {nodes} node(s)"
+            f"{label}: mdtest launched {launched} task(s), expected {tasks}"
         )
 
 
@@ -168,24 +174,22 @@ def launch(ctx: RunContext, slots: Sequence[cluster.Slot], binary: str, options:
     """Run one mdtest job; return its stdout and task 0's rank CSV.
 
     Private tasks share one ``<work>/<node>/<name>`` per machine, with mdtest's test
-    directory precreated there (mdtest creates it only for rank 0); shared tasks get
-    ``<work>/<name>``.
+    directory created there if absent (mdtest creates it only for rank 0); shared tasks
+    get ``<work>/<name>``.
     """
     capture = Path('/tmp') / f'agent-fs-bench-{ctx.run_id}-{ctx.target.name}-{name}.csv'
-    directories, fresh, mkdirs = [], [], []
+    directories, mkdirs = [], []
     for slot in slots:
         if layout == 'private':
             directory = ctx.work_dir / slot.node.name / name
-            fresh.append([directory / TEST_DIR])
-            mkdirs.append([])
+            mkdirs.append([directory / TEST_DIR])
         else:
             directory = ctx.work_dir / name
-            fresh.append([])
             mkdirs.append([directory])
         directories.append(directory)
     programs = [[binary, *options, *(['-u'] if layout == 'private' else []), '-d', str(directory),
                  f'--saveRankPerformanceDetails={capture}'] for directory in directories]
-    result = cluster.run_native(slots, programs, ctx.result_dir, name, mkdirs=mkdirs, fresh=fresh,
+    result = cluster.run_native(slots, programs, ctx.result_dir, name, mkdirs=mkdirs,
                                 within=ctx.target.path, capture=capture)
     if ctx.info.setdefault('mdtest_sha256', result.sha256) != result.sha256:
         raise BenchmarkError(f'{name}: the mdtest binary changed during the run')
@@ -200,14 +204,13 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         raise BenchmarkError(f"total_items {args.total_items} must divide into at least two "
                              f"items per task for {tasks} tasks")
     items = args.total_items // tasks
-    nodes = len({slot.node.name for slot in slots})
     options = ["-a", "POSIX", "-n", str(items), "-i", "1", "-F" if args.subset == "file" else "-D"]
     ctx.info.update(mdtest_version=MDTEST_VERSION, cache_state=CACHE_STATE, completion=COMPLETION)
     for repeat in range(1, args.repeats + 1):
         name = f"{args.subset}-{args.layout}-N{tasks}-rep{repeat}"
         print(f"  {name}: {items} items/task", flush=True)
         stdout, text = launch(ctx, slots, args.mdtest_bin, options, args.layout, name)
-        check_banner(stdout, tasks, nodes, name)
+        check_banner(stdout, tasks, name)
         check_workload(stdout, args.subset, tasks, args.total_items, name)
         warnings = unexpected_warnings(stdout)
         if warnings:

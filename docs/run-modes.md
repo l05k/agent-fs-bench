@@ -54,7 +54,10 @@ list the controller.
 
 Open MPI starts each machine's daemon through the controller's inventory-aware SSH
 agent (`agent_fs_bench/ssh.py`) with tree spawning disabled, so machines need no SSH
-access to each other. The inventory is never written to results.
+access to each other. No SSH credential or option is written to results, but the
+per-job Open MPI appfile under `results/<bench>/<run-id>/<target>/` holds each
+machine's Open MPI address, checkout path and Python path; remove or redact those
+files before publishing results.
 
 ## Launcher settings
 

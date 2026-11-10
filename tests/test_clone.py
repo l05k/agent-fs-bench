@@ -84,6 +84,10 @@ class WorkloadPlanTests(unittest.TestCase):
         for selection, commands, message in (
                 ({'copier': 'cp-r', 'target_copiers': {'fs': 'lakebase'}}, commands,
                  'no command configured'),
+                ({'copier': 'cp-r', 'target_copiers': {'fs': ['lakebase']}}, commands,
+                 'must be one command name'),
+                ({'copier': ['cp-r'], 'target_copiers': {}}, commands,
+                 'must be one command name'),
                 ({'copier': 'cp-r', 'target_copiers': {}},
                  {'cp-r': 'not-an-installed-command-xyz {src} {dst}'}, 'executable not found')):
             with self.subTest(message=message), self.assertRaisesRegex(BenchmarkError, message):

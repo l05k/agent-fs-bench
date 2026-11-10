@@ -111,9 +111,9 @@ all,32,,,,,,,,,,,4.9618383734e+04,1.2898445129e-03,1.1046726584e+06,5.7935714722
 '''
     BANNER = 'mdtest-4.0.0 was launched with 2 total task(s) on 1 node(s)\n'
 
-    def parse(self, csv, banner=None, nodes=1):
+    def parse(self, csv, banner=None):
         return Mdtest._parse('private', self.BANNER if banner is None else banner,
-                             csv, ('File creation',), 2, nodes)
+                             csv, ('File creation',), 2)
 
     def test_aggregate_uses_barrier_time_not_average_rank_time(self):
         _, items, times, ranks = self.parse(self.CSV)
@@ -131,12 +131,12 @@ all,32,,,,,,,,,,,4.9618383734e+04,1.2898445129e-03,1.1046726584e+06,5.7935714722
         with self.assertRaisesRegex(RuntimeError, 'no time'):
             self.parse(self.CSV.replace('1.2898445129e-03', 'nan'))
 
-    def test_banner_node_count_must_match_the_rank_hosts(self):
-        # Two ranks on two hosts must not silently accept a one-node banner.
-        multi = self.BANNER.replace('1 node(s)', '2 node(s)')
-        self.assertEqual(self.parse(self.CSV, multi, nodes=2)[1], 32)
-        with self.assertRaisesRegex(RuntimeError, r'expected 2 on 2'):
-            self.parse(self.CSV, nodes=2)
+    def test_mdtest_node_count_is_not_compared_with_the_plan(self):
+        # mdtest counts MPI shared-memory domains, so unequal per-machine task counts
+        # make its node count differ from the planned machine count. Placement is
+        # proved per task by the wrapper instead.
+        multi = self.BANNER.replace('1 node(s)', '3 node(s)')
+        self.assertEqual(self.parse(self.CSV, multi)[1], 32)
 
     def test_launcher_output_interleaved_with_the_banner_is_tolerated(self):
         banner = '[node-a:1234] ' + self.BANNER

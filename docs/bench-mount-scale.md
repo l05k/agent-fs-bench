@@ -132,14 +132,14 @@ uv run python -m agent_fs_bench run mount-scale --mode local \
    - requires the task's client aliases to exist on its own machine;
    - reports the binary's SHA-256, then execs upstream mdtest.
 
-   The controller checks that the measured affinity is exactly the requested single CPU and that every task ran the same binary. The private `test-dir.0-0` is precreated on its machine outside timing. Global rank 0 writes the native CSV on its own machine; the wrapper returns it through the launcher output, so no machine needs a shared result disk.
+   The controller checks that the measured affinity is exactly the requested single CPU and that every task ran the same binary. The private `test-dir.0-0` is created if absent on its machine before the launch, outside timing. Global rank 0 writes the native CSV on its own machine; the wrapper returns it through the launcher output, so no machine needs a shared result disk.
 7. Stop resource sampling, unmount concurrently in reverse order on each machine, verify no residue, and sample released-idle. On success, emit the whole repeat's results and delete the unmounted private data and the empty repeat directory. After all repeats succeed, collect lifecycle logs; then the first machine's worker deletes this run's shared fixture.
 
 Protocol: warm shared data, no cache drop; prereading does not guarantee later cache residency. Private reads follow this round's create with no fsync/sync, so they do not prove durable-write latency. The mdtest wrapper, loop and barriers are inside upstream phase timing; the Python wrapper, MPI startup, worker startup, fixture, warm-up and result output are outside it.
 
 `--warningAsErrors` is enabled. Any of the following fails the run, and the repeat emits no successful throughput:
 - operation errors;
-- wrong task/node counts or actual placement;
+- wrong task counts or actual placement;
 - a version or binary mismatch;
 - missing or nonfinite timings.
 
@@ -189,7 +189,7 @@ Metric cells that do not apply to a row stay empty: for example `remaining_mount
 - the mount profile SHA-256;
 - `placement`: the verified placement proof per run case (`N<tasks>-R<repeat>`) and mdtest job, with each task's index, logical machine, hostname and CPUs.
 
-`ranks` carries each task's planned machine and CPU for every phase; the wrapper's proof fails the run on any machine/CPU mismatch. SSH transport configuration and mount credentials are not written; archive inventory/profile privately. mdtest stdout/stderr, appfiles and the wrapper's placement lines remain as diagnostic attachments.
+`ranks` carries each task's planned machine and CPU for every phase; the wrapper's proof fails the run on any machine/CPU mismatch. SSH credentials and mount credentials are not written; archive inventory/profile privately. mdtest stdout/stderr, appfiles and the wrapper's placement lines remain as diagnostic attachments; the appfiles hold each machine's Open MPI address, checkout path and Python path, so remove or redact them before publishing.
 
 Default figures are rendered when their table has rows, so the directory smoke, which mounts nothing, skips `mount-dispatch`. Re-render them with `uv run python -m agent_fs_bench plot <run-dir>...`.
 

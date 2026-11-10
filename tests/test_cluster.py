@@ -1,6 +1,10 @@
 """Placement, pool and launch invariants of the cluster dispatcher; no MPI is executed."""
 
+import contextlib
+import io
+import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -184,6 +188,34 @@ class TaskDirectoryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'does not exist'):
                 self.task(target).setup()
             self.assertFalse(target.exists())
+
+
+class ExecWrapperTests(unittest.TestCase):
+    """The exec wrapper's directory handling, driven without MPI."""
+
+    def run_wrapper(self, argv):
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.dict(os.environ, {'OMPI_COMM_WORLD_RANK': '0'}), \
+                mock.patch.object(cluster.socket, 'gethostname', return_value='host'), \
+                mock.patch.object(cluster.os, 'sched_getaffinity', return_value={0}), \
+                mock.patch.object(cluster.os, 'sched_setaffinity'):
+            return cluster._exec_main(argv)
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux affinity calls are required')
+    def test_a_second_task_may_use_a_directory_the_first_task_already_filled(self):
+        # Tasks of one machine share mdtest's test directory: the first task's mdtest
+        # writes into it before the second wrapper runs.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shared, capture = root / 'test-dir.0-0', root / 'capture.txt'
+            argv = ['--index', '0', '--hostname', 'host', '--cpus', '0',
+                    '--mkdir', str(shared), '--capture', str(capture),
+                    '--', '/bin/sh', '-c', f'echo csv > {capture}']
+            self.assertEqual(self.run_wrapper(argv), 0)
+            self.assertTrue(shared.is_dir())
+            (shared / 'file').write_text('written by task 0')
+            self.assertEqual(self.run_wrapper(argv), 0)
+            self.assertEqual((shared / 'file').read_text(), 'written by task 0')
 
 
 if __name__ == '__main__':

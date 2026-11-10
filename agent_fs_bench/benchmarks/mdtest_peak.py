@@ -73,7 +73,6 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     slots = cluster.allocate(ctx.pool.nodes, args.tasks, args.cpus_per_task, args.oversubscribe)
     tasks, size, items = len(slots), args.file_size_bytes, args.items_per_task
     total = items * tasks
-    nodes = len({slot.node.name for slot in slots})
     options = ["-a", "POSIX", "-F", "-n", str(items), "-i", "1", "-w", str(size), "-e", str(size),
                "-y"]
     ctx.info.update(mdtest_version=MDTEST_VERSION, cache_state=CACHE_STATE, completion=COMPLETION)
@@ -81,7 +80,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
         name = f"S{size}-{args.layout}-N{tasks}-rep{repeat}"
         print(f"  {name}: {items} files/task of {size} B", flush=True)
         stdout, text = launch(ctx, slots, args.mdtest_bin, options, args.layout, name)
-        check_banner(stdout, tasks, nodes, name)
+        check_banner(stdout, tasks, name)
         check_workload(stdout, "file", tasks, total, name)
         warnings = unexpected_warnings(stdout)
         if warnings:

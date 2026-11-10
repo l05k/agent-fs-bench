@@ -1,27 +1,37 @@
-"""Every Python workload's `task()` runs end to end as one task and emits its tables.
+"""Every Python workload's `task()` runs end to end at N=2 and emits its tables.
 
 Network, pinned-version and Docker tools are replaced by small scripts; the
-workload's own preparation, timing and row code run unchanged. dev-workflow is not
-covered: it needs real Linux kernel commits, and its task code matches
-mini-dev-workflow's.
+workload's own preparation, timing, collective and row code run unchanged. Each
+workload runs in both placements a real run uses (two tasks on one machine, one task
+on each of two machines), because only a multi-task run can show a missing, extra or
+reordered collective. dev-workflow is not covered: it needs real Linux kernel commits,
+and its task code matches mini-dev-workflow's.
 """
 
+import argparse
 import json
 import os
 from pathlib import Path
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
 from agent_fs_bench.benchmarks import (agent_replay, clone, kvtest, mini_dev_workflow,
                                        npm_install, sqlite_speedtest, sqlite_tools)
-from fake_task import run_task
+import fake_task
+from fake_task import run_tasks
 from test_kvtest import KVTEST_RUN_STDOUT
 from test_sqlite_speedtest import SPEEDTEST_STDOUT
 
 LINUX = sys.platform.startswith('linux')
+
+LAYOUTS = {
+    'one machine': [('local', 'host-a', (0,)), ('local', 'host-a', (1,))],
+    'two machines': [('local', 'host-a', (0,)), ('node-a', 'host-b', (0,))],
+}
 
 
 def program(path: Path, body: str) -> Path:
@@ -51,40 +61,65 @@ class TaskRunTests(unittest.TestCase):
                 mock.patch.object(sqlite_tools, 'build',
                                   return_value=(self.tools / tool, provenance)))
 
+    def per_node(self, args, name: str, base: Path | None = None):
+        """Args with one `name` directory per machine, as separate machines have."""
+        base = self.tools if base is None else base
+
+        def args_for(node):
+            copy = argparse.Namespace(**vars(args))
+            setattr(copy, name, str(base / node))
+            (base / node).mkdir(exist_ok=True)
+            return copy
+        return args_for
+
     @unittest.skipUnless(LINUX and shutil.which('cp'), 'Linux and cp are required')
     def test_clone(self):
         args = clone.parse_args(['--smoke'])
         args.files, args.repeats = 8, 1
-        rows = run_task(clone, args)
-        self.assertEqual(len(rows['batches']), 1)
-        self.assertEqual([(row['sample'], row['host']) for row in rows['requests']],
-                         [('0', 'local')])
+        for label, slots in LAYOUTS.items():
+            with self.subTest(layout=label):
+                rows = run_tasks(clone, args, slots)
+                self.assertEqual(len(rows['batches']), 1)
+                self.assertEqual([(row['sample'], row['host']) for row in rows['requests']],
+                                 [(str(index), slot[0]) for index, slot in enumerate(slots)])
+                self.assertEqual({row['tasks'] for row in rows['batches']}, {'2'})
 
     def test_kvtest(self):
         args = kvtest.parse_args([])
         args.build_dir, args.repeats = str(self.tools), 1
         sources, build = self.fake_sqlite_build('kvtest', KVTEST_RUN_STDOUT)
-        with sources, build:
-            rows = run_task(kvtest, args)
-        self.assertEqual([(row['tasks'], row['sample'], row['host']) for row in rows['repeats']],
-                         [('1', '0', 'local')])
+        for label, slots in LAYOUTS.items():
+            with self.subTest(layout=label):
+                with sources, build:
+                    rows = run_tasks(kvtest, args, slots)
+                self.assertEqual([(row['tasks'], row['sample'], row['host'])
+                                  for row in rows['repeats']],
+                                 [('2', str(index), slot[0])
+                                  for index, slot in enumerate(slots)])
 
     def test_sqlite_speedtest(self):
         args = sqlite_speedtest.parse_args([])
         args.build_dir, args.repeats = str(self.tools), 1
         sources, build = self.fake_sqlite_build('speedtest1', SPEEDTEST_STDOUT)
-        with sources, build:
-            rows = run_task(sqlite_speedtest, args)
-        self.assertEqual(len(rows['totals']), 1)
-        self.assertEqual(len(rows['stages']), len(sqlite_speedtest.MAIN_STAGES))
+        for label, slots in LAYOUTS.items():
+            with self.subTest(layout=label):
+                with sources, build:
+                    rows = run_tasks(sqlite_speedtest, args, slots)
+                self.assertEqual(len(rows['totals']), len(slots))
+                self.assertEqual(len(rows['stages']),
+                                 len(slots) * len(sqlite_speedtest.MAIN_STAGES))
 
     @unittest.skipUnless(all(shutil.which(name) for name in
                              ('git', 'make', 'cc', 'bash', 'grep', 'sed', 'python3')),
                          'git, make, a C compiler and the shell tools are required')
     def test_mini_dev_workflow(self):
-        rows = run_task(mini_dev_workflow, mini_dev_workflow.parse_args([]))
-        self.assertEqual(len(rows['workflow']), 1)
-        self.assertTrue(rows['steps'])
+        args = mini_dev_workflow.parse_args([])
+        for label, slots in LAYOUTS.items():
+            with self.subTest(layout=label):
+                rows = run_tasks(mini_dev_workflow, args, slots)
+                self.assertEqual(len(rows['workflow']), len(slots))
+                self.assertEqual({row['tasks'] for row in rows['workflow']}, {'2'})
+                self.assertTrue(rows['steps'])
 
     @unittest.skipUnless(LINUX and Path('/dev/shm').is_dir(), 'Linux tmpfs /dev/shm is required')
     def test_npm_install(self):
@@ -96,10 +131,15 @@ class TaskRunTests(unittest.TestCase):
         prep = tempfile.TemporaryDirectory(dir='/dev/shm')
         self.addCleanup(prep.cleanup)
         args.prep_dir, args.repeats = prep.name, 1
+        # Each machine prepares on its own tmpfs, never on the target's filesystem.
+        node_args = self.per_node(args, 'prep_dir', Path(prep.name))
         with mock.patch.dict(os.environ, {'PATH': f'{self.tools}:{os.environ["PATH"]}'}):
-            rows = run_task(npm_install, args)
-        self.assertEqual(len(rows['batches']), 1)
-        self.assertEqual([row['host'] for row in rows['installs']], ['local'])
+            for label, slots in LAYOUTS.items():
+                with self.subTest(layout=label):
+                    rows = run_tasks(npm_install, args, slots, node_args=node_args)
+                    self.assertEqual(len(rows['batches']), 1)
+                    self.assertEqual([row['host'] for row in rows['installs']],
+                                     [slot[0] for slot in slots])
 
     @unittest.skipUnless(LINUX, 'GNU cp is required')
     def test_agent_replay(self):
@@ -132,10 +172,80 @@ class TaskRunTests(unittest.TestCase):
         args = agent_replay.parse_args([])
         args.cases_file, args.repeats = str(cases / 'cases.toml'), 1
         with mock.patch.object(agent_replay, 'REPLAY_ROOT', replay):
-            rows = run_task(agent_replay, args)
-        self.assertEqual([(row['case'], row['elapsed_s']) for row in rows['replays']],
-                         [('smoke', '1.5')])
-        self.assertEqual({row['phase'] for row in rows['phases']}, {'agent_execution', 'verifier'})
+            for label, slots in LAYOUTS.items():
+                with self.subTest(layout=label):
+                    rows = run_tasks(agent_replay, args, slots)
+                    self.assertEqual([(row['case'], row['sample'], row['elapsed_s'])
+                                      for row in rows['replays']],
+                                     [('smoke', str(index), '1.5')
+                                      for index, _slot in enumerate(slots)])
+                    self.assertEqual({row['phase'] for row in rows['phases']},
+                                     {'agent_execution', 'verifier'})
+
+
+class FakeWorldTests(unittest.TestCase):
+    """The two-task harness must fail, not hang, when collectives do not line up."""
+
+    def run_two(self, body, timeout=1.0):
+        world = fake_task.World(2, timeout)
+        errors = []
+
+        def run(index):
+            world.attach(index)
+            try:
+                body(world, index)
+            except BaseException as error:
+                errors.append(error)
+                world.abort(error)
+
+        threads = [threading.Thread(target=run, args=(index,)) for index in (0, 1)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return errors
+
+    def test_a_task_that_skips_a_collective_fails_instead_of_hanging(self):
+        def body(world, index):
+            world.Barrier()
+            if index == 0:
+                world.Barrier()
+
+        errors = self.run_two(body)
+        self.assertTrue(errors)
+        self.assertIn('timed out', str(errors[0]))
+
+    def test_different_collectives_in_the_same_slot_are_rejected(self):
+        def body(world, index):
+            if index == 0:
+                world.Barrier()
+            else:
+                world.gather('x')
+
+        errors = self.run_two(body)
+        self.assertTrue(errors)
+        self.assertIn('same collectives in the same order', str(errors[0]))
+
+    def test_gather_returns_every_value_on_the_root_only(self):
+        world = fake_task.World(2, 5.0)
+        seen = {}
+        errors = []
+
+        def run(index):
+            world.attach(index)
+            try:
+                seen[index] = world.gather(index)
+            except BaseException as error:
+                errors.append(error)
+                world.abort(error)
+
+        threads = [threading.Thread(target=run, args=(index,)) for index in (0, 1)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(seen, {0: [0, 1], 1: None})
 
 
 if __name__ == '__main__':

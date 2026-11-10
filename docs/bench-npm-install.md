@@ -62,10 +62,11 @@ the runtime. `CONFIG` is experiment setup — changing it changes the measured p
 preparation semantics — so keep it fixed across compared filesystems. Preparation is always
 external and local, with no same-filesystem mode and no automatic fallback.
 
-`tasks` must fit the pool: `tasks × cpus_per_task` may not exceed the CPUs of the machines the mode
-offers, times `oversubscribe`; a request above capacity is an error, never a smaller run. A
-`repeats = 1`, `tasks = 1` run in `--mode local` is a minimal real smoke; it still needs registry
-access during seeding and a valid preparation filesystem.
+`tasks` must fit the pool: capacity is summed per machine, `floor(CPUs / cpus_per_task) ×
+oversubscribe`, over the machines the mode offers; a request above capacity is an error,
+never a smaller run. Two 6-CPU machines at `cpus_per_task = 4` hold two tasks, not three.
+A `repeats = 1`, `tasks = 1` run in `--mode local` is a minimal real smoke; it still needs
+registry access during seeding and a valid preparation filesystem.
 
 ## Layout and results
 

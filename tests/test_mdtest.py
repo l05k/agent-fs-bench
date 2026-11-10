@@ -100,23 +100,23 @@ class BannerTests(unittest.TestCase):
                 f"on {nodes} node(s)\n")
 
     def test_matching_launch_is_accepted(self):
-        check_banner(self.banner(), 4, 1, self.label)
-        check_banner(self.banner(nodes=2), 4, 2, self.label)
+        check_banner(self.banner(), 4, self.label)
 
     def test_singleton_launch_is_rejected(self):
-        with self.assertRaisesRegex(BenchmarkError, 'expected 4 task'):
-            check_banner(self.banner(tasks=1), 4, 1, self.label)
+        with self.assertRaisesRegex(BenchmarkError, 'expected 4'):
+            check_banner(self.banner(tasks=1), 4, self.label)
 
-    def test_machine_count_must_match_the_placement(self):
-        # Tasks spread over two machines must not accept a one-node banner, and vice versa.
-        for reported, planned in ((2, 1), (1, 2)):
-            with self.subTest(reported=reported, planned=planned), \
-                    self.assertRaisesRegex(BenchmarkError, f'on {planned} node'):
-                check_banner(self.banner(nodes=reported), 4, planned, self.label)
+    def test_mdtest_node_count_is_not_compared(self):
+        # mdtest counts MPI shared-memory domains: unequal per-machine task counts make
+        # the banner's node count differ from the planned machine count. Placement is
+        # proved per task by the wrapper instead.
+        for nodes in (1, 2, 3):
+            with self.subTest(nodes=nodes):
+                check_banner(self.banner(tasks=12, nodes=nodes), 12, self.label)
 
     def test_unpinned_version_is_rejected(self):
         with self.assertRaisesRegex(BenchmarkError, 'reported version 3.5.0'):
-            check_banner(self.banner(version='3.5.0'), 4, 1, self.label)
+            check_banner(self.banner(version='3.5.0'), 4, self.label)
 
 class WorkloadTests(unittest.TestCase):
     label = 'file-private-N4-rep1'

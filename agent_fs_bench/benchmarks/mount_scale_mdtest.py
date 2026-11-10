@@ -10,9 +10,10 @@ this module never resolves or stats a remote path on the controller.
 mdtest runs unchanged upstream 4.0.0: one global ``MPI_COMM_WORLD``, exactly one ``-d``
 path per task (mdtest rejects several paths with ``-S`` and without ``-u``), its own phase
 barriers, and its own rank CSV. Every task accesses the same task-independent
-``mdtest.shared.<n>`` names through its own client alias. Private phases precreate each
-task's ``test-dir.0-0`` on the machine that owns the workspace, because mdtest creates it
-only for ranks below ``path_count``; each task then creates ``mdtest_tree.<rank>.0``.
+``mdtest.shared.<n>`` names through its own client alias. Private phases create each
+task's ``test-dir.0-0`` if absent on the machine that owns the workspace, because mdtest
+creates it only for ranks below ``path_count``; each task then creates
+``mdtest_tree.<rank>.0``.
 
 Timing comes only from mdtest's rank CSV: the ``all`` row is the aggregate (maximum task
 time including the phase-end barrier), each ``<rank>`` row is that task's time before the
@@ -175,33 +176,29 @@ class Mdtest:
         result = cluster.run_native(
             slots, programs, log_dir, label,
             exists=[[rank.workspace, *rank.shared] for rank in ranks],
-            fresh=[[rank.workspace / _TEST_DIR] if private else [] for rank in ranks],
+            mkdirs=[[rank.workspace / _TEST_DIR] if private else [] for rank in ranks],
             capture=capture, timeout_s=self._timeout_s,
         )
         if self._sha256 is None:
             self._sha256 = result.sha256
         elif result.sha256 != self._sha256:
             raise RuntimeError(f'mdtest run {label} used a different mdtest binary')
-        nodes = len({slot.node.name for slot in slots})
         self._version, items, times, per_rank = self._parse(
-            label, result.stdout, result.capture, phases, len(ranks), nodes)
+            label, result.stdout, result.capture, phases, len(ranks))
         return items, times, per_rank, result.placement
 
     @staticmethod
     def _parse(label: str, stdout: str, text: str, phases: Sequence[str],
-               tasks: int, nodes: int = 1
-               ) -> tuple[str, int, dict[str, float], dict[str, list[float]]]:
+               tasks: int) -> tuple[str, int, dict[str, float], dict[str, list[float]]]:
         match = _BANNER.search(stdout)
         if match is None:
             raise RuntimeError(f'mdtest run {label} did not print its version banner')
-        version, launched, reported = (match.group(1), int(match.group(2)),
-                                       int(match.group(3)))
+        version, launched = match.group(1), int(match.group(2))
         if version != _VERSION:
             raise RuntimeError(f'mdtest run {label} used mdtest-{version}, need {_VERSION}')
-        if launched != tasks or reported != nodes:
+        if launched != tasks:
             raise RuntimeError(
-                f'mdtest run {label} launched {launched} task(s) on {reported} node(s), '
-                f'expected {tasks} on {nodes}'
+                f'mdtest run {label} launched {launched} task(s), expected {tasks}'
             )
         rows = [row for row in csv.reader(io.StringIO(text)) if row]
         if (len(rows) < 2 or rows[0] != _HEADER or rows[1][0] != 'all'

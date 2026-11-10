@@ -139,7 +139,7 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     profile = None if profile_text is None else parse_profile(profile_text, ctx.target.name,
                                                               str(args.profiles))
     if profile is not None:
-        admin = profile.admin_root
+        admin = profile.admin_root.resolve()
         if (ctx.target.path.resolve().is_relative_to(admin)
                 or ctx.result_dir.resolve().is_relative_to(admin)):
             raise ValueError('staging and results must be outside admin_root')

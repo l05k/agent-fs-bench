@@ -379,27 +379,25 @@ def run_tasks(ctx, args, *, label: str = 'tasks') -> None:
 
 def run_native(slots: Sequence[Slot], programs: Sequence[Sequence[str]], log_dir: Path,
                label: str, *, exists: Sequence[Sequence[Path]] | None = None,
-               mkdirs: Sequence[Sequence[Path]] | None = None,
-               fresh: Sequence[Sequence[Path]] | None = None, within: Path | None = None,
+               mkdirs: Sequence[Sequence[Path]] | None = None, within: Path | None = None,
                capture: Path | None = None, timeout_s: float | None = None) -> NativeRun:
     """Run one MPI program per task (e.g. mdtest) under the placement wrapper.
 
     On its own node, task i first requires the directories `exists[i]`, then creates
-    `mkdirs[i]` (parents allowed) and `fresh[i]` (must be absent or empty), which must
-    resolve inside the existing directory `within` (the measured target). `capture` is a
-    file the program writes on task 0's node; the wrapper returns its text through stdout,
-    so no node needs a shared result directory.
+    `mkdirs[i]` (parents allowed, create-if-absent) inside the existing directory
+    `within` (the measured target). Tasks of one node may create the same directory
+    concurrently, so this never requires it to be empty. `capture` is a file the program
+    writes on task 0's node; the wrapper returns its text through stdout, so no node
+    needs a shared result directory.
     """
     count = len(slots)
     exists = exists or [()] * count
     mkdirs = mkdirs or [()] * count
-    fresh = fresh or [()] * count
     wrapped = []
     for index, (slot, program) in enumerate(zip(slots, programs, strict=True)):
         argv = _wrapper(slot, index, 'exec')
         argv += [token for path in exists[index] for token in ('--exists', str(path))]
         argv += [token for path in mkdirs[index] for token in ('--mkdir', str(path))]
-        argv += [token for path in fresh[index] for token in ('--fresh', str(path))]
         if within is not None:
             argv += ['--within', str(within)]
         if index == 0 and capture is not None:
@@ -635,7 +633,6 @@ def _exec_main(argv: list[str]) -> int:
     parser = _wrapper_parser('exec')
     parser.add_argument('--exists', action='append', default=[], type=Path)
     parser.add_argument('--mkdir', action='append', default=[], type=Path)
-    parser.add_argument('--fresh', action='append', default=[], type=Path)
     parser.add_argument('--within', type=Path)
     parser.add_argument('--capture', type=Path)
     options = parser.parse_args(argv[:split])
@@ -644,7 +641,7 @@ def _exec_main(argv: list[str]) -> int:
         raise ValueError('exec needs a program after "--"')
     os.environ.update(dict(options.env))
     proof = _pin(options.index, options.hostname, options.cpus)
-    for path in [*options.exists, *options.mkdir, *options.fresh]:
+    for path in [*options.exists, *options.mkdir]:
         if not path.is_absolute():
             raise ValueError(f'task directories must be absolute: {path}')
     for path in options.exists:
@@ -655,14 +652,11 @@ def _exec_main(argv: list[str]) -> int:
         if not root.is_dir():
             raise RuntimeError(f'target directory does not exist on {socket.gethostname()}: '
                                f'{root}; mount it first')
-        for path in [*options.mkdir, *options.fresh]:
+        for path in options.mkdir:
             if not path.resolve().is_relative_to(root.resolve()):
                 raise RuntimeError(f'{path} escapes target {root} through a symlink')
+    # Create-if-absent: sibling tasks of one machine may create the same directory.
     for path in options.mkdir:
-        path.mkdir(parents=True, exist_ok=True)
-    for path in options.fresh:
-        if path.exists() and (not path.is_dir() or any(path.iterdir())):
-            raise RuntimeError(f'directory must be absent or empty: {path}')
         path.mkdir(parents=True, exist_ok=True)
     found = shutil.which(command[0])
     if found is None:

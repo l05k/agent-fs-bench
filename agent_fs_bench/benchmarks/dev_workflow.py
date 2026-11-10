@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -78,9 +79,11 @@ def resolve_linux_url(value: str) -> str:
     """Resolve a local Linux mirror on this machine; URLs pass through.
 
     Relative mirror paths are resolved against this machine's checkout, so a
-    controller path never reaches a task on another machine.
+    controller path never reaches a task on another machine. Anything with a
+    colon before its first slash is a URL: ``https://`` and scp-like
+    ``host:linux.git`` or ``user@host:linux.git``, as Git itself decides.
     """
-    if "://" in value or value.startswith("git@"):
+    if re.match(r"^[^/]+:", value):
         return value
     path = Path(value).expanduser()
     return str(path if path.is_absolute() else PROJECT_ROOT / path)

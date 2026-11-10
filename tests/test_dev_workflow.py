@@ -63,14 +63,25 @@ class FixtureResolutionTests(unittest.TestCase):
         self.assertEqual(dev_workflow.resolve_fixture_dir(str(path)), path)
 
     def test_linux_url_passes_through(self):
-        url = 'https://github.com/torvalds/linux.git'
-        self.assertEqual(dev_workflow.resolve_linux_url(url), url)
-        self.assertEqual(dev_workflow.resolve_linux_url('git@example.invalid:linux.git'),
-                         'git@example.invalid:linux.git')
+        for url in ('https://github.com/torvalds/linux.git',
+                    'ssh://example.invalid/linux.git',
+                    'git@example.invalid:linux.git',
+                    'example.invalid:linux.git',
+                    # Git reads a colon before the first slash as scp-like syntax, so a
+                    # local mirror with a colon in its name needs an explicit "./".
+                    'mirror:linux.git'):
+            with self.subTest(url=url):
+                self.assertEqual(dev_workflow.resolve_linux_url(url), url)
+
+    def test_explicitly_local_path_with_a_colon_resolves(self):
+        self.assertEqual(dev_workflow.resolve_linux_url('./mirror:linux.git'),
+                         str(PROJECT_ROOT / 'mirror:linux.git'))
 
     def test_relative_linux_mirror_resolves_in_checkout(self):
-        self.assertEqual(dev_workflow.resolve_linux_url('data'),
-                         str(PROJECT_ROOT / 'data'))
+        for name in ('data', 'mirror/linux.git'):
+            with self.subTest(name=name):
+                self.assertEqual(dev_workflow.resolve_linux_url(name),
+                                 str(PROJECT_ROOT / name))
 
     def test_absolute_linux_mirror_is_taken_as_given(self):
         self.assertEqual(dev_workflow.resolve_linux_url('/var/tmp/linux.git'),

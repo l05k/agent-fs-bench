@@ -194,6 +194,8 @@ def warm_source(source: Path, expected_bytes: int) -> None:
 def resolve_copier(args: argparse.Namespace, target_name: str) -> Copier:
     """The one copier this target uses, as an executable argv template."""
     name = args.target_copiers.get(target_name, args.copier)
+    if not isinstance(name, str):
+        raise BenchmarkError(f"copier for {target_name} must be one command name: {name!r}")
     if name not in args.commands:
         raise BenchmarkError(f"no command configured for copier {name!r}")
     argv = shlex.split(args.commands[name])
