@@ -1,8 +1,11 @@
-"""Replay the pinned Linux workflow in a runner-owned checkout.
+"""Replay the pinned Linux workflow in per-task runner-owned checkouts.
 
-Configuration, builds, command loading/replay, commits and tree assertions are
-measured. Preparation and reset/clean cleanup are separate. No checkpoints or
-backend snapshots run; shell pipelines omit pipefail.
+Every task clones Linux into its own directory on its own machine, then all
+tasks run the same configuration/build/command/commit workflow between
+barriers. Configuration, builds, command loading/replay, commits and tree
+assertions are measured. Cloning, checkout validation and reset/clean cleanup
+are separate. No checkpoints or backend snapshots run; shell pipelines omit
+pipefail.
 """
 
 from __future__ import annotations
@@ -11,30 +14,34 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
 import subprocess
-import sys
 import time
-import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
+from agent_fs_bench import cluster
 from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
 from .build_settings import read_compiler_version
 
-DEFAULT_FIXTURE_DIR = PROJECT_ROOT / "data" / "dev-workflow"
+# Relative to each machine's checkout: no controller path may reach a task.
+DEFAULT_FIXTURE_DIR = Path("data") / "dev-workflow"
 DEFAULT_SERIES = "overlayfs-ovl-file.json"
 DEFAULT_CONFIG = "tinyconfig-overlayfs.config"
 DEFAULT_LINUX_URL = "https://github.com/torvalds/linux.git"
 
-# Fixed build parallelism: an unpinned value makes runs incomparable across
-# machines. Change CONFIG["jobs"] only for a deliberate experiment.
+# One task's `make -j` uses exactly the CPUs it is pinned to. An unpinned value
+# makes runs incomparable across machines; change both CONFIG keys together
+# for a deliberate experiment.
 DEFAULT_JOBS = 8
+
+WORKFLOW_METRICS = ("elapsed_ms", "preparation_ms", "cleanup_ms", "unattributed_ms")
 
 # ---------------------------------------------------------------------------
 # Experiment configuration. These constants replace the former workload CLI
@@ -43,15 +50,54 @@ DEFAULT_JOBS = 8
 CONFIG = {
     "fixture_dir": str(DEFAULT_FIXTURE_DIR),
     "require_fstype": None,
+    "tasks": 1,
+    # Must equal "jobs": one pinned CPU per make job.
+    "cpus_per_task": DEFAULT_JOBS,
     "jobs": DEFAULT_JOBS,
+    "oversubscribe": 1,
     "verbose": False,
     "linux_url": DEFAULT_LINUX_URL,
 }
 
 FIGURES = [
     Figure("steps", "kind", "ms", kind="box", xlabel="Step kind",
-           ylabel="Duration (s)", yscale=1000, name="step-duration"),
+           ylabel="Duration (s)", yscale=1000, split=("tasks",), name="step-duration-tasks"),
+    Figure("workflow", "tasks", "elapsed_ms", kind="box", xlabel="Tasks",
+           ylabel="Workflow (s)", yscale=1000, name="workflow-duration"),
 ]
+
+def resolve_fixture_dir(value: str) -> Path:
+    """Resolve the fixture directory in this machine's checkout.
+
+    A relative name (the default) is resolved against this machine's project
+    root; an absolute path must exist on every machine.
+    """
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+def resolve_linux_url(value: str) -> str:
+    """Resolve a local Linux mirror on this machine; URLs pass through.
+
+    Relative mirror paths are resolved against this machine's checkout, so a
+    controller path never reaches a task on another machine. Anything with a
+    colon before its first slash is a URL: ``https://`` and scp-like
+    ``host:linux.git`` or ``user@host:linux.git``, as Git itself decides.
+    """
+    if re.match(r"^[^/]+:", value):
+        return value
+    path = Path(value).expanduser()
+    return str(path if path.is_absolute() else PROJECT_ROOT / path)
+
+def check_build_parallelism(jobs: int, cpus_per_task: int) -> int:
+    """Require one make job per pinned CPU; return the build parallelism."""
+    if type(jobs) is not int or jobs < 1:
+        raise ValueError(f"jobs must be a positive integer: {jobs!r}")
+    if cpus_per_task != jobs:
+        raise ValueError(
+            f"cpus_per_task ({cpus_per_task}) must equal jobs ({jobs}): "
+            "one make job per pinned CPU"
+        )
+    return jobs
 
 CORE_COMMANDS = ("git", "bash", "make", "patch", "grep", "sed", "python3")
 KERNEL_COMMANDS = ("bc", "bison", "flex", "perl", "openssl")
@@ -296,11 +342,6 @@ def tool_versions(work_dir: Path) -> dict[str, str]:
     }
 
 
-def require_linux() -> None:
-    if not sys.platform.startswith("linux"):
-        raise WorkflowError(f"kernel workflow requires Linux, not {sys.platform}")
-
-
 def validate_fixtures(fixture_dir: Path) -> dict[str, Any]:
     """Fail fast on missing fixtures before the expensive Linux preparation."""
     if not fixture_dir.is_dir():
@@ -339,6 +380,15 @@ def validate_fixtures(fixture_dir: Path) -> dict[str, Any]:
             f"{fixture_dir}: {', '.join(sorted(set(missing)))}"
         )
     return series
+
+
+def fixture_names(series: dict[str, Any]) -> set[str]:
+    """Fixture files whose hashes identify the pinned series."""
+    names = {DEFAULT_SERIES, DEFAULT_CONFIG}
+    for commit in series["commits"]:
+        names.update(commit[key] for key in
+                     ("search_commands", "read_commands", "edit_commands"))
+    return names
 
 
 def missing_dependencies(*, require_fstype: bool = False) -> list[str]:
@@ -398,13 +448,17 @@ def prepare_linux_checkout(
     base_commit: str,
     commit_ids: list[str],
     verbose: bool,
-) -> str:
+) -> None:
+    """Clone the source into this task's directory and check out the base.
+
+    ``linux_url`` is already resolved on this machine: a Git URL or a local
+    mirror path. ``--no-local`` keeps the clone from sharing source objects, so
+    every object is written to the measured filesystem.
+    """
     if repo.exists():
         raise WorkflowError(f"runner checkout must be fresh: {repo}")
-    source = Path(linux_url).expanduser()
-    clone_source = str(source.resolve()) if source.exists() else linux_url
     run_command(
-        ["git", "clone", "--no-local", clone_source, str(repo)],
+        ["git", "clone", "--no-local", linux_url, str(repo)],
         cwd=repo.parent,
         what="cloning Linux checkout",
         verbose=verbose,
@@ -642,25 +696,21 @@ def verify_tree(repo: Path, commit_id: str) -> dict[str, Any]:
 
 
 
-def run_workflow(
-    ctx: RunContext,
+def prepare_checkout(
+    repo: Path,
+    *,
+    linux_url: str,
     args: argparse.Namespace,
     series: dict[str, Any],
-) -> dict[str, Any]:
-    repo = ctx.work_dir / "repo"
-    fixture_dir = Path(args.fixture_dir).expanduser().absolute()
-    series_path = fixture_dir / DEFAULT_SERIES
-    config_path = fixture_dir / DEFAULT_CONFIG
-
+) -> tuple[str, int]:
+    """Create and validate this task's checkout; never timed."""
+    start = time.perf_counter_ns()
     base_commit_expression = series["base_commit"]
-    commits = series["commits"]
-    commit_ids = [commit["id"] for commit in commits]
-
+    commit_ids = [commit["id"] for commit in series["commits"]]
     require_filesystem(repo, args.require_fstype, "Linux checkout")
-    preparation_start = time.perf_counter_ns()
     prepare_linux_checkout(
         repo,
-        linux_url=args.linux_url,
+        linux_url=linux_url,
         base_commit=base_commit_expression,
         commit_ids=commit_ids,
         verbose=args.verbose,
@@ -677,35 +727,30 @@ def run_workflow(
             f"fixture base commit {base_commit_expression} cannot be resolved "
             f"in {repo}"
         )
+    begin_checkout_run(repo, base_commit=base_commit)
+    return base_commit, elapsed_ms(start)
 
+
+def run_workflow(
+    repo: Path,
+    *,
+    args: argparse.Namespace,
+    fixture_dir: Path,
+    series: dict[str, Any],
+    base_commit: str,
+    preparation_ms: int,
+) -> dict[str, Any]:
+    """Run the timed workflow in `repo`; raise on any failure."""
+    series_path = fixture_dir / DEFAULT_SERIES
+    config_path = fixture_dir / DEFAULT_CONFIG
+    commits = series["commits"]
     # Pinned by CONFIG so timings stay comparable across machines.
     jobs = args.jobs
 
     steps: list[dict[str, Any]] = []
     tree_assertions: list[dict[str, Any]] = []
-    cleanup_error: str | None = None
-    cleanup_ms: int | None = None
-    preparation_ms: int | None = None
-    workflow_ms: int | None = None
-    success = False
-    error: str | None = None
-    timed_start: int | None = None
-    checkout_ready = False
-    compiler_version: str | None = None
-
+    timed_start = time.perf_counter_ns()
     try:
-        begin_checkout_run(
-            repo,
-            base_commit=base_commit,
-        )
-        checkout_ready = True
-        preparation_ms = elapsed_ms(preparation_start)
-        print(
-            f"Linux preparation complete ({preparation_ms} ms).",
-            file=sys.stderr,
-        )
-        timed_start = time.perf_counter_ns()
-
         config_start = time.perf_counter_ns()
         run_command(
             ["make", "tinyconfig", f"-j{jobs}"],
@@ -844,56 +889,16 @@ def run_workflow(
                 "ms": elapsed_ms(verify_start),
             })
 
-        success = True
-    except WorkflowError as exc:
-        error = str(exc)
-    except KeyboardInterrupt:
-        error = "interrupted"
-    except Exception as exc:
-        error = f"unexpected error: {exc}"
-        if args.verbose:
-            traceback.print_exc()
+        workflow_ms = elapsed_ms(timed_start)
+        compiler_version = read_compiler_version(repo)
     finally:
-        if preparation_ms is None:
-            preparation_ms = elapsed_ms(preparation_start)
-        timed_end = time.perf_counter_ns()
-        if timed_start is not None:
-            workflow_ms = (timed_end - timed_start) // 1_000_000
-        else:
-            workflow_ms = 0
-        if success:
-            try:
-                compiler_version = read_compiler_version(repo)
-            except (OSError, RuntimeError) as exc:
-                success = False
-                error = str(exc)
         cleanup_start = time.perf_counter_ns()
-        if checkout_ready:
-            try:
-                cleanup_checkout(
-                    repo,
-                    base_commit=base_commit,
-                    verbose=args.verbose,
-                )
-            except WorkflowError as exc:
-                cleanup_error = str(exc)
+        cleanup_checkout(repo, base_commit=base_commit, verbose=args.verbose)
         cleanup_ms = elapsed_ms(cleanup_start)
 
-    if cleanup_error:
-        success = False
-        error = (
-            f"{error}; {cleanup_error}"
-            if error
-            else cleanup_error
-        )
-
-    unattributed_ms = max(0, (workflow_ms or 0) - sum(
-        step["ms"] for step in steps
-    ))
+    unattributed_ms = max(0, workflow_ms - sum(step["ms"] for step in steps))
 
     return {
-        "success": success,
-        "error": error,
         "base_commit": base_commit,
         "compiler_version": compiler_version,
         "elapsed_ms": workflow_ms,
@@ -908,41 +913,74 @@ def run_workflow(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run dev-workflow directly in one disposable Linux checkout on the "
-            "filesystem under test."
+            "Replay the kernel workflow in one disposable Linux checkout per "
+            "task on the filesystem under test."
         )
     )
     parser.parse_args(argv)
-    return argparse.Namespace(**CONFIG)
+    args = argparse.Namespace(**CONFIG)
+    check_build_parallelism(args.jobs, args.cpus_per_task)
+    return args
 
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
-    require_linux()
-    ensure_dependencies(require_fstype=bool(args.require_fstype))
-    fixture_dir = Path(args.fixture_dir).expanduser().absolute()
+    cluster.run_tasks(ctx, args)
+
+
+def task(t: cluster.Task) -> None:
+    """Clone, prepare and run one kernel workflow instance on this machine."""
+    args = t.args
+    fixture_dir = resolve_fixture_dir(args.fixture_dir)
     series = validate_fixtures(fixture_dir)
-    names = {DEFAULT_SERIES, DEFAULT_CONFIG}
-    for commit in series["commits"]:
-        names.update(commit[key] for key in ("search_commands", "read_commands", "edit_commands"))
-    ctx.info.update({
+    if t.leader:
+        ensure_dependencies(require_fstype=bool(args.require_fstype))
+        versions = tool_versions(PROJECT_ROOT)
+    else:
+        versions = None
+    t.node_barrier()
+
+    repo = t.task_dir / "repo"
+    base_commit, preparation_ms = prepare_checkout(
+        repo,
+        linux_url=resolve_linux_url(args.linux_url),
+        args=args,
+        series=series,
+    )
+    t.log(f"task {t.index} on {t.node}: checkout ready in {preparation_ms} ms")
+
+    t.barrier()
+    summary = run_workflow(
+        repo,
+        args=args,
+        fixture_dir=fixture_dir,
+        series=series,
+        base_commit=base_commit,
+        preparation_ms=preparation_ms,
+    )
+
+    results = t.gather((t.node, summary))
+    if t.leader:
+        t.node_info({
+            "fixture_sha256": fixture_hashes(fixture_dir, fixture_names(series)),
+            "tool_versions": {**(versions or {}), "compiler": summary["compiler_version"]},
+        })
+    else:
+        t.node_info(None)
+    if t.index != 0:
+        return
+    first = results[0][1]
+    t.info({
         "jobs": args.jobs,
-        "fixture_sha256": fixture_hashes(fixture_dir, names),
-        "tool_versions": tool_versions(ctx.work_dir),
+        "cpus_per_task": args.cpus_per_task,
+        "base_commit": first["base_commit"],
+        "tree_assertions": first["tree_assertions"],
     })
-    result = run_workflow(ctx, args, series)
-    ctx.info["base_commit"] = result.pop("base_commit")
-    ctx.info["tree_assertions"] = result.pop("tree_assertions")
-    compiler = result.pop("compiler_version")
-    if compiler is not None:
-        ctx.info["tool_versions"]["compiler"] = compiler
-    if not result.pop("success"):
-        raise WorkflowError(result["error"] or "workflow failed")
-    result.pop("error")
-    ctx.emit("workflow", {}, {key: result.pop(key) for key in (
-        "elapsed_ms", "preparation_ms", "cleanup_ms", "unattributed_ms"
-    )})
-    for step, entry in enumerate(result.pop("steps"), 1):
-        ctx.emit("steps", {
-            "step": step, "name": entry["name"],
-            "kind": entry["kind"], "commit": entry["commit"],
-        }, {"ms": entry["ms"]})
+    for sample, (host, result) in enumerate(results):
+        t.emit("workflow", {"tasks": t.count, "sample": sample, "host": host},
+               {key: result[key] for key in WORKFLOW_METRICS})
+        for step, entry in enumerate(result["steps"], 1):
+            t.emit("steps", {
+                "tasks": t.count, "sample": sample, "host": host,
+                "step": step, "name": entry["name"],
+                "kind": entry["kind"], "commit": entry["commit"],
+            }, {"ms": entry["ms"]})

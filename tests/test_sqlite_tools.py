@@ -7,6 +7,22 @@ from unittest import mock
 import zipfile
 
 from agent_fs_bench.benchmarks import sqlite_tools
+from agent_fs_bench.results import PROJECT_ROOT
+
+class BuildDirectoryTests(unittest.TestCase):
+    def test_default_is_this_checkout(self):
+        self.assertEqual(
+            sqlite_tools.build_directory(None, "kvtest"),
+            PROJECT_ROOT / "build" / "kvtest",
+        )
+
+    def test_explicit_path_is_expanded_and_resolved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(
+                sqlite_tools.build_directory(root / "cache", "sqlite-speedtest"),
+                (root / "cache").resolve(),
+            )
 
 
 class DownloadIntegrityTests(unittest.TestCase):

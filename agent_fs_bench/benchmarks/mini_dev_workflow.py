@@ -1,26 +1,27 @@
-"""Replay the tiny C fixture in a real disposable Git worktree.
+"""Replay the tiny C fixture in a real disposable Git worktree per task.
 
-The source repository is cloned from the committed bundle beside the worktree
-on the target filesystem. Worktree prune/add and the full command/build/commit
-sequence are timed; source setup and worktree removal are separate. No checkpoints
-run. As upstream, commit trees are not compared.
+Every task clones the committed bundle into its own source repository beside
+its own worktree, then all tasks run the worktree/build/commit sequence between
+barriers. Worktree prune/add and the full command/build/commit sequence are
+timed; source setup, validation and worktree removal are separate. No
+checkpoints run. As upstream, commit trees are not compared.
 """
 
 from __future__ import annotations
 
 import argparse
 import shutil
-import sys
 import time
-import traceback
 from pathlib import Path
 from typing import Any
 
+from agent_fs_bench import cluster
 from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
 from .build_settings import read_compiler_version
 from .dev_workflow import (
     WorkflowError,
+    check_build_parallelism,
     elapsed_ms,
     fixture_hashes,
     git_text,
@@ -28,13 +29,15 @@ from .dev_workflow import (
     load_commands,
     load_json,
     require_filesystem,
+    resolve_fixture_dir,
     run_command,
     run_git,
     run_shell,
     tool_versions,
 )
 
-DEFAULT_FIXTURE_DIR = PROJECT_ROOT / "data" / "mini-dev-workflow"
+# Relative to each machine's checkout: no controller path may reach a task.
+DEFAULT_FIXTURE_DIR = Path("data") / "mini-dev-workflow"
 DEFAULT_SERIES = "series.json"
 DEFAULT_BUNDLE = "source-repo.bundle"
 
@@ -43,8 +46,12 @@ DEFAULT_BUNDLE = "source-repo.bundle"
 SOURCE_REPO_SUFFIX = "-source"
 
 # Keep this harness's configured parallelism; upstream invokes plain make.
-# Change CONFIG["jobs"] only for a deliberate experiment; it is capped below.
+# Both "jobs" and "cpus_per_task" are capped here for a deliberate experiment.
 FIXED_JOBS = 2
+
+WORKFLOW_METRICS = (
+    "elapsed_ms", "preparation_ms", "cleanup_ms", "unattributed_ms", "source_setup_ms",
+)
 
 # ---------------------------------------------------------------------------
 # Experiment configuration. These constants replace the former workload CLI
@@ -53,24 +60,22 @@ FIXED_JOBS = 2
 CONFIG = {
     "fixture_dir": str(DEFAULT_FIXTURE_DIR),
     "require_fstype": None,
+    "tasks": 1,
+    # Must equal "jobs": one pinned CPU per make job.
+    "cpus_per_task": FIXED_JOBS,
     "jobs": FIXED_JOBS,
+    "oversubscribe": 1,
     "verbose": False,
 }
 
 FIGURES = [
     Figure("steps", "kind", "ms", kind="box", xlabel="Step kind",
-           ylabel="Duration (s)", yscale=1000, name="step-duration"),
+           ylabel="Duration (s)", yscale=1000, split=("tasks",), name="step-duration-tasks"),
+    Figure("workflow", "tasks", "elapsed_ms", kind="box", xlabel="Tasks",
+           ylabel="Workflow (s)", yscale=1000, name="workflow-duration"),
 ]
 
 CORE_COMMANDS = ("git", "bash", "make", "grep", "sed", "python3")
-
-def require_linux() -> None:
-    if sys.platform.startswith("linux"):
-        return
-    raise WorkflowError(
-        f"the mini-dev-workflow measures Linux filesystems and only runs on "
-        f"Linux (current platform: {sys.platform})"
-    )
 
 def validate_fixtures(fixture_dir: Path) -> dict[str, Any]:
     """Fail fast on missing fixtures before the worktree is created."""
@@ -112,6 +117,14 @@ def validate_fixtures(fixture_dir: Path) -> dict[str, Any]:
             f"{fixture_dir}: {', '.join(sorted(set(missing)))}"
         )
     return series
+
+def fixture_names(series: dict[str, Any]) -> set[str]:
+    """Fixture files whose hashes identify the pinned series and bundle."""
+    names = {DEFAULT_SERIES, DEFAULT_BUNDLE}
+    for commit in series["commits"]:
+        names.update(commit[key] for key in
+                     ("search_commands", "read_commands", "edit_commands"))
+    return names
 
 def missing_dependencies(*, require_fstype: bool = False) -> list[str]:
     missing = [name for name in CORE_COMMANDS if shutil.which(name) is None]
@@ -216,51 +229,54 @@ def remove_worktree(
     if errors:
         raise WorkflowError("worktree cleanup failed: " + "; ".join(errors))
 
-def resolve_jobs(args: argparse.Namespace) -> int:
+def resolve_jobs(jobs: int) -> int:
     """Cap build parallelism so runs stay comparable."""
-    return min(args.jobs, FIXED_JOBS)
+    return min(jobs, FIXED_JOBS)
 
-def run_workflow(
-    ctx: RunContext,
+def prepare_worktree(
+    task_dir: Path,
+    *,
+    fixture_dir: Path,
     args: argparse.Namespace,
     series: dict[str, Any],
-) -> dict[str, Any]:
-    worktree = ctx.work_dir / "repo"
-    fixture_dir = Path(args.fixture_dir).expanduser().absolute()
+) -> tuple[Path, Path, int, int]:
+    """Create and validate this task's source repository; never timed."""
+    worktree = task_dir / "repo"
     source_repo = default_source_repo(worktree)
-
-    base_commit = series["base_commit"]
-    commits = series["commits"]
-    commit_ids = [commit["id"] for commit in commits]
-
+    require_filesystem(source_repo, args.require_fstype, "source repository")
     source_setup_ms = prepare_source_repo(
         source_repo, fixture_dir, verbose=args.verbose
     )
     source_repo = resolve_source_repo(source_repo, verbose=args.verbose)
-    require_filesystem(source_repo, args.require_fstype, "source repository")
 
     preparation_start = time.perf_counter_ns()
-    validate_source_repository(source_repo, base_commit=base_commit, commit_ids=commit_ids)
+    validate_source_repository(
+        source_repo,
+        base_commit=series["base_commit"],
+        commit_ids=[commit["id"] for commit in series["commits"]],
+    )
+    if worktree.exists():
+        raise WorkflowError(f"runner worktree must be fresh: {worktree}")
+    return worktree, source_repo, source_setup_ms, elapsed_ms(preparation_start)
 
-    jobs = resolve_jobs(args)
+def run_workflow(
+    worktree: Path,
+    source_repo: Path,
+    *,
+    args: argparse.Namespace,
+    fixture_dir: Path,
+    series: dict[str, Any],
+    preparation_ms: int,
+    source_setup_ms: int,
+) -> dict[str, Any]:
+    """Run the timed workflow in `worktree`, then remove it; raise on failure."""
+    base_commit = series["base_commit"]
+    commits = series["commits"]
+    jobs = args.jobs
+
     steps: list[dict[str, Any]] = []
-    cleanup_error: str | None = None
-    cleanup_ms: int | None = None
-    preparation_ms: int | None = None
-    workflow_ms: int | None = None
-    success = False
-    error: str | None = None
-    timed_start: int | None = None
-    worktree_ready = False
-    compiler_version: str | None = None
-
+    timed_start = time.perf_counter_ns()
     try:
-        if worktree.exists():
-            raise WorkflowError(f"runner worktree must be fresh: {worktree}")
-        worktree_ready = True
-        preparation_ms = elapsed_ms(preparation_start)
-        timed_start = time.perf_counter_ns()
-
         prune_start = time.perf_counter_ns()
         run_git(
             source_repo,
@@ -385,52 +401,16 @@ def run_workflow(
                 "ms": commit_result.ms,
             })
 
-        success = True
-    except WorkflowError as exc:
-        error = str(exc)
-    except KeyboardInterrupt:
-        error = "interrupted"
-    except Exception as exc:
-        error = f"unexpected error: {exc}"
-        if args.verbose:
-            traceback.print_exc()
+        workflow_ms = elapsed_ms(timed_start)
+        compiler_version = read_compiler_version(worktree)
     finally:
-        if preparation_ms is None:
-            preparation_ms = elapsed_ms(preparation_start)
-        timed_end = time.perf_counter_ns()
-        if timed_start is not None:
-            workflow_ms = (timed_end - timed_start) // 1_000_000
-        else:
-            workflow_ms = 0
-        if success:
-            try:
-                compiler_version = read_compiler_version(worktree)
-            except (OSError, RuntimeError) as exc:
-                success = False
-                error = str(exc)
         cleanup_start = time.perf_counter_ns()
-        if worktree_ready:
-            try:
-                remove_worktree(
-                    source_repo,
-                    worktree=worktree,
-                    verbose=args.verbose,
-                )
-            except WorkflowError as exc:
-                cleanup_error = str(exc)
+        remove_worktree(source_repo, worktree=worktree, verbose=args.verbose)
         cleanup_ms = elapsed_ms(cleanup_start)
 
-    if cleanup_error:
-        success = False
-        error = f"{error}; {cleanup_error}" if error else cleanup_error
-
-    unattributed_ms = max(0, (workflow_ms or 0) - sum(
-        step["ms"] for step in steps
-    ))
+    unattributed_ms = max(0, workflow_ms - sum(step["ms"] for step in steps))
 
     return {
-        "success": success,
-        "error": error,
         "base_commit": base_commit,
         "compiler_version": compiler_version,
         "source_setup_ms": source_setup_ms,
@@ -473,40 +453,73 @@ def validate_source_repository(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the mini-dev-workflow in a disposable Git worktree on the "
-            "filesystem under test."
+            "Replay the mini workflow in one disposable Git worktree per task "
+            "on the filesystem under test."
         )
     )
     parser.parse_args(argv)
-    return argparse.Namespace(**CONFIG)
+    args = argparse.Namespace(**CONFIG)
+    args.jobs = resolve_jobs(args.jobs)
+    args.cpus_per_task = resolve_jobs(args.cpus_per_task)
+    check_build_parallelism(args.jobs, args.cpus_per_task)
+    return args
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
-    require_linux()
-    ensure_dependencies(require_fstype=bool(args.require_fstype))
-    fixture_dir = Path(args.fixture_dir).expanduser().absolute()
+    cluster.run_tasks(ctx, args)
+
+def task(t: cluster.Task) -> None:
+    """Clone the fixture bundle and run one mini workflow instance here."""
+    args = t.args
+    fixture_dir = resolve_fixture_dir(args.fixture_dir)
     series = validate_fixtures(fixture_dir)
-    names = {DEFAULT_SERIES, DEFAULT_BUNDLE}
-    for commit in series["commits"]:
-        names.update(commit[key] for key in ("search_commands", "read_commands", "edit_commands"))
-    ctx.info.update({
-        "jobs": resolve_jobs(args),
-        "fixture_sha256": fixture_hashes(fixture_dir, names),
-        "tool_versions": tool_versions(ctx.work_dir),
+    if t.leader:
+        ensure_dependencies(require_fstype=bool(args.require_fstype))
+        versions = tool_versions(PROJECT_ROOT)
+    else:
+        versions = None
+    t.node_barrier()
+
+    worktree, source_repo, source_setup_ms, preparation_ms = prepare_worktree(
+        t.task_dir,
+        fixture_dir=fixture_dir,
+        args=args,
+        series=series,
+    )
+    t.log(f"task {t.index} on {t.node}: worktree ready in {preparation_ms} ms")
+
+    t.barrier()
+    summary = run_workflow(
+        worktree,
+        source_repo,
+        args=args,
+        fixture_dir=fixture_dir,
+        series=series,
+        preparation_ms=preparation_ms,
+        source_setup_ms=source_setup_ms,
+    )
+
+    results = t.gather((t.node, summary))
+    if t.leader:
+        t.node_info({
+            "fixture_sha256": fixture_hashes(fixture_dir, fixture_names(series)),
+            "tool_versions": {**(versions or {}), "compiler": summary["compiler_version"]},
+        })
+    else:
+        t.node_info(None)
+    if t.index != 0:
+        return
+    first = results[0][1]
+    t.info({
+        "jobs": args.jobs,
+        "cpus_per_task": args.cpus_per_task,
+        "base_commit": first["base_commit"],
     })
-    result = run_workflow(ctx, args, series)
-    ctx.info["base_commit"] = result.pop("base_commit")
-    compiler = result.pop("compiler_version")
-    if compiler is not None:
-        ctx.info["tool_versions"]["compiler"] = compiler
-    if not result.pop("success"):
-        raise WorkflowError(result["error"] or "workflow failed")
-    result.pop("error")
-    ctx.emit("workflow", {}, {key: result.pop(key) for key in (
-        "elapsed_ms", "preparation_ms", "cleanup_ms", "unattributed_ms",
-        "source_setup_ms",
-    )})
-    for step, entry in enumerate(result.pop("steps"), 1):
-        ctx.emit("steps", {
-            "step": step, "name": entry["name"],
-            "kind": entry["kind"], "commit": entry["commit"],
-        }, {"ms": entry["ms"]})
+    for sample, (host, result) in enumerate(results):
+        t.emit("workflow", {"tasks": t.count, "sample": sample, "host": host},
+               {key: result[key] for key in WORKFLOW_METRICS})
+        for step, entry in enumerate(result["steps"], 1):
+            t.emit("steps", {
+                "tasks": t.count, "sample": sample, "host": host,
+                "step": step, "name": entry["name"],
+                "kind": entry["kind"], "commit": entry["commit"],
+            }, {"ms": entry["ms"]})

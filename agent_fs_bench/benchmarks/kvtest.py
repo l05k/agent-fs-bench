@@ -19,19 +19,28 @@ transcript metadata/FTS/compression, and offers FULL synchronization or
 parameters are not replayed. Keep SQLite settings fixed across filesystems.
 Never run concurrent writers/readers against the measured database: official
 kvtest can report writes despite failed commits; integrity_check is not proof
-of committed work. A workload invocation owns its database exclusively.
+of committed work. A task owns its database exclusively.
 
-Each timed invocation emits one ``repeats`` row: the experiment settings and
-repeat index as key columns, then ``microseconds_per_write``,
-``write_rate_mb_s`` and ``total_elapsed_s``. Reported microseconds/write
-amortize connection setup and final close/checkpoint; they are not individually
-sampled transaction latencies. The observed journal mode, cache size and page
-size, the SQLite version, the build provenance and the final integrity-check
-result go to the run manifest. A fresh database directory is allocated for each
-invocation.
+A run starts ``tasks`` independent kvtest instances together, one per task
+slot. Every task initializes and measures its own database under the run's
+per-task directory, so no database ever has concurrent users. Repeats of all
+instances are aligned by MPI barriers; each repeat emits one row per task.
+Pool runs with different ``tasks`` values for a concurrency curve.
 
-The workload uses the standard library. A C compiler and network access are
-needed for the first source download/build.
+Each timed invocation emits one row: the experiment settings, ``tasks``,
+repeat index, task ``sample`` and node ``host`` as key columns, then
+``microseconds_per_write``, ``write_rate_mb_s`` and ``total_elapsed_s``.
+Reported microseconds/write amortize connection setup and final
+close/checkpoint; they are not individually sampled transaction latencies.
+The observed journal mode, cache size and page size, the build provenance and
+the final integrity-check result go to the run manifest. The node leader on
+each machine downloads or verifies the pinned sources and builds the binary
+once per machine, before any task touches the target. A machine without
+network access needs the sources pre-placed in its build directory.
+
+The workload itself uses the standard library; task dispatch uses the shared MPI
+framework. A C compiler and network access are needed for the first source
+download/build on each machine.
 """
 
 from __future__ import annotations
@@ -41,8 +50,9 @@ from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Sequence
 
+from agent_fs_bench import cluster
 from agent_fs_bench.analysis import Figure
-from agent_fs_bench.results import PROJECT_ROOT, RunContext
+from agent_fs_bench.results import RunContext
 
 from . import sqlite_tools
 
@@ -54,8 +64,8 @@ DEFAULT_COUNT = 2000
 DEFAULT_CACHE_KIB = 1000
 
 # Deliberate experiment settings. Edit for an ablation; they become the
-# per-row key columns. build_dir and force_download are run management.
-# Private settings must never be committed.
+# per-row key columns. build_dir, force_download and the task controls are
+# run management. Private settings must never be committed.
 CONFIG = {
     "size": DEFAULT_PAYLOAD,
     "variance": DEFAULT_VARIANCE,
@@ -66,17 +76,21 @@ CONFIG = {
     "mmap": 0,
     "multitrans": True,
     "repeats": 5,
+    "tasks": 1,
+    "cpus_per_task": 1,
+    "oversubscribe": 1,
     "build_dir": None,
     "force_download": False,
 }
 
 FIGURES = [
     Figure(
-        "repeats", "transaction", "microseconds_per_write", kind="box",
-        xlabel="Transaction mode", ylabel="Microseconds per write",
+        "repeats", "tasks", "microseconds_per_write", kind="box",
+        split=("transaction",), xlabel="Tasks", ylabel="Microseconds per write",
         name="kvtest-microseconds-per-write",
     ),
 ]
+
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -84,10 +98,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "Run SQLite's official single-writer kvtest against the filesystem under test."
         )
     )
-    parser.parse_args(argv)
-    args = argparse.Namespace(**CONFIG)
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="two tasks, two repeats and 200 writes; needs two logical CPUs",
+    )
+    options = parser.parse_args(argv)
+    values = dict(CONFIG)
+    if options.smoke:
+        values.update(tasks=2, repeats=2, count=200)
+    args = argparse.Namespace(**values, smoke=options.smoke)
     args.jmode = args.jmode.lower()
     return args
+
 
 PARSE_PATTERNS = {
     "sqlite_version": re.compile(
@@ -116,6 +139,7 @@ PARSE_PATTERNS = {
 INTEGRITY_PATTERN = re.compile(
     r"^Integrity-check:[ \t]*(\S.*?)[ \t]*\r?$", re.MULTILINE
 )
+
 
 def parse_kvtest_output(text: str) -> Dict[str, Any]:
     """Parse ``kvtest run`` output, rejecting any missing measured field.
@@ -150,6 +174,7 @@ def parse_kvtest_output(text: str) -> Dict[str, Any]:
         "write_rate_mb_s": float(matches["write_rate_mb_s"].group(1)),
     }
 
+
 def parse_integrity_check(text: str) -> str:
     """Parse ``kvtest stat`` output; every printed check must be ``ok``."""
     values = INTEGRITY_PATTERN.findall(text)
@@ -164,18 +189,9 @@ def parse_integrity_check(text: str) -> str:
         + text)
     return "ok"
 
-def measure(args: argparse.Namespace, target_dir: Path) -> Dict[str, Any]:
-    build_dir = Path(
-        args.build_dir or (PROJECT_ROOT / "build" / "kvtest")
-    ).expanduser().resolve()
-    sources = sqlite_tools.ensure_sources(build_dir, "kvtest", args.force_download)
-    binary, provenance = sqlite_tools.build(build_dir, "kvtest", sources, args.force_download)
 
-    target_dir.mkdir(parents=True, exist_ok=True)
-    db_path = target_dir / DB_FILENAME
-    sqlite_tools.remove_database(db_path)
-
-    sqlite_tools.run_command([
+def init_argv(binary: Path, db_path: Path, args: argparse.Namespace) -> List[str]:
+    return [
         str(binary),
         "init",
         str(db_path),
@@ -185,9 +201,11 @@ def measure(args: argparse.Namespace, target_dir: Path) -> Dict[str, Any]:
         str(args.size),
         "--variance",
         str(args.variance),
-    ])
+    ]
 
-    run_argv = [
+
+def run_argv(binary: Path, db_path: Path, args: argparse.Namespace) -> List[str]:
+    argv = [
         str(binary),
         "run",
         str(db_path),
@@ -204,74 +222,99 @@ def measure(args: argparse.Namespace, target_dir: Path) -> Dict[str, Any]:
         str(args.mmap),
     ]
     if args.multitrans:
-        run_argv.append("--multitrans")
+        argv.append("--multitrans")
     if args.nosync:
-        run_argv.append("--nosync")
+        argv.append("--nosync")
+    return argv
 
-    repeats: List[Dict[str, Any]] = []
-    for index in range(args.repeats):
-        # kvtest overwrites the same rows again each time; later repeats
-        # therefore measure overwrite-with-existing-rows.
-        proc = sqlite_tools.run_command(run_argv)
-        repeats.append(
-            {
-                "repeat": index + 1,
-                "parsed": parse_kvtest_output(proc.stdout),
-            }
+
+def _run(node: str, argv: List[str]) -> tuple[str, str]:
+    return node, sqlite_tools.run_command(argv).stdout
+
+
+def task(t: cluster.Task) -> None:
+    build_dir = sqlite_tools.build_directory(t.args.build_dir, "kvtest")
+    build_info = None
+    if t.leader:
+        sources = sqlite_tools.ensure_sources(build_dir, "kvtest", t.args.force_download)
+        _, provenance = sqlite_tools.build(
+            build_dir, "kvtest", sources, t.args.force_download
         )
+        build_info = {
+            "compiler": provenance["compiler_version"],
+            "source_sha256": provenance["source_sha256"],
+            "binary_sha256": provenance["binary_sha256"],
+            "sqlite_version": sqlite_tools.SQLITE_VERSION,
+        }
+    t.node_barrier()
+    t.node_info(build_info)
 
-    # One final validation after all timed runs, using the same binary.
-    integrity = parse_integrity_check(
-        sqlite_tools.run_command([str(binary), "stat", str(db_path)]).stdout
-    )
-
-    return {
-        "provenance": provenance,
-        "repeats": repeats,
-        "integrity_check": integrity,
-    }
-
-def run(ctx: RunContext, args: argparse.Namespace) -> None:
-    result = measure(args, ctx.work_dir)
-    provenance = result["provenance"]
-    repeats = result["repeats"]
-    sqlite_version = repeats[0]["parsed"]["sqlite_version"]
-    if any(
-        entry["parsed"]["sqlite_version"] != sqlite_version
-        for entry in repeats
-    ):
-        raise sqlite_tools.BenchmarkError("kvtest reported different SQLite versions across repeats")
-
-    ctx.info.update(
-        sqlite_version=sqlite_version,
-        compiler=provenance["compiler_version"],
-        source_sha256=provenance["source_sha256"],
-        binary_sha256=provenance["binary_sha256"],
-        integrity_check=result["integrity_check"],
-        observed=[{
-            "repeat": entry["repeat"],
-            **{key: entry["parsed"][key] for key in ("journal_mode", "cache_size", "page_size")},
-        } for entry in repeats],
-    )
+    binary = build_dir / "kvtest"
+    db_path = t.task_dir / DB_FILENAME
+    # Initialization is preparation, never timed; each task owns this database.
+    sqlite_tools.run_command(init_argv(binary, db_path, t.args))
 
     keys = {
-        "jmode": args.jmode,
-        "sync": "off" if args.nosync else "full",
-        "transaction": "autocommit" if args.multitrans else "batch",
-        "payload_bytes": args.size,
-        "variance_bytes": args.variance,
-        "count": args.count,
-        "cache_size_kib": args.cache_size,
-        "mmap_bytes": args.mmap,
+        "jmode": t.args.jmode,
+        "sync": "off" if t.args.nosync else "full",
+        "transaction": "autocommit" if t.args.multitrans else "batch",
+        "payload_bytes": t.args.size,
+        "variance_bytes": t.args.variance,
+        "count": t.args.count,
+        "cache_size_kib": t.args.cache_size,
+        "mmap_bytes": t.args.mmap,
     }
-    for entry in repeats:
-        parsed = entry["parsed"]
-        ctx.emit(
-            "repeats",
-            {**keys, "repeat": entry["repeat"]},
-            {
-                "microseconds_per_write": parsed["microseconds_per_write"],
-                "write_rate_mb_s": parsed["write_rate_mb_s"],
-                "total_elapsed_s": parsed["total_elapsed_s"],
-            },
-        )
+    observed: List[Dict[str, Any]] = []
+    for repeat in range(1, t.args.repeats + 1):
+        # kvtest overwrites the same rows again each time; later repeats
+        # therefore measure overwrite-with-existing-rows.
+        _, results = t.batch(_run, t.node, run_argv(binary, db_path, t.args))
+        if t.index != 0:
+            continue
+        for sample, (node, stdout) in enumerate(results):
+            parsed = parse_kvtest_output(stdout)
+            if parsed["sqlite_version"] != sqlite_tools.SQLITE_VERSION:
+                raise sqlite_tools.BenchmarkError(
+                    f"task {sample} on {node} reported SQLite "
+                    f"{parsed['sqlite_version']}, expected {sqlite_tools.SQLITE_VERSION}"
+                )
+            observed.append({
+                "repeat": repeat,
+                "sample": sample,
+                "host": node,
+                "journal_mode": parsed["journal_mode"],
+                "cache_size": parsed["cache_size"],
+                "page_size": parsed["page_size"],
+            })
+            t.emit(
+                "repeats",
+                {
+                    **keys,
+                    "tasks": t.count,
+                    "repeat": repeat,
+                    "sample": sample,
+                    "host": node,
+                },
+                {
+                    "microseconds_per_write": parsed["microseconds_per_write"],
+                    "write_rate_mb_s": parsed["write_rate_mb_s"],
+                    "total_elapsed_s": parsed["total_elapsed_s"],
+                },
+            )
+
+    # One final validation per task after all timed runs, using the same binary.
+    # Any failure aborts the job before task 0 reports run facts.
+    parse_integrity_check(
+        sqlite_tools.run_command([str(binary), "stat", str(db_path)]).stdout
+    )
+    t.barrier()
+    if t.index == 0:
+        t.info({
+            "sqlite_version": sqlite_tools.SQLITE_VERSION,
+            "integrity_check": "ok",
+            "observed": observed,
+        })
+
+
+def run(ctx: RunContext, args: argparse.Namespace) -> None:
+    cluster.run_tasks(ctx, args)

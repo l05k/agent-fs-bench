@@ -17,9 +17,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 def source_digest() -> str:
     """Identify the Python sources and fixed inputs, including local edits.
 
-    Each module's top-level CONFIG literal is excluded: the manifest records its
-    values as `config`, so one sweep can edit CONFIG per run (e.g. mount-scale
-    clients) while any other source change still yields a new fingerprint.
+    Each module's top-level CONFIG literal is excluded: the manifest records a
+    workload's values as `config` (the launcher CONFIG of `cluster.py` only as
+    `config.launcher_sha256`), so one sweep can edit CONFIG per run (e.g. `tasks`)
+    while any other source change still yields a new fingerprint.
     """
     digest = hashlib.sha256()
     paths = list((PROJECT_ROOT / 'agent_fs_bench').rglob('*.py'))
@@ -97,6 +98,7 @@ class RunContext:
     tables: Tables
     info: dict[str, Any] = field(default_factory=dict)
     rows: int = 0
+    pool: Any = None  # cluster.Pool of the machines this run may use
 
     def emit(self, table: str, keys: dict[str, Any], metrics: dict[str, int | float | None]) -> None:
         """Append one row; `target` is prepended to keys, None metrics stay empty."""

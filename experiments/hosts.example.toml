@@ -1,20 +1,20 @@
-# Copy to local/hosts.toml. Host keys and noninteractive SSH auth must be configured.
-# multi-host: every entry is a worker; mount the same target path externally.
-# mount-scale: list REMOTE machines only, in fill order; the current Linux
-# controller is always used first. All hosts use the same staging/admin paths,
-# target profile, Open MPI 4.1.x and mdtest binary. Allow group-internal MPI TCP.
-# To fill only local CPUs with mount-scale clients=None, use: hosts = []
-# Never list the controller again; each address must identify one distinct machine.
+# Copy to local/hosts.toml for `run --mode overflow` or `--mode remote`.
+# List REMOTE machines only, in fill order; never list the controller again and give
+# each address one distinct machine. Every machine needs the same checkout (`root`,
+# default: the controller's checkout path) with its own `uv sync --locked` environment,
+# Open MPI 4.1, non-interactive SSH from the controller, and TCP between all machines.
+# See docs/run-modes.md.
 [[hosts]]
 name = "node-a"
 address = "node-a.example.net"
 user = "bench"
 port = 22
-python = "python3"
 ssh_args = ["-o", "ServerAliveInterval=30"]
 
 [[hosts]]
 name = "node-b"
-address = "node-b.example.net"
+address = "10.0.0.12"
 user = "bench"
 # Optional: ssh_args = ["-i", "/home/operator/.ssh/bench_ed25519"]
+# Optional: root = "/srv/agent-fs-bench"       # checkout on this machine
+# Optional: python = "/srv/agent-fs-bench/.venv/bin/python"

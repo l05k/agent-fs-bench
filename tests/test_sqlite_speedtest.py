@@ -1,12 +1,7 @@
-import subprocess
-import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from agent_fs_bench.benchmarks import sqlite_speedtest, sqlite_tools
-from agent_fs_bench.results import RunContext, Tables, read_table
-from agent_fs_bench.targets import Target
 
 # Official SQLite 3.54.1 main --size 1 output from a Linux/ext4 smoke run.
 SPEEDTEST_STDOUT = """-- Speedtest1 for SQLite 3.54.1 2026-10-16 14:45:20 555e07ef
@@ -77,47 +72,15 @@ class SpeedtestOutputTests(unittest.TestCase):
             with self.subTest(prefix=prefix), self.assertRaises(sqlite_tools.BenchmarkError):
                 sqlite_speedtest.parse_speedtest_output(text)
 
-class SpeedtestRunTests(unittest.TestCase):
-    def test_emits_stage_and_total_tables_with_build_provenance(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "work").mkdir()
-            args = sqlite_speedtest.parse_args([])
-            args.repeats = 2
-            args.build_dir = root / "build"
-            provenance = {
-                "compiler_version": "test compiler",
-                "source_sha256": {},
-                "binary_sha256": "test binary",
-            }
-            completed = subprocess.CompletedProcess([], 0, SPEEDTEST_STDOUT, "")
-            tables = Tables(root)
-            context = RunContext(
-                "sqlite-speedtest", "run", Target("fs", root),
-                root / "work", root / "results", tables,
-            )
-            with mock.patch.object(sqlite_tools, "ensure_sources", return_value={}), \
-                    mock.patch.object(sqlite_tools, "build",
-                                      return_value=(root / "speedtest1", provenance)), \
-                    mock.patch.object(sqlite_tools, "run_command", return_value=completed):
-                sqlite_speedtest.run(context, args)
-            tables.close()
-
-            stages = read_table(root / "stages.csv")
-            totals = read_table(root / "totals.csv")
-            self.assertEqual(len(stages), len(sqlite_speedtest.MAIN_STAGES) * 2)
-            self.assertEqual([int(row["repeat"]) for row in totals], [1, 2])
-            self.assertEqual(
-                {int(row["stage"]) for row in stages},
-                set(sqlite_speedtest.MAIN_STAGES),
-            )
-            self.assertEqual(stages[0]["description"],
-                             "500 INSERTs into table with no index")
-            self.assertEqual(float(totals[0]["official_total_s"]), 0.031)
-            self.assertEqual(context.info["compiler"], "test compiler")
-            self.assertEqual(context.info["source_sha256"], {})
-            self.assertEqual(context.info["binary_sha256"], "test binary")
-            self.assertEqual(context.info["sqlite_version"], sqlite_tools.SQLITE_VERSION)
+class ConfigurationTests(unittest.TestCase):
+    def test_argv_passes_negative_cache_size_and_optional_nosync(self):
+        binary, database = Path("speedtest1"), Path("speedtest.sqlite")
+        args = sqlite_speedtest.parse_args([])
+        argv = sqlite_speedtest.speedtest_argv(binary, database, args)
+        self.assertEqual(argv[argv.index("--cachesize") + 1], "-2000")
+        self.assertNotIn("--nosync", argv)
+        args.nosync = True
+        self.assertIn("--nosync", sqlite_speedtest.speedtest_argv(binary, database, args))
 
 if __name__ == "__main__":
     unittest.main()

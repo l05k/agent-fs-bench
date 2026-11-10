@@ -5,14 +5,13 @@ from datetime import datetime, timezone
 import signal
 import sys
 
-from . import analysis
+from . import analysis, cluster
 from .results import PROJECT_ROOT, RunContext, Tables, source_digest, write_json
 from .targets import load_targets
 
 BENCHMARKS = (
     'clone', 'dev-workflow', 'mini-dev-workflow', 'npm-install', 'npm-install-nofsync',
-    'kvtest', 'sqlite-speedtest', 'multi-host', 'mount-scale', 'mdtest', 'mdtest-peak',
-    'agent-replay',
+    'kvtest', 'sqlite-speedtest', 'mount-scale', 'mdtest', 'mdtest-peak', 'agent-replay',
 )
 RESULTS_DIR = PROJECT_ROOT / 'results'
 TARGETS_FILE = PROJECT_ROOT / 'local' / 'targets.toml'
@@ -25,11 +24,17 @@ def run_benchmark(argv: list[str]) -> int:
     parser.add_argument('benchmark', choices=BENCHMARKS)
     parser.add_argument('--dirs', nargs='+', metavar='DIRECTORY')
     parser.add_argument('--target', action='append', help='Select a registered alias; repeatable.')
+    parser.add_argument('--mode', choices=cluster.MODES, default='local',
+                        help='local: this machine only; overflow: this machine first, then '
+                             'local/hosts.toml in order; remote: local/hosts.toml only')
     split = argv.index('--') if '--' in argv else len(argv)
     options = parser.parse_args(argv[:split])
     workload_argv = argv[split + 1:]
     module = analysis.workload(options.benchmark)
-    config = vars(module.parse_args(workload_argv))
+    # Mode and launcher settings are part of the experiment: plot pools runs of one mode
+    # and one launcher configuration unless --vary names them.
+    config = {**vars(module.parse_args(workload_argv)), 'mode': options.mode,
+              'launcher_sha256': cluster.launcher_digest()}
     targets = load_targets(TARGETS_FILE, options.dirs)
     # A misspelled override would silently measure cp-r; check before --target filtering.
     unknown = set(config.get('target_copiers', {})) - {target.name for target in targets}
@@ -41,31 +46,33 @@ def run_benchmark(argv: list[str]) -> int:
         if unknown:
             raise ValueError(f'unknown targets: {", ".join(sorted(unknown))}')
         targets = [target for target in targets if target.name in options.target]
-    remote = getattr(module, 'REMOTE', False)
-    if not remote:
+    if options.mode != 'remote':
+        # Remote machines check their own target; the controller only where it runs tasks.
         for target in targets:
             if not target.path.is_dir():
                 raise ValueError(f'target directory does not exist: {target.path}; mount it first')
             if RESULTS_DIR.is_relative_to(target.path.resolve()):
                 raise ValueError('results must be outside every measured target directory')
+    pool = cluster.open_pool(options.mode)
+    print(f'[{options.benchmark}] mode {options.mode}: ' + ', '.join(
+        f'{node.name} ({node.hostname}, {len(node.cpus)} CPUs)' for node in pool.nodes), flush=True)
     run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
     run_dir = RESULTS_DIR / options.benchmark / run_id
     run_dir.mkdir(parents=True)
     tables = Tables(run_dir)
     manifest = {'benchmark': options.benchmark, 'run_id': run_id,
                 'source_sha256': source_digest(), 'config': config,
+                'launcher': pool.launcher, 'nodes': pool.manifest(),
                 'targets': [], 'tables': tables.schemas}
     write_json(run_dir / 'manifest.json', manifest)
     try:
         for target in targets:
+            # Each participating machine creates its own <work_dir>/<node>/ when it starts.
             work_dir = target.path / 'agent-fs-bench' / options.benchmark / run_id
-            if not remote:
-                if not work_dir.resolve().is_relative_to(target.path.resolve()):
-                    raise ValueError(f'work directory escapes target through a symlink: {work_dir}')
-                work_dir.mkdir(parents=True)
             result_dir = run_dir / target.name
             result_dir.mkdir()
-            context = RunContext(options.benchmark, run_id, target, work_dir, result_dir, tables)
+            context = RunContext(options.benchmark, run_id, target, work_dir, result_dir, tables,
+                                 pool=pool)
             print(f'[{options.benchmark}] {target.name}: {target.path}', flush=True)
             # A fresh Namespace per target keeps workload setup from leaking state.
             module.run(context, module.parse_args(workload_argv))

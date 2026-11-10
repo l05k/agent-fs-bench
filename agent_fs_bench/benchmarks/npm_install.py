@@ -1,11 +1,14 @@
 """Offline npm/pnpm materialization from prewarmed external local sources.
 
-Each batch starts independent projects together. Every worker has a private
-cache/store and measures command execution and, when ``CONFIG['flush']`` is
-set, a full project fsync. Source preparation, project creation, inventories
-and cleanup are untimed.
-The internal pool width and external project concurrency are separate inputs;
-neither is a claim about the package manager's total thread count.
+Every task installs into its own project at the same time, on its own machine and
+CPU set. Each machine seeds its own source from the registry; each task copies
+that source into a private sandbox for every repeat, so no task reads a cache,
+store, home or project another task wrote. The command and, when
+``CONFIG['flush']`` is set, a full project fsync are timed; source preparation,
+project creation, prereading, inventories and cleanup are not.
+The internal pool width (``concurrency``) and the external task count (``tasks``)
+are separate inputs; neither is a claim about the package manager's total thread
+count.
 
 This is not an empty-cache sandbox install or a physical write-bandwidth test.
 Registry traffic and lifecycle scripts are excluded; target FS traffic remains.
@@ -15,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import multiprocessing
 import os
 import resource
 import shutil
@@ -25,10 +27,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from agent_fs_bench import cluster
 from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
 from agent_fs_bench.benchmarks.clone import fstype
 
+MANAGERS = ("npm", "pnpm")
 PNPM_IMPORT_METHOD = "copy"
 LOCAL_PREP_FILESYSTEMS = {"tmpfs", "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs"}
 # Upstream pnpm fixture vendored under data/, so the benchmark can replay the
@@ -41,10 +45,15 @@ FIXTURES = {
 # when changing runtimes; the benchmark never installs tools automatically.
 CONFIG: dict[str, Any] = {
     "fixture": "pnpm-bench",
-    "pm": "both",
-    "runs": 10,
+    "pm": "npm",
+    "repeats": 10,
+    # External concurrency: simultaneous independent installs, never swept in one run.
+    "tasks": 1,
+    # Keep cpus_per_task equal to the pool width below: each install gets the CPUs
+    # its file materialization can actually use.
+    "cpus_per_task": 4,
+    "oversubscribe": 1,
     "concurrency": 4,
-    "concurrent_jobs": [1],
     "prep_dir": "/dev/shm",
     "npm_bin": "npm",
     "pnpm_bin": "pnpm",
@@ -56,18 +65,15 @@ CONFIG: dict[str, Any] = {
 }
 
 FIGURES = [
-    Figure("batches", "concurrent_jobs", "install_mean_s", split=("manager",),
+    Figure("batches", "tasks", "install_mean_s", split=("manager",),
            xlabel="Concurrent installs", ylabel="Install time (s)", logx=True),
-    Figure("batches", "concurrent_jobs", "durable_mean_s", split=("manager",),
+    Figure("batches", "tasks", "durable_mean_s", split=("manager",),
            xlabel="Concurrent installs", ylabel="Durable install time (s)", logx=True),
 ]
 
 
-
 class BenchError(RuntimeError):
     pass
-
-
 
 
 def log(message: str) -> None:
@@ -157,6 +163,7 @@ def check_project_placement(project: Path, target: Path) -> None:
     if not project.is_relative_to(target):
         die(f"project is outside the measured target: {project}")
 
+
 def sync_prepared_project(project: Path, target: Path) -> None:
     """Persist input files and every newly created ancestor before timing."""
     project, target = project.resolve(), target.resolve()
@@ -174,7 +181,6 @@ def warm_tree(path: Path) -> None:
     """Read cache/store files; page residency is still best effort."""
     if not path.is_dir():
         die(f"cache/store directory is missing: {path}")
-    log(f"prewarming cache/store: {path}")
     for dirpath, _dirnames, filenames in os.walk(path, followlinks=False, onerror=raise_walk_error):
         for filename in filenames:
             file_path = Path(dirpath) / filename
@@ -185,8 +191,6 @@ def warm_tree(path: Path) -> None:
 
 def ignore_args(ignore_scripts: bool) -> list[str]:
     return ["--ignore-scripts"] if ignore_scripts else []
-
-
 
 
 def concurrency_env(manager: str, concurrency: int) -> dict[str, str]:
@@ -231,16 +235,21 @@ def manager_env(manager: str, concurrency: int, sandbox: Path) -> dict[str, str]
     return env
 
 
-def run_visible(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
+def run_visible(command: list[str], cwd: Path, log_path: Path,
+                env: dict[str, str] | None = None) -> None:
+    """Run a command whose output belongs in a per-task log file, not the console."""
     log("run: " + " ".join(command))
-    result = subprocess.run(
-        command,
-        cwd=str(cwd),
-        env=env,
-        check=False,
-    )
+    with log_path.open("w", encoding="utf-8") as handle:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd),
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
     if result.returncode != 0:
-        die(f"command failed with exit code {result.returncode}")
+        die(f"command failed with exit code {result.returncode}: {log_path}\n{read_tail(log_path)}")
 
 
 def fixture_dir_for(name: str) -> Path:
@@ -269,6 +278,7 @@ def seed_npm_fixture(
     fixture_dir: Path,
     ignore_scripts: bool,
     concurrency: int,
+    log_path: Path,
 ) -> None:
     """Seed the npm cache from the fixture's manifest and npm lockfile.
 
@@ -296,6 +306,7 @@ def seed_npm_fixture(
     ]
     run_visible(
         command, seed_dir,
+        log_path,
         env=manager_env("npm", concurrency, seed_dir.parent / "npm-env"),
     )
 
@@ -314,6 +325,7 @@ def seed_pnpm_fixture(
     fixture_dir: Path,
     ignore_scripts: bool,
     concurrency: int,
+    log_path: Path,
 ) -> None:
     """Seed the pnpm store from the fixture's committed lockfile.
 
@@ -338,7 +350,7 @@ def seed_pnpm_fixture(
     ]
     env = manager_env("pnpm", concurrency, seed_dir.parent / "pnpm-env")
     env["XDG_CACHE_HOME"] = str(cache_dir)
-    run_visible(command, seed_dir, env=env)
+    run_visible(command, seed_dir, log_path, env=env)
 
     if (seed_dir / "pnpm-lock.yaml").read_bytes() != (fixture_dir / "pnpm-lock.yaml").read_bytes():
         die("pnpm seed changed the committed lockfile")
@@ -429,111 +441,73 @@ def install_command(
     ]
 
 
-def install_worker(
+def install(
     command: list[str], project: Path, log_path: Path, env: dict[str, str],
-    barrier: Any, connection: Any, flush: bool = True,
-) -> None:
-    """One Python process owns one child and its resource-usage counters."""
-    try:
-        with log_path.open("w", encoding="utf-8") as log_handle:
-            connection.send({"ready": True})
-            barrier.wait()
-            before = resource.getrusage(resource.RUSAGE_CHILDREN)
-            started = time.monotonic()
-            result = subprocess.run(
-                command, cwd=project, env=env, stdout=log_handle,
-                stderr=subprocess.STDOUT, check=False,
-            )
-            exited = time.monotonic()
-            if result.returncode != 0:
-                die(f"install exited {result.returncode}; {log_path}\n{read_tail(log_path)}")
-            if flush:
-                fsync_tree(project)
-                durable = time.monotonic()
-            after = resource.getrusage(resource.RUSAGE_CHILDREN)
-        sample = {
-            "started": started,
-            "install_s": exited - started,
-            "user_s": after.ru_utime - before.ru_utime,
-            "sys_s": after.ru_stime - before.ru_stime,
-        }
+    flush: bool, host: str,
+) -> dict[str, int | float | str]:
+    """Run this task's install, then flush the project when asked.
+
+    Returns one sample: command wall time, optional flush and durable times, the
+    child CPU time this task's process accumulated, and the machine it ran on.
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    sample: dict[str, int | float | str] = {"host": host}
+    with log_path.open("w", encoding="utf-8") as log_handle:
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        started = time.monotonic()
+        result = subprocess.run(
+            command, cwd=project, env=env, stdout=log_handle,
+            stderr=subprocess.STDOUT, check=False,
+        )
+        exited = time.monotonic()
+        if result.returncode != 0:
+            die(f"install exited {result.returncode}; {log_path}\n{read_tail(log_path)}")
+        sample["install_s"] = exited - started
         if flush:
+            fsync_tree(project)
+            durable = time.monotonic()
             sample["flush_s"] = durable - exited
             sample["durable_s"] = durable - started
-        connection.send(sample)
-    except Exception as exc:
-        connection.send({"error": f"{type(exc).__name__}: {exc}"})
-    finally:
-        connection.close()
+        after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    sample["user_s"] = after.ru_utime - before.ru_utime
+    sample["sys_s"] = after.ru_stime - before.ru_stime
+    return sample
 
 
-def run_workers(jobs: list[dict[str, Any]]) -> list[dict[str, int | float]]:
-    """Release ready workers together; retain actual start offsets."""
-    context = multiprocessing.get_context("fork")
-    barrier = context.Barrier(len(jobs) + 1)
-    processes = []
-    connections = []
-    try:
-        for job in jobs:
-            receiver, sender = context.Pipe(duplex=False)
-            process = context.Process(
-                target=install_worker,
-                args=(job["command"], job["project"], job["log"], job["env"], barrier, sender, job["flush"]),
-            )
-            process.start()
-            sender.close()
-            processes.append(process)
-            connections.append(receiver)
-        for connection in connections:
-            ready = connection.recv()
-            if "error" in ready:
-                die(ready["error"])
-        batch_started = time.monotonic()
-        barrier.wait()
-        tasks = []
-        for task_number, connection in enumerate(connections, 1):
-            result = connection.recv()
-            if "error" in result:
-                die(result["error"])
-            result["start_offset_s"] = result.pop("started") - batch_started
-            result["task"] = task_number
-            tasks.append(result)
-        for process in processes:
-            process.join()
-            if process.exitcode != 0:
-                die(f"install worker exited {process.exitcode}")
-        return tasks
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-            process.join()
-        for connection in connections:
-            connection.close()
+def install_metrics(sample: dict[str, int | float | str], flush: bool) -> dict[str, int | float]:
+    names = ("install_s", "flush_s", "durable_s") if flush else ("install_s",)
+    return {**{name: sample[name] for name in names},
+            **{name: sample[name] for name in ("user_s", "sys_s")}}
 
 
 def batch_metrics(
-    tasks: list[dict[str, int | float]], trees: list[dict[str, int]],
-    flush: bool = True,
+    samples: list[dict[str, int | float | str]], trees: list[dict[str, int]],
+    wall: float, flush: bool = True,
 ) -> dict[str, int | float]:
-    count = len(tasks)
-    install_s = max(task["start_offset_s"] + task["install_s"] for task in tasks)
+    """Summarize one barrier-aligned batch from per-task samples.
+
+    `wall` is the batch's barrier-to-barrier time and therefore covers release
+    skew plus every task's install and flush; it is the durable batch time.
+    `batch_install_s` is the slowest task's own install duration, because a
+    start offset across machines is not observable.
+    """
+    count = len(samples)
     phases = ("install", "flush", "durable") if flush else ("install",)
     metrics = {
-        f"{phase}_mean_s": sum(task[f"{phase}_s"] for task in tasks) / count
+        f"{phase}_mean_s": sum(sample[f"{phase}_s"] for sample in samples) / count
         for phase in phases
     }
+    install_s = max(sample["install_s"] for sample in samples)
     metrics.update({
         "batch_install_s": install_s,
         "installs_per_s": count / install_s,
-        "user_s": sum(task["user_s"] for task in tasks),
-        "sys_s": sum(task["sys_s"] for task in tasks),
+        "user_s": sum(sample["user_s"] for sample in samples),
+        "sys_s": sum(sample["sys_s"] for sample in samples),
     })
     if flush:
-        durable_s = max(task["start_offset_s"] + task["durable_s"] for task in tasks)
         metrics.update({
-            "batch_durable_s": durable_s,
-            "durable_installs_per_s": count / durable_s,
+            "batch_durable_s": wall,
+            "durable_installs_per_s": count / wall,
         })
     return {
         **{key: round(value, 6) for key, value in metrics.items()},
@@ -541,61 +515,125 @@ def batch_metrics(
     }
 
 
-def run_batch(
-    ctx: RunContext, args: argparse.Namespace, manager: str, binary: str,
-    source: Path, template: Path, prep: Path, count: int, repeat: int,
-) -> tuple[dict[str, int | float], list[dict[str, int | float]]]:
-    name = f"{manager}-c{count}-r{repeat}"
-    source_batch = prep / "batches" / name
-    project_batch = ctx.work_dir / name
-    jobs = []
-    for task_number in range(1, count + 1):
-        sandbox = source_batch / f"task-{task_number}"
-        task_source = sandbox / "source"
-        shutil.copytree(source, task_source)
-        project = prepare_project(project_batch / f"task-{task_number}", manager, template)
-        env = manager_env(manager, args.concurrency, sandbox)
-        if manager == "pnpm":
-            env["XDG_CACHE_HOME"] = str(task_source / "cache")
-        check_project_placement(project, ctx.target.path)
-        if args.flush:
-            sync_prepared_project(project, ctx.target.path)
-        jobs.append({
-            "project": project, "env": env,
-            "command": install_command(manager, binary, task_source, args.ignore_scripts),
-            "log": ctx.result_dir / "logs" / f"{name}-task-{task_number}.log",
-            "flush": args.flush,
-        })
-    # No source writes, metrics or deletions overlap timed workers.
-    if args.flush:
-        sync_filesystem()
-    for task_number in range(1, count + 1):
-        warm_tree(source_batch / f"task-{task_number}" / "source")
-    log(f"{manager}: {count} projects, batch {repeat}/{args.runs}")
-    tasks = run_workers(jobs)
-    trees = [tree_metrics(job["project"] / "node_modules") for job in jobs]
-    metrics = batch_metrics(tasks, trees, flush=args.flush)
-    if not args.keep_node_modules:
-        remove_tree(project_batch)
-    remove_tree(source_batch)
-    if args.flush:
-        sync_filesystem()
-    return metrics, tasks
+def node_prep_dir(t: cluster.Task) -> Path:
+    """This machine's preparation root for this run; never shared between machines."""
+    prep_root = Path(t.args.prep_dir).expanduser().resolve()
+    return prep_root / "agent-fs-bench" / t.benchmark / t.run_id / t.target.name / t.node
 
-def task_metrics(task: dict[str, int | float], flush: bool) -> dict[str, int | float]:
-    names = ("install_s", "flush_s", "durable_s") if flush else ("install_s",)
-    return {**{name: task[name] for name in names},
-            **{name: task[name] for name in ("user_s", "sys_s", "start_offset_s")}}
+
+def prepare_node(t: cluster.Task) -> dict[str, Any]:
+    """Seed this machine's source from the registry and report its facts.
+
+    Runs on the node leader only: the target placement, the tool versions and
+    the seed are properties of the machine that will do the work.
+    """
+    args = t.args
+    if not Path("/proc/self/mountinfo").is_file():
+        die(f"{t.node}: npm-install requires Linux")
+    target = t.target.path.resolve()
+    prep_root = Path(args.prep_dir).expanduser().resolve()
+    if not prep_root.is_dir():
+        die(f"{t.node}: preparation directory does not exist: {prep_root}")
+    target_type, prep_type = check_placement(target, prep_root)
+    binary, versions = checked_tools(args)
+    prep = node_prep_dir(t)
+    prep.mkdir(parents=True, exist_ok=False)
+    source = ensure_dir(prep / "source")
+    template = ensure_dir(prep / "template")
+    seed = ensure_dir(prep / "seeds")
+    fixture = fixture_dir_for(args.fixture)
+    seed_log = t.log_dir / f"seed-{args.pm}.log"
+    if args.pm == "npm":
+        seed_npm_fixture(
+            binary, ensure_dir(source / "cache"), seed, template,
+            fixture, args.ignore_scripts, args.concurrency, seed_log,
+        )
+    else:
+        seed_pnpm_fixture(
+            binary, ensure_dir(source / "store"), ensure_dir(source / "cache"),
+            seed, template, fixture, args.ignore_scripts, args.concurrency, seed_log,
+        )
+    lockfile = "package-lock.json" if args.pm == "npm" else "pnpm-lock.yaml"
+    fingerprints = {
+        name: hashlib.sha256((template / name).read_bytes()).hexdigest()
+        for name in ("package.json", lockfile)
+        if (template / name).is_file()
+    }
+    return {
+        "target_fstype": target_type,
+        "prep_fstype": prep_type,
+        "tool_versions": versions,
+        "seed_input_sha256": fingerprints,
+    }
+
+
+def run_repeat(t: cluster.Task, args: argparse.Namespace, repeat: int, binary: str) -> None:
+    """One install round: private sandbox and project, barrier, install, inventory."""
+    manager = args.pm
+    prep = node_prep_dir(t)
+    sandbox = prep / "repeats" / f"repeat-{repeat:04d}" / f"task-{t.index:04d}"
+    source = sandbox / "source"
+    shutil.copytree(prep / "source", source)
+    project = prepare_project(t.task_dir / f"repeat-{repeat:04d}", manager, prep / "template")
+    env = manager_env(manager, args.concurrency, sandbox)
+    if manager == "pnpm":
+        env["XDG_CACHE_HOME"] = str(source / "cache")
+    check_project_placement(project, t.target.path)
+    if args.flush:
+        sync_prepared_project(project, t.target.path)
+    t.node_barrier()
+    if t.leader and args.flush:
+        sync_filesystem()
+    warm_tree(source)
+    if t.index == 0:
+        t.log(f"{manager}: repeat {repeat}/{args.repeats}, {t.count} install(s)")
+    wall, samples = t.batch(
+        install, install_command(manager, binary, source, args.ignore_scripts),
+        project, t.log_dir / f"{manager}-repeat-{repeat:04d}-task-{t.index:04d}.log",
+        env, args.flush, t.node,
+    )
+    trees = t.gather(tree_metrics(project / "node_modules"))
+    if t.index == 0:
+        keys = {"manager": manager, "tasks": t.count, "repeat": repeat}
+        t.emit("batches", keys, batch_metrics(samples, trees, wall, flush=args.flush))
+        for index, sample in enumerate(samples, 1):
+            t.emit("installs", {**keys, "sample": index, "host": sample["host"]},
+                   install_metrics(sample, args.flush))
+    if not args.keep_node_modules:
+        remove_tree(project)
+    remove_tree(sandbox)
+
+
+def task(t: cluster.Task) -> None:
+    """Prepare this machine once, then run every repeat on this task."""
+    args = t.args
+    binary = resolve_tool(getattr(args, f"{args.pm}_bin"), args.pm)
+    info = prepare_node(t) if t.leader else None
+    t.node_barrier()
+    t.node_info(info)
+    if args.seed_only:
+        if t.leader:
+            t.log(f"{args.pm}: seed complete; source retained at {node_prep_dir(t)}")
+        return
+    for repeat in range(1, args.repeats + 1):
+        run_repeat(t, args, repeat, binary)
+    t.node_barrier()
+    if t.leader:
+        remove_tree(node_prep_dir(t).parent)
+
 
 def parse_args(argv: list[str], config: dict[str, Any] = CONFIG) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Offline installation batches; edit CONFIG for experiment settings."
+        description="Offline installs at one external task count; edit CONFIG for "
+                    "experiment settings."
     )
     namespace = argparse.Namespace(**config, **vars(parser.parse_args(argv)))
-    # Duplicate sizes would write rows with identical keys and double-weight the summary.
-    if len(set(namespace.concurrent_jobs)) != len(namespace.concurrent_jobs) or any(
-            count < 1 for count in namespace.concurrent_jobs):
-        die("concurrent_jobs must be distinct positive batch sizes")
+    if namespace.pm not in MANAGERS:
+        die(f"pm must be one of {', '.join(MANAGERS)}: {namespace.pm!r}")
+    if type(namespace.repeats) is not int or namespace.repeats < 1:
+        die(f"repeats must be a positive integer: {namespace.repeats!r}")
+    if type(namespace.concurrency) is not int or namespace.concurrency < 0:
+        die(f"concurrency must be a non-negative integer: {namespace.concurrency!r}")
     return namespace
 
 
@@ -610,77 +648,17 @@ def check_placement(target: Path, prep: Path) -> tuple[str, str]:
     return target_type, prep_type
 
 
-def checked_tools(args: argparse.Namespace, managers: list[str]) -> tuple[dict[str, str], dict[str, str]]:
-    binaries = {manager: resolve_tool(getattr(args, f"{manager}_bin"), manager) for manager in managers}
-    versions = {manager: command_version(binary) for manager, binary in binaries.items()}
+def checked_tools(args: argparse.Namespace) -> tuple[str, dict[str, str]]:
+    """Resolve the manager binary and enforce the pinned versions on this machine."""
+    manager = args.pm
+    binary = resolve_tool(getattr(args, f"{manager}_bin"), manager)
+    versions = {manager: command_version(binary)}
     versions["node"] = command_version(resolve_tool("node", "node"))
     for tool, version in versions.items():
         if version != args.tool_versions[tool]:
             die(f"{tool} version {version} does not match pinned {args.tool_versions[tool]}")
-    return binaries, versions
+    return binary, versions
 
 
 def run(ctx: RunContext, args: argparse.Namespace) -> None:
-    if not Path("/proc/self/mountinfo").is_file():
-        die("npm-install requires Linux; run it inside the benchmark client or Colima")
-    target = ctx.target.path.resolve()
-    prep_root = Path(args.prep_dir).expanduser().resolve()
-    if not prep_root.is_dir():
-        die(f"preparation directory does not exist: {prep_root}")
-    target_type, prep_type = check_placement(target, prep_root)
-    managers = [manager for manager in ("npm", "pnpm") if args.pm in (manager, "both")]
-    binaries, versions = checked_tools(args, managers)
-    prep = prep_root / "agent-fs-bench" / ctx.benchmark / ctx.run_id / ctx.target.name
-    prep.mkdir(parents=True, exist_ok=False)
-    ensure_dir(ctx.result_dir / "logs")
-    fixture = fixture_dir_for(args.fixture)
-    sources, templates, fingerprints = {}, {}, {}
-    for manager in managers:
-        source = ensure_dir(prep / "sources" / manager)
-        template = ensure_dir(prep / "templates" / manager)
-        seed = ensure_dir(prep / "seeds" / manager)
-        if manager == "npm":
-            seed_npm_fixture(
-                binaries[manager], ensure_dir(source / "cache"), seed, template,
-                fixture, args.ignore_scripts, args.concurrency,
-            )
-        else:
-            seed_pnpm_fixture(
-                binaries[manager], ensure_dir(source / "store"), ensure_dir(source / "cache"),
-                seed, template, fixture, args.ignore_scripts, args.concurrency,
-            )
-        lockfile = "package-lock.json" if manager == "npm" else "pnpm-lock.yaml"
-        fingerprints[manager] = {
-            name: hashlib.sha256((template / name).read_bytes()).hexdigest()
-            for name in ("package.json", lockfile)
-            if (template / name).is_file()
-        }
-        sources[manager], templates[manager] = source, template
-    ctx.info.update({
-        "target_fstype": target_type,
-        "prep_fstype": prep_type,
-        "cpu_count": len(os.sched_getaffinity(0)),
-        "tool_versions": {
-            manager: {tool: versions[tool] for tool in ("node", manager)}
-            for manager in managers
-        },
-        "seed_input_sha256": fingerprints,
-    })
-    if args.flush:
-        sync_filesystem()
-    if args.seed_only:
-        log(f"seed complete; sources retained at {prep}")
-        return
-    for manager in managers:
-        for count in args.concurrent_jobs:
-            for repeat in range(1, args.runs + 1):
-                metrics, tasks = run_batch(
-                    ctx, args, manager, binaries[manager], sources[manager],
-                    templates[manager], prep, count, repeat,
-                )
-                keys = {"manager": manager, "concurrent_jobs": count, "repeat": repeat}
-                ctx.emit("batches", keys, metrics)
-                for task in tasks:
-                    ctx.emit("tasks", {**keys, "sample": task["task"]},
-                             task_metrics(task, args.flush))
-    remove_tree(prep)
+    cluster.run_tasks(ctx, args)
