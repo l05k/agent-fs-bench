@@ -34,6 +34,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
+import math
 from pathlib import Path
 import time
 from typing import Any
@@ -44,7 +45,7 @@ from agent_fs_bench.results import PROJECT_ROOT, RunContext
 from .mount_scale_cluster import Worker, parallel
 from .mount_scale_io import CREATE_WRITE, READ, PosixIo
 from .mount_scale_mdtest import VERSION as MDTEST_VERSION, Mdtest, Phase, Rank
-from .mount_scale_mounts import Profile, parse_profile
+from .mount_scale_mounts import CGROUP_CPU_MAX, CGROUP_MEMORY_MAX, Profile, parse_profile
 
 CONFIG = {
     'profiles': PROJECT_ROOT / 'local' / 'mounts.toml',
@@ -57,7 +58,9 @@ CONFIG = {
     'file_size_bytes': 4096,
     'repeats': 3,
     'mdtest': 'mdtest',  # Used only by the explicitly selected K>1 ablation.
-    'command_timeout_s': 300,  # Worker control replies and each mount/unmount command.
+    'command_timeout_s': 360,  # Each mount/unmount command and short worker replies.
+    'lifecycle_timeout_s': 900,  # One worker's complete mount or unmount action.
+    'startup_timeout_s': 180,  # Before all ranks report they started, within job_timeout_s.
     'job_timeout_s': 900,  # Each native MPI job: read, create-write or mdtest.
     'fixture_timeout_s': 1800,  # Per-repeat fixture creation and cleanup control replies.
     'idle_sample_s': 1.0,
@@ -96,17 +99,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument('--directory-smoke', action='store_true',
                         help='Ordinary directories only on one machine; N=2, 32 files, one '
                              'repeat; never read mount profiles or execute mount/unmount.')
+    for name, kind in (('tasks', int), ('repeats', int), ('startup_timeout_s', float),
+                       ('job_timeout_s', float), ('fixture_timeout_s', float)):
+        parser.add_argument('--' + name.replace('_', '-'), type=kind, default=CONFIG[name])
     options = parser.parse_args(argv)
-    values = dict(CONFIG)
+    values = {**CONFIG, **vars(options)}
     if options.directory_smoke:
         values.update(tasks=2, directories=1, files=32, repeats=1, idle_sample_s=0.1)
-    args = argparse.Namespace(**values, directory_smoke=options.directory_smoke)
+    args = argparse.Namespace(**values)
     for name in ('tasks', 'directories', 'files', 'file_size_bytes', 'repeats',
-                 'command_timeout_s', 'job_timeout_s', 'fixture_timeout_s',
-                 'idle_sample_s', 'resource_sample_s'):
+                 'command_timeout_s', 'lifecycle_timeout_s', 'startup_timeout_s',
+                 'job_timeout_s', 'fixture_timeout_s', 'idle_sample_s', 'resource_sample_s'):
         value = getattr(args, name)
-        assert type(value) in (int, float) and value > 0, \
-            f'{name}: expected positive number, measured {value!r}'
+        assert type(value) in (int, float) and math.isfinite(value) and value > 0, \
+            f'{name}: expected positive finite number, measured {value!r}'
+    assert args.startup_timeout_s < args.job_timeout_s, \
+        'startup_timeout_s must be shorter than job_timeout_s'
     return args
 
 
@@ -175,6 +183,8 @@ def load_profile(ctx: RunContext, args: argparse.Namespace) -> tuple[Profile | N
         return None, None
     text = Path(args.profiles).read_text()
     profile = parse_profile(text, ctx.target.name, str(args.profiles))
+    if profile.cgroup and args.directories != 1:
+        raise ValueError('per-client cgroups require directories=1')
     admin = profile.admin_root.resolve()
     assert not (ctx.target.path.resolve().is_relative_to(admin)
                 or ctx.result_dir.resolve().is_relative_to(admin)), \
@@ -192,6 +202,7 @@ def worker_job(ctx: RunContext, args: argparse.Namespace, name: str, data_root: 
         'directories': args.directories, 'idle_sample_s': args.idle_sample_s,
         'resource_sample_s': args.resource_sample_s,
         'command_timeout_s': args.command_timeout_s,
+        'lifecycle_timeout_s': args.lifecycle_timeout_s,
         'fixture_timeout_s': args.fixture_timeout_s,
     }
 
@@ -219,8 +230,8 @@ def start(ctx: RunContext, args: argparse.Namespace, profile: Profile | None,
     return Experiment('directory-smoke' if profile is None else profile.topology, profile,
                       data_root, placement, workers,
                       (None if args.directories == 1 else
-                       Mdtest(args.mdtest, launcher, tag, args.job_timeout_s)),
-                      PosixIo(launcher, args.job_timeout_s))
+                       Mdtest(args.mdtest, launcher, tag, args.job_timeout_s, args.startup_timeout_s)),
+                      PosixIo(launcher, args.job_timeout_s, args.startup_timeout_s))
 
 
 def prepare(ctx: RunContext, args: argparse.Namespace, experiment: Experiment) -> dict[str, Any]:
@@ -231,6 +242,10 @@ def prepare(ctx: RunContext, args: argparse.Namespace, experiment: Experiment) -
         info.update(cache_control='unmount-remount-no-cache-drop',
                     completion='exact-full-file',
                     durability='target-scoped-syncfs-final-batch')
+        if experiment.profile is not None and experiment.profile.cgroup:
+            info['mount_cgroup'] = {'cpu_max': CGROUP_CPU_MAX,
+                                    'memory_max_bytes': CGROUP_MEMORY_MAX,
+                                    'scope': 'userspace-client-and-rank'}
         return info
     assert experiment.engine is not None, 'K>1: expected an mdtest engine'
     digests = cluster.binary_digests(cluster.machines(experiment.placement), ctx.pool.launcher,
@@ -255,7 +270,8 @@ def setup_clients(experiment: Experiment, repeat: int) -> tuple[list[Rank], list
             'setup', repeat=repeat, clients=shares[worker.name], total_clients=count),
             experiment.workers))
     ranks = [Rank(worker.node, Path(client['workspace']),
-                  tuple(Path(path) for path in client['shared']))
+                  tuple(Path(path) for path in client['shared']),
+                  Path(client['cgroup']) if client['cgroup'] is not None else None)
              for worker, setup in zip(experiment.workers, setups) for client in setup['clients']]
     return ranks, [setup['baseline'] for setup in setups]
 
@@ -427,6 +443,6 @@ def run(ctx: RunContext, args: argparse.Namespace) -> None:
     for number in range(1, args.repeats + 1):
         result = measure_repeat(ctx, args, experiment, number)
         validate_repeat(experiment, result)
-        write_repeat(ctx, args, experiment, result)
         clean_repeat(experiment, result)
+        write_repeat(ctx, args, experiment, result)
     finish(experiment)

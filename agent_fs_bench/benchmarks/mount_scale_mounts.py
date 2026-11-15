@@ -1,4 +1,4 @@
-"""Mount lifecycle for the single-host mount-scaling benchmark.
+"""Mount lifecycle for each worker in the mount-scaling benchmark.
 
 Profile commands are literal argv templates run concurrently per client, then
 checked through mountinfo and per-agent sentinels; no shell, sudo or cleanup.
@@ -7,6 +7,7 @@ checked through mountinfo and per-agent sentinels; no shell, sudo or cleanup.
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import re
 import secrets
 import subprocess
@@ -21,6 +22,9 @@ SHARED_DIRECTORY = "shared-directory"
 _TOPOLOGIES = {MULTI_MOUNT, SHARED_DIRECTORY}
 _MOUNTINFO = "/proc/self/mountinfo"
 _UNESCAPE = re.compile(r"\\([0-7]{3})")
+CGROUP_ROOT = Path('/sys/fs/cgroup/agent-fs-bench')
+CGROUP_CPU_MAX = '100000 100000'
+CGROUP_MEMORY_MAX = 2 * 1024**3
 
 
 @dataclass(frozen=True)
@@ -30,12 +34,14 @@ class Profile:
     private_mount: tuple[str, ...] = ()
     shared_mount: tuple[str, ...] = ()
     unmount: tuple[str, ...] = ()
+    cgroup: bool = False
 
 
 @dataclass(frozen=True)
 class Client:
     workspace: Path
     shared: tuple[Path, ...]
+    cgroup: Path | None = None
 
 
 def parse_profile(text: str, target_name: str, source: str = "mounts.toml") -> Profile:
@@ -45,6 +51,13 @@ def parse_profile(text: str, target_name: str, source: str = "mounts.toml") -> P
     it on its own machine.
     """
     table = tomllib.loads(text)["profiles"][target_name]
+    unknown = table.keys() - {'topology', 'admin_root', 'private_mount', 'shared_mount',
+                            'unmount', 'cgroup'}
+    if unknown:
+        raise ValueError(f'{source}: unknown profile keys {sorted(unknown)}')
+    cgroup = table.get('cgroup', False)
+    if type(cgroup) is not bool:
+        raise ValueError(f'{source}: cgroup must be a TOML boolean')
     topology = table["topology"]
     if topology not in _TOPOLOGIES:
         raise ValueError(f"{source}: topology must be {MULTI_MOUNT} or {SHARED_DIRECTORY}")
@@ -65,6 +78,7 @@ def parse_profile(text: str, target_name: str, source: str = "mounts.toml") -> P
         private_mount=command("private_mount", True),
         shared_mount=command("shared_mount", topology == MULTI_MOUNT),
         unmount=command("unmount", True),
+        cgroup=cgroup,
     )
 
 
@@ -98,10 +112,10 @@ def _run(argv: list[str], log_path: Path, timeout_s: float) -> None:
                 argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
                 text=True, timeout=timeout_s,
             )
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
         raise RuntimeError(
             f'command exceeded {timeout_s:g}s; inspect {log_path.parent}'
-        ) from exc
+        ) from None
     if completed.returncode:
         raise RuntimeError(
             f'command exited with status {completed.returncode}; '
@@ -131,6 +145,8 @@ class Layout:
             or not all(path.is_dir() for path in shared)
         ):
             raise ValueError("work_dir, data_root and shared_paths must exist")
+        if profile.cgroup and shared:
+            raise ValueError('per-client cgroups require directories=1')
         admin = profile.admin_root.resolve()
         work = work_dir.resolve()
         if _inside(work, admin) or _inside(admin, work):
@@ -169,9 +185,13 @@ class Layout:
                 (local_root / "workspace").mkdir()
                 for path in shared_dirs:
                     path.mkdir()
-            client_values.append(Client(local_root / "workspace", tuple(shared_dirs)))
-            self.mountpoints += ([local_root / "workspace", *shared_dirs]
-                                 if multi else [local_root])
+            mountpoint = local_root / 'workspace' if multi else local_root
+            cgroup = None
+            if profile.cgroup:
+                digest = hashlib.sha256(str(mountpoint.resolve()).encode()).hexdigest()
+                cgroup = CGROUP_ROOT / digest[:20]
+            client_values.append(Client(local_root / 'workspace', tuple(shared_dirs), cgroup))
+            self.mountpoints.extend([mountpoint, *shared_dirs] if multi else [mountpoint])
         self.clients = tuple(client_values)
         self._write_sentinels()
 
@@ -239,7 +259,20 @@ class Layout:
                 + (f"; missing {missing}" if missing else "")
             )
         self._check_aliases()
+        for client in self.clients:
+            if client.cgroup is not None:
+                self._check_cgroup(client.cgroup)
         return {"measured_mounts": len(scope)}
+
+    @staticmethod
+    def _check_cgroup(path: Path) -> None:
+        cpu = (path / 'cpu.max').read_text().strip()
+        memory = (path / 'memory.max').read_text().strip()
+        if (cpu, memory) != (CGROUP_CPU_MAX, str(CGROUP_MEMORY_MAX)):
+            raise RuntimeError(f'{path}: expected 1 CPU / 2 GiB, measured cpu.max={cpu!r}, '
+                               f'memory.max={memory!r}')
+        if not (path / 'cgroup.procs').read_text().strip():
+            raise RuntimeError(f'{path}: no mount client process in cgroup')
 
     def unmount(self) -> dict[str, int | float]:
         """Run every client's unmount commands in reverse, then verify."""
@@ -255,6 +288,9 @@ class Layout:
                 f"unmount verification failed: {len(remaining)} mountpoint(s) "
                 f"remain; inspect {self.work_dir} and {self.data_root}"
             )
+        for client in self.clients:
+            if client.cgroup is not None and client.cgroup.exists():
+                raise RuntimeError(f'per-client cgroup remains after unmount: {client.cgroup}')
         self._mounted = False
         self._before = None
         return {"unmount_elapsed_s": wall, "remaining_mounts": 0}

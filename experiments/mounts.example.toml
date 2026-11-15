@@ -10,6 +10,9 @@
 # The canonical paper scenario uses directories = 1 (K=1): one real backend mount
 # and one private set per agent. The commands below then expose exactly one mount.
 # K>1 profiles are an explicitly selected shared-scope ablation, not the default.
+# cgroup = true is only for the separate K=1 FUSE resource ablation. The site's
+# mount/unmount wrappers must create/enter/remove the per-client leaf; see
+# docs/bench-mount-scale.md. Leave it unset for the main comparison.
 
 [profiles.nfs]
 topology = "multi-mount"

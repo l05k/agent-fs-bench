@@ -1,6 +1,6 @@
 # Markdown 单文档实验结果交换
 
-代码、方案和站点配置通过 GitHub 传递；测试机上的原始数据留在原位。只有**核实后的提取结果**通过一份 Markdown 回传，写入机导入后分析和画图。工具不执行命令、不接触原始样本、不重新计算统计量。
+代码、方案和模板通过 GitHub 传递；站点配置和原始数据留在测试机。只有**核实后的提取结果**通过一份 Markdown 回传，写入机导入后分析和画图。工具不执行命令、不接触原始样本、不重新计算统计量。
 
 ## 1. 什么允许过通道
 
@@ -32,7 +32,7 @@ flowchart LR
 - `x`：横轴取值；折线图用数值字符串（如 `64`），柱状图用 `all`。
 - `metric`：指标名，同一组内保持一致（如 `aggregate_files_per_s`、`latency_s`、`paired_tool_time_ratio_to_ext4`）。
 - `median`、`q1`、`q3`：在**预先声明的聚合单位**上计算的分位数；必须满足 `q1 <= median <= q3`。
-- `n`：支撑该行的独立观测数。`n=1` 合法，但论文中要按单样本处理，不得画出虚假误差条。
+- `n`：支撑该行的独立观测数。`n=1` 时必须有 `q1 = median = q3`；论文不画误差条。
 
 约束：
 
@@ -107,9 +107,10 @@ replay,Apsara,divergence,1
 replay,NAS,capture_missing,3
 ```
 
-- `group`/`series` 必须存在于摘要组；`label` 是单一 ASCII token（如 `timeout`、`divergence`、`error`、`capture_missing`、`incomplete`）。
+- `group` 与 `series` 必须由冻结方案定义，但不要求有数字行：某个系列或某个组可能全部失败。`group` 和 `label` 是 ASCII token（如 `timeout`、`divergence`、`error`、`capture_missing`、`incomplete`）；`series` 非空。
 - `count` 是规范的非负整数；同一 `(group, series, label)` 只出现一次。
 - 即使没有任何失败，也要有表头，禁止用“未观察到失败”的口头声明代替。
+- 整批无有效数值时，只交 `plan.md`、`execution.md`、`summary/failures.csv`，至少有一条正失败计数。不要写空摘要对或虚构数字。
 - 失败账目是**样本数之外的**计划观测；不得把失败数加进摘要分母来制造成功表。
 
 ## 4. 导出 / 导入
@@ -169,7 +170,7 @@ python3 -m agent_fs_bench.exchange import \
 导出前：
 
 - [ ] `plan.md` 是冻结原文；`execution.md` 记录实际命令、配置、偏离、失败和提取公式。
-- [ ] 每个计划比较组都有 `<group>.csv` + `<group>.json`；每个计划 run/target 都在摘要或失败账目中。
+- [ ] 有有效值的组都有 `<group>.csv` + `<group>.json`；每个计划 run/target 都在摘要或失败账目中，零有效值的组只进失败账目。
 - [ ] `q1 <= median <= q3`，`n >= 1`，行为有限数；系列顺序已定；`source_runs` 均可追溯。
 - [ ] `failures.csv` 有表头，所有失败/超时/发散/缺失都已计数，没有补零或替换样本。
 - [ ] 原始逐样本、日志、cassette、模型响应没有进入 staging；没有隐藏文件或符号链接。

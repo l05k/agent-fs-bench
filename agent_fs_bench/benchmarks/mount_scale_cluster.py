@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import platform
-from queue import Queue
+from queue import Empty, Queue
 import shlex
 import shutil
 import subprocess
@@ -27,7 +27,7 @@ import time
 from agent_fs_bench import cluster
 from agent_fs_bench.results import PROJECT_ROOT
 from agent_fs_bench.ssh import ssh_argv
-from .mount_scale_mounts import Client, Layout, parse_profile
+from .mount_scale_mounts import CGROUP_ROOT, Client, Layout, parse_profile
 from . import mount_scale_io as io
 from . import mount_scale_resources as resources
 
@@ -68,7 +68,7 @@ class Worker:
         self._replies: Queue[str | None] = Queue()
         threading.Thread(target=self._read, daemon=True).start()
         self._send(job)
-        self._reply(timeout_s)
+        self._reply('preflight', timeout_s)
 
     def _read(self) -> None:
         for line in self.process.stdout:
@@ -79,19 +79,25 @@ class Worker:
         self.process.stdin.write(json.dumps(value) + '\n')
         self.process.stdin.flush()
 
-    def _reply(self, timeout_s: float) -> dict:
-        line = self._replies.get(timeout=timeout_s)
-        assert line is not None, f'{self.name} worker reply: expected a result, measured exit; ' \
-                                 f'inspect {self.diagnostic_dir}/worker.stderr.txt'
+    def _reply(self, action: str, timeout_s: float) -> dict:
+        stderr = self.diagnostic_dir / 'worker.stderr.txt'
+        try:
+            line = self._replies.get(timeout=timeout_s)
+        except Empty:
+            raise RuntimeError(f'{self.name} worker {action} exceeded {timeout_s:g}s; '
+                               f'inspect {stderr}') from None
+        assert line is not None, f'{self.name} worker exited during {action}; inspect {stderr}'
         return json.loads(line)
 
     def call(self, action: str, **data) -> dict:
         self._send({'action': action, **data})
-        steps = self.job['directories'] if action in ('mount', 'unmount') else 1
-        timeout_s = (self.job['fixture_timeout_s']
-                     if action in ('prepare-read', 'cleanup', 'remove-data')
-                     else self.timeout_s * steps)
-        return self._reply(timeout_s)
+        if action in ('mount', 'unmount'):
+            timeout_s = self.job['lifecycle_timeout_s']
+        elif action in ('prepare-read', 'cleanup', 'remove-repeat', 'remove-data'):
+            timeout_s = self.job['fixture_timeout_s']
+        else:
+            timeout_s = self.timeout_s
+        return self._reply(action, timeout_s)
 
     def collect(self) -> None:
         for relative, content in self.call('diagnostics').items():
@@ -112,11 +118,16 @@ def preflight(job: dict) -> None:
     staging = Path(job['staging'])
     assert staging.is_dir(), f'staging: expected an existing directory, measured {staging}'
     if not job['directory_smoke']:
-        admin = parse_profile(job['profile'], job['target']).admin_root
+        profile = parse_profile(job['profile'], job['target'])
+        admin = profile.admin_root
         assert admin.is_dir(), f'admin_root: expected mounted here, measured {admin}'
         assert not (staging.resolve().is_relative_to(admin.resolve())
                     or admin.resolve().is_relative_to(staging.resolve())), \
             f'staging: expected outside admin_root {admin}, measured {staging}'
+        if profile.cgroup:
+            controllers = (CGROUP_ROOT / 'cgroup.subtree_control').read_text().split()
+            if not {'cpu', 'memory'} <= set(controllers):
+                raise RuntimeError(f'{CGROUP_ROOT}: enable both cgroup v2 cpu and memory controllers')
 
 
 class Lifecycle:
@@ -243,7 +254,9 @@ class Lifecycle:
         self.clients = tuple(aliases)
         baseline = idle(self.job['idle_sample_s'])
         return {'clients': [{'workspace': str(client.workspace),
-                             'shared': [str(p) for p in client.shared]} for client in aliases],
+                             'shared': [str(p) for p in client.shared],
+                             'cgroup': str(client.cgroup) if client.cgroup is not None else None}
+                            for client in aliases],
                 'baseline': baseline}
 
 

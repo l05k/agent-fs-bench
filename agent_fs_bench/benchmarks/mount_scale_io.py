@@ -160,6 +160,7 @@ class PosixIo:
 
     launcher: cluster.Launcher
     timeout_s: float
+    startup_timeout_s: float
 
     def measure(self, label: str, ranks: Sequence[Rank], mode: str, files: int, size: int,
                 log_dir: Path) -> Phase:
@@ -168,8 +169,12 @@ class PosixIo:
                      'agent_fs_bench.benchmarks.mount_scale_io',
                      '--mode', mode, '--path', str(rank.workspace / SUBDIRECTORY[mode]),
                      '--files', str(files), '--bytes', str(size)] for rank in ranks]
+        for program, rank in zip(programs, ranks):
+            if rank.cgroup is not None:
+                program.extend(('--cgroup', str(rank.cgroup)))
         run = cluster.run_program(tuple(rank.node for rank in ranks), self.launcher, programs,
-                                  log_dir, label, timeout_s=self.timeout_s)
+                                  log_dir, label, timeout_s=self.timeout_s,
+                                  startup_timeout_s=self.startup_timeout_s)
         cluster.validate_exit(run)
         return parse_batch(label, run.stdout, len(ranks), mode, files, size)
 
@@ -180,6 +185,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument('--path', required=True)
     parser.add_argument('--files', type=int, required=True)
     parser.add_argument('--bytes', type=int, required=True)
+    parser.add_argument('--cgroup', type=Path)
     args = parser.parse_args(argv)
     assert args.files >= 1 and args.bytes >= 1, \
         f'batch size: expected positive files and bytes, measured {args.files}, {args.bytes}'
@@ -188,6 +194,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str]) -> int:
     options = parse_args(argv)
+    if options.cgroup is not None:
+        (options.cgroup / 'cgroup.procs').write_text(str(os.getpid()), encoding='ascii')
+    cluster.report_rank_start()
+
     from mpi4py import MPI
 
     world = MPI.COMM_WORLD

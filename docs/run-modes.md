@@ -20,6 +20,7 @@ simultaneous independent tasks (mdtest ranks, clone requests, npm installs, work
 instances, mount-scale clients). It is one value per run; draw a curve over N from
 several runs pooled with `plot --vary tasks`. `mode` is part of `config.json`'s `config`,
 so runs of different modes pool only with `--vary mode`.
+`mount-scale` can override `tasks` at invocation time with `-- --tasks N`.
 
 ## Machines
 

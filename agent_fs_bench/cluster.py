@@ -83,7 +83,7 @@ MPI_OPTIONS = ('--mca', 'pml', 'ob1', '--mca', 'btl', 'self,vader,tcp',
                '--mca', 'mpi_yield_when_idle', '1')
 
 MESSAGE_PREFIX = 'AFB'
-MESSAGE_KINDS = ('row', 'info', 'node', 'placement', 'log', 'done')
+MESSAGE_KINDS = ('row', 'info', 'node', 'placement', 'log', 'done', 'started')
 
 
 def encode_message(kind: str, payload: Any) -> str:
@@ -96,6 +96,12 @@ def decode_message(line: str) -> tuple[str, Any] | None:
         return None
     kind, _, payload = rest.rstrip('\n').partition(' ')
     return kind, json.loads(payload)
+
+
+def report_rank_start() -> None:
+    """Report Open MPI spawn before MPI_Init, which can wait for absent ranks."""
+    rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
+    print(encode_message('started', (rank, socket.gethostname())), end='', flush=True)
 
 
 @dataclass(frozen=True)
@@ -275,34 +281,51 @@ class ProgramRun:
 
 def run_program(placement: Placement, launcher: Launcher, programs: Sequence[Sequence[str]],
                 log_dir: Path, label: str, stdin: str = '',
-                timeout_s: float | None = None) -> ProgramRun:
+                timeout_s: float | None = None,
+                startup_timeout_s: float | None = None) -> ProgramRun:
     """Run one MPI job (one program per rank); keep appfile, stdout and stderr in `log_dir`.
 
-    Progress messages of task 0 are printed while the job runs. With `timeout_s`, the
-    launcher process group is killed and the job fails instead of returning a run.
+    With `startup_timeout_s`, every program must report its rank and host before
+    MPI_Init. The startup and total job deadlines both kill the launcher group.
     """
     assert timeout_s is None or timeout_s > 0, \
         f'{label} timeout: expected positive seconds or None, measured {timeout_s!r}'
+    assert startup_timeout_s is None or (timeout_s is not None and
+                                         0 < startup_timeout_s < timeout_s), \
+        f'{label}: startup timeout must be positive and shorter than the MPI job timeout'
     log_dir.mkdir(parents=True, exist_ok=True)
     appfile_path, stderr_path = log_dir / f'{label}.appfile', log_dir / f'{label}.stderr.txt'
     appfile_path.write_text(appfile(placement, [list(map(str, p)) for p in programs]))
-    lines = []
-    timed_out = threading.Event()
+    lines: list[str] = []
+    pending = set(range(len(placement))) if startup_timeout_s is not None else None
+    deadline_lock = threading.Lock()
+    expired = None
 
     def stop() -> None:
-        timed_out.set()
         try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
+            if timeout_s is not None:
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
             pass
+
+    def expire(kind: str) -> None:
+        nonlocal expired
+        with deadline_lock:
+            if expired is None and (kind == 'job' or pending):
+                expired = kind
+                stop()
 
     with stderr_path.open('w') as stderr:
         process = subprocess.Popen(mpiexec_argv(placement, launcher, appfile_path),
                                    cwd=PROJECT_ROOT, stdin=subprocess.PIPE,
                                    stdout=subprocess.PIPE, stderr=stderr, text=True, bufsize=1,
                                    start_new_session=timeout_s is not None)
-        timer = threading.Timer(timeout_s, stop) if timeout_s is not None else None
-        if timer is not None:
+        timers = [threading.Timer(seconds, expire, (kind,))
+                  for kind, seconds in (('job', timeout_s), ('startup', startup_timeout_s))
+                  if seconds is not None]
+        for timer in timers:
             timer.start()
         try:
             process.stdin.write(stdin)
@@ -310,18 +333,44 @@ def run_program(placement: Placement, launcher: Launcher, programs: Sequence[Seq
             for line in process.stdout:
                 lines.append(line)
                 message = decode_message(line)
-                if message is not None and message[0] == 'log':
-                    print(f'  {message[1]}', flush=True)
+                if message is None:
+                    continue
+                kind, payload = message
+                if kind == 'log':
+                    print(f'  {payload}', flush=True)
+                elif kind == 'started' and pending is not None:
+                    rank, host = payload
+                    with deadline_lock:
+                        if expired is not None:
+                            continue
+                        if type(rank) is not int or rank not in pending:
+                            raise RuntimeError(f'{label}: duplicate or unexpected MPI rank {rank!r}')
+                        expected = placement[rank].hostname
+                        if host != expected:
+                            raise RuntimeError(f'{label} MPI rank {rank}: expected host {expected!r}, '
+                                               f'measured {host!r}')
+                        pending.remove(rank)
             returncode = process.wait()
+        except BaseException:
+            stop()
+            process.wait()
+            raise
         finally:
-            if timer is not None:
+            for timer in timers:
                 timer.cancel()
+                timer.join()
             process.stdout.close()
-    stdout = ''.join(lines)
-    (log_dir / f'{label}.stdout.txt').write_text(stdout)
-    if timed_out.is_set():
-        raise RuntimeError(f'{label} MPI job exceeded {timeout_s:g}s; '
-                           f'inspect {stderr_path}')
+            stdout = ''.join(lines)
+            (log_dir / f'{label}.stdout.txt').write_text(stdout)
+    if expired == 'job':
+        raise RuntimeError(f'{label} MPI job exceeded {timeout_s:g}s; inspect {stderr_path}')
+    if pending:
+        missing = Counter(placement[rank].name for rank in sorted(pending))
+        status = (f'exceeded {startup_timeout_s:g}s' if expired == 'startup'
+                  else f'exited with status {returncode}')
+        raise RuntimeError(f'{label} MPI startup {status}: '
+                           f'{len(placement) - len(pending)}/{len(placement)} ranks started; '
+                           f'missing by host {dict(missing)}; inspect {stderr_path}')
     return ProgramRun(label, returncode, stdout, stderr_path)
 
 
@@ -571,6 +620,9 @@ def main(argv: list[str]) -> int:
         return probe_main()
     if argv[0] == 'task':
         return task_main()
+    if argv[0] == 'rank-exec':
+        report_rank_start()
+        os.execvp(argv[1], argv[1:])
     return digest_main(argv[1])
 
 

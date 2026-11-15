@@ -79,6 +79,20 @@ class MountTopologyTests(unittest.TestCase):
                        log_dir=root / 'logs', timeout_s=5)
             self.assertFalse((outside / 'agent-0000').exists())
 
+    def test_existing_but_unbounded_mount_cgroup_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            leaf = Path(directory)
+            (leaf / 'cpu.max').write_text('100000 100000\n')
+            (leaf / 'memory.max').write_text('max\n')
+            (leaf / 'cgroup.procs').write_text('42\n')
+            with self.assertRaisesRegex(RuntimeError, 'expected 1 CPU / 2 GiB'):
+                Layout._check_cgroup(leaf)
+
+            (leaf / 'memory.max').write_text('2147483648\n')
+            (leaf / 'cgroup.procs').write_text('')
+            with self.assertRaisesRegex(RuntimeError, 'no mount client process'):
+                Layout._check_cgroup(leaf)
+
 
 @unittest.skipUnless(hasattr(os, 'fork'), 'requires POSIX daemon behavior')
 class LifecycleCommandTests(unittest.TestCase):

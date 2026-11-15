@@ -57,6 +57,31 @@ class ExchangeTests(unittest.TestCase):
                                         'summary/replay.csv', 'summary/replay.json'))]
         self.assertEqual(json.loads((self.destination / 'exchange.json').read_text())['files'], expected)
 
+    def test_entirely_failed_batch_has_no_fabricated_points(self):
+        (self.stage / 'summary' / 'replay.csv').unlink()
+        (self.stage / 'summary' / 'replay.json').unlink()
+        ledger = self.stage / 'summary' / 'failures.csv'
+        export_packet(self.stage, self.packet, batch='no-successes')
+        import_packet(self.packet, self.destination)
+        self.assertEqual(list((self.destination / 'summary').iterdir()),
+                         [self.destination / 'summary' / 'failures.csv'])
+        self.assertEqual((self.destination / 'summary' / 'failures.csv').read_bytes(),
+                         ledger.read_bytes())
+
+    def test_failed_series_without_a_numeric_row_survives_round_trip(self):
+        self.write_group('replay', [('Apsara', 'all', 'paired_tool_time_ratio_to_ext4',
+                                    0.62, 0.55, 0.80, 88)])
+        export_packet(self.stage, self.packet, batch='partial-success')
+        import_packet(self.packet, self.destination)
+        self.assertIn('replay,NAS,divergence,2\n',
+                      (self.destination / 'summary' / 'failures.csv').read_text())
+
+    def test_single_observation_cannot_claim_a_nonzero_iqr(self):
+        self.write_group('replay', [('Apsara', 'all', 'x', 1.0, 0.9, 1.1, 1)])
+        with self.assertRaisesRegex(ValueError, 'n=1 requires'):
+            export_packet(self.stage, self.packet, batch='invented-spread')
+        self.assertFalse(self.packet.exists())
+
     def test_raw_per_sample_results_are_not_an_exchange_artifact(self):
         raw = self.stage / 'results' / 'mdtest' / 'run-a'
         raw.mkdir(parents=True)

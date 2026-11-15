@@ -66,7 +66,7 @@ def _summary(text: str, name: str) -> list[str]:
     if not rows:
         raise ValueError(f'{name}: no summary rows')
     for index, row in enumerate(rows, 2):
-        if any(value is None for value in row.values()):
+        if None in row or None in row.values():
             raise ValueError(f'{name}:{index}: row width differs from the header')
         key = row['series'], row['x'], row['metric']
         if any(not part.strip() for part in key):
@@ -84,6 +84,8 @@ def _summary(text: str, name: str) -> list[str]:
             raise ValueError(f'{name}:{index}: n must be an integer, measured {row["n"]!r}') from None
         if count < 1 or str(count) != row['n']:
             raise ValueError(f'{name}:{index}: n must be a positive canonical integer')
+        if count == 1 and not q1 == median == q3:
+            raise ValueError(f'{name}:{index}: n=1 requires q1 = median = q3')
     return list(dict.fromkeys(row['series'] for row in rows))
 
 
@@ -114,17 +116,18 @@ def _meta(text: str, name: str, rows: list[str]) -> None:
         raise ValueError(f'{name}: series_order must equal the CSV first-appearance order')
 
 
-def _failures(text: str, groups: set[str], series: dict[str, list[str]]) -> None:
+def _failures(text: str) -> bool:
     reader = csv.DictReader(io.StringIO(text, newline=''), strict=True)
     if tuple(reader.fieldnames or ()) != FAILURE_COLUMNS:
         raise ValueError(f'summary/failures.csv: columns must be {",".join(FAILURE_COLUMNS)}')
     keys = set()
+    observed = False
     for index, row in enumerate(reader, 2):
-        if any(value is None for value in row.values()):
+        if None in row or None in row.values():
             raise ValueError(f'summary/failures.csv:{index}: row width differs from the header')
         group, label = row['group'], row['label']
-        if group not in groups or row['series'] not in series[group]:
-            raise ValueError(f'summary/failures.csv:{index}: unknown group or series')
+        if not TOKEN.fullmatch(group) or not row['series'].strip():
+            raise ValueError(f'summary/failures.csv:{index}: expected a group token and series')
         if not TOKEN.fullmatch(label):
             raise ValueError(f'summary/failures.csv:{index}: label must be one ASCII token')
         if (group, row['series'], label) in keys:
@@ -136,6 +139,8 @@ def _failures(text: str, groups: set[str], series: dict[str, list[str]]) -> None
             raise ValueError(f'summary/failures.csv:{index}: count must be an integer') from None
         if count < 0 or str(count) != row['count']:
             raise ValueError(f'summary/failures.csv:{index}: count must be a canonical nonnegative integer')
+        observed |= count > 0
+    return observed
 
 
 def _validate(files: dict[str, str]) -> None:
@@ -149,23 +154,21 @@ def _validate(files: dict[str, str]) -> None:
     groups = {PurePosixPath(name).stem for name in files
               if name.startswith('summary/') and name.endswith('.csv')
               and name != 'summary/failures.csv'}
-    if not groups:
-        raise ValueError('A packet needs at least one summary/<group> pair')
+    if 'summary/failures.csv' not in files:
+        raise ValueError('A packet needs summary/failures.csv, even with only a header')
     expected = {'plan.md', 'execution.md', 'summary/failures.csv'}
     expected |= {f'summary/{group}.{suffix}' for group in groups for suffix in ('csv', 'json')}
     unexpected = sorted(set(files) - expected)
     if unexpected:
         raise ValueError(f'Undeclared exchange artifacts: {unexpected}')
-    series = {}
+    has_failures = _failures(files['summary/failures.csv'])
+    if not groups and not has_failures:
+        raise ValueError('A packet needs a summary/<group> pair or a positive failure count')
     for group in groups:
         csv_name, meta_name = f'summary/{group}.csv', f'summary/{group}.json'
         if csv_name not in files or meta_name not in files:
             raise ValueError(f'{group}: summary needs both .csv and .json')
-        series[group] = _summary(files[csv_name], csv_name)
-        _meta(files[meta_name], meta_name, series[group])
-    if 'summary/failures.csv' not in files:
-        raise ValueError('A packet needs summary/failures.csv, even with only a header')
-    _failures(files['summary/failures.csv'], groups, series)
+        _meta(files[meta_name], meta_name, _summary(files[csv_name], csv_name))
 
 
 def _manifest(batch: str, files: dict[str, str]) -> dict:

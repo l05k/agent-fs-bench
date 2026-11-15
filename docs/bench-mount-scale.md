@@ -80,8 +80,9 @@ make -j
 
 ## Configuration and runs
 
-Experiment parameters live in `CONFIG` at the top of `mount_scale.py`; there are no
-scaling or fault-tolerance CLI flags.
+Pass `--tasks`, `--repeats`, `--startup-timeout-s`, `--job-timeout-s` and
+`--fixture-timeout-s` after `--` for an experiment. Other parameters live in `CONFIG`
+at the top of `mount_scale.py`.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -92,7 +93,9 @@ scaling or fault-tolerance CLI flags.
 | `file_size_bytes` | `4096` | Bytes per file |
 | `repeats` | `3` | Complete repetitions at the same N |
 | `mdtest` | `mdtest` | Upstream binary used only by the K>1 ablation |
-| `command_timeout_s` | `300` | Worker control replies and each mount/unmount command |
+| `command_timeout_s` | `360` | Each mount/unmount command and short worker replies |
+| `lifecycle_timeout_s` | `900` | Each worker's full mount/unmount action, including verification |
+| `startup_timeout_s` | `180` | Deadline for every MPI rank to report its rank and planned host before `MPI_Init` |
 | `job_timeout_s` | `900` | Each native MPI job: read, create-write or ablation mdtest |
 | `fixture_timeout_s` | `1800` | Per-repeat read-fixture preparation and cleanup control replies |
 | `idle_sample_s` | `1.0` | Machine idle sampling duration for baseline/mounted/released |
@@ -153,11 +156,21 @@ released. With K=1 the LakeBase profile must omit the empty `--bind` argument; t
 variant in the example file adds it. The canonical read fixture travels through the first
 mount, so the read phase starts after an unmount/remount boundary.
 
+For a K=1 FUSE resource ablation, set `cgroup = true` in both arms' profiles and
+use site-owned mount/unmount wrappers. Before starting the FUSE daemon, the mount
+wrapper must put it in `/sys/fs/cgroup/agent-fs-bench/<sha256(resolved mountpoint)[:20]>`
+with `cpu.max = 100000 100000` and `memory.max = 2147483648`. The site enables CPU
+and memory controllers at that root; the unmount wrapper removes the leaf after the
+daemon has exited. The harness checks both limits and a nonempty process list on each
+mount, moves the measured rank into the same leaf before MPI initialization, and
+rejects leftover leaves after unmount. Fixture preparation is outside that rank's
+budget. Do not apply this profile to a kernel filesystem client.
+
 ```sh
-uv run python -m agent_fs_bench run mount-scale --mode local --target cephfs
+uv run python -m agent_fs_bench run mount-scale --mode remote --target cephfs -- --tasks 768 --repeats 3
 uv run python -m agent_fs_bench run mount-scale --mode local --target lakebase
 
-# Two clients, ordinary directories, 32 files, one repeat; reads no profile and mounts nothing.
+# Two clients, ordinary directories, 32 files, one repeat; mounts nothing.
 uv run python -m agent_fs_bench run mount-scale --mode local \
   --dirs /tmp/mdtest-directory-smoke -- --directory-smoke
 ```
@@ -193,15 +206,17 @@ storage-performance evidence.
    filesystem containing each client's target; when mounts share a superblock it may
    persist other clients' pending writes too.
 6. Stop resource sampling, unmount concurrently in reverse order on each machine, verify
-   no residue, and sample released-idle. On success, emit the repeat's results and delete
-   the unmounted private data and empty repeat directory. After all repeats succeed,
+   no residue, sample released-idle, and delete the unmounted private data and empty
+   repeat directory. Only then emit the repeat's results. After all repeats succeed,
    collect lifecycle logs and delete the run's data.
 
-The canonical MPI jobs use `cluster.run_program` with `job_timeout_s` applied to the
-launcher process group. A timeout, nonzero exit, short read/write count,
-missing file, failed `sync -f`, or nonfinite timing fails the run. A failed or incomplete
-batch emits **no** throughput row. Mounting, fixture preparation and cleanup never enter a
-phase timer.
+The launcher checks a startup report from each planned rank before `MPI_Init`. A missed
+startup deadline fails with the missing rank count per host; a duplicate or misplaced
+rank fails immediately. This is separate from the full `job_timeout_s` deadline, which
+also bounds hangs after all ranks have spawned. Both deadlines terminate the local MPI
+launcher process group, retaining stdout and stderr. A timeout, nonzero exit, short
+read/write count, missing file, failed `sync -f`, or nonfinite timing fails the repeat
+without emitting throughput. Mounting, fixture preparation and cleanup are untimed.
 
 A failure stops the run and leaves mounts and data in place for inspection: no automatic
 unmount, retry, failover or shrinking to a smaller N.
@@ -281,9 +296,8 @@ with `uv run python -m agent_fs_bench plot <run-dir>...`.
 | `memory-delta-<topology>` | `resource_deltas` | tasks | used_bytes_delta for `mounted-idle` | topology |
 
 Each run measures one N, so its default figures hold one x point. Pool separate N runs
-with `uv run python -m agent_fs_bench plot <run-N1> <run-N2>... --vary tasks`. All other
-configuration, the mode and the source fingerprint must match; the fingerprint ignores
-each module's `CONFIG` literal, so editing `CONFIG['tasks']` between runs is fine.
+with `uv run python -m agent_fs_bench plot <run-N1> <run-N2>... --vary tasks`. Keep
+all other measurement settings, the mode and the source fingerprint fixed.
 
 Resources come from **whole-machine counters on each machine**: CPU busy, MemTotal−
 MemAvailable, cache, dirty, slab and mount entries. They include Python, MPI, daemons, the
@@ -312,11 +326,10 @@ namespace, so a daemon must create mounts in that namespace.
 
 ## Validation performed
 
-No post-change smoke run was performed while preparing this revision. The previous
-implementation's directory and two-lab-server smokes validated its mount/lifecycle
-harness but used the previous four-phase private workload; they are not evidence for the
-read/create-write path. The directory smoke is still only a harness check, not storage
-performance data.
+The K=1 directory smoke on Linux with Open MPI 4.1.8 started both ranks and verified
+64 complete files in each of the read and create-write batches. It checks local MPI
+startup, I/O and cleanup, not real backend mounts, cgroups, multi-host placement or
+storage performance.
 
 ## References
 
