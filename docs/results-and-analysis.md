@@ -14,6 +14,11 @@ may leave partial rows in the CSV when a target fails. Python MPI workloads
 publish rows only after the job completes. Replay has a separate `outcomes`
 table for planned failures and emits no latency for those trials.
 
+For a copy/paste-only test machine, use the [Markdown exchange workflow](markdown-exchange.md).
+Import restores these same run directories; run `plot` or `replay_report` only
+after transfer. Historical data stays under `legacy/` until its measurement
+contract has been reviewed, never silently converted to current results.
+
 ## config.json
 
 | Field | Meaning |

@@ -19,8 +19,8 @@ uv run python -m agent_fs_bench --help
 ```
 
 `uv sync --locked` installs mpi4py, which loads the machine's Open MPI 4.1 at run
-time. Figures need the Arial font (Ubuntu: `sudo apt install ttf-mscorefonts-installer`).
-Without it, `run` fails after the CSV tables are written; re-plot them elsewhere.
+time. Only the machine running `plot` needs Matplotlib and Arial (Ubuntu:
+`sudo apt install ttf-mscorefonts-installer`); `run` does not render figures.
 
 Deploy the whole checkout, including `data/`, on every machine that runs tasks.
 External tools are prepared by the experimenter; each workload doc lists its
@@ -124,6 +124,14 @@ uv run python -m agent_fs_bench plot results/mdtest/<run-n1> results/mdtest/<run
 ```
 
 Columns and plot options: [results and figures](docs/results-and-analysis.md).
+
+For a test machine reached only by copy/pasting one Markdown document, start with
+the self-contained [read-only inventory request](experiments/00-inventory-request.md).
+It preserves old code, local experiment changes, failure experience and historical
+data before any upgrade. Then use the [single-document exchange workflow](docs/markdown-exchange.md):
+a manual plan in, reviewed raw data out, local analysis and plotting afterward.
+`python3 -m agent_fs_bench.exchange` packages/imports reviewed UTF-8 text using only
+the standard library; it never runs the copied commands or renders figures.
 
 ## Reproducibility
 
