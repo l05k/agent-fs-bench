@@ -14,6 +14,13 @@ may leave partial rows in the CSV when a target fails. Python MPI workloads
 publish rows only after the job completes. Replay has a separate `outcomes`
 table for planned failures and emits no latency for those trials.
 
+When raw results stay on a remote test machine, use the
+[summary exchange workflow](markdown-exchange.md). Only verified per-group
+medians, quartiles, sample counts and failure counts cross the copy/paste
+channel; import restores those summaries, and figures are drawn on the writing
+host from them. `plot` remains a raw-CSV tool for machines that still hold the
+samples.
+
 ## config.json
 
 | Field | Meaning |
