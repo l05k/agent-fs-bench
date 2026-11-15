@@ -5,10 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from agent_fs_bench.analysis import Figure, figure_data, load_snapshots
 from agent_fs_bench.exchange import export_packet, import_packet
-from agent_fs_bench.replay_report import summarize
-from agent_fs_bench.results import read_table
 
 
 class ExchangeTests(unittest.TestCase):
@@ -18,165 +15,156 @@ class ExchangeTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.stage = self.root / 'reviewed'
         self.stage.mkdir()
-        (self.stage / 'plan.md').write_text('# Plan\n\n```sh\necho commands are never executed\n```\n')
-        (self.stage / 'execution.md').write_text('# Actual execution\nNo observations were omitted.\n')
+        (self.stage / 'plan.md').write_text('# Plan\n\n```sh\necho not executed\n```\n')
+        (self.stage / 'execution.md').write_text('# Execution\nAll planned ranges are in the summary.\n')
         self.packet = self.root / 'reply.md'
         self.destination = self.root / 'imported'
+        (self.stage / 'summary').mkdir()
+        (self.stage / 'summary' / 'failures.csv').write_text(
+            'group,series,label,count\nreplay,Apsara,timeout,1\nreplay,NAS,divergence,2\n')
+        self.write_group('replay', [
+            ('Apsara', 'all', 'paired_tool_time_ratio_to_ext4', 0.62, 0.55, 0.80, 88),
+            ('NAS', 'all', 'paired_tool_time_ratio_to_ext4', 2.40, 1.90, 3.10, 88),
+        ])
 
-    def inventory(self):
-        (self.stage / 'inventory').mkdir()
-        (self.stage / 'inventory' / 'issues.csv').write_bytes(
-            b'id,status,evidence\r\nE01,confirmed,"same host alias, different cache state"\r\n')
-        (self.stage / 'legacy').mkdir()
-        (self.stage / 'legacy' / 'old.csv').write_text('task,seconds\nsmall,0.125\n')
-        export_packet(self.stage, self.packet, kind='inventory', batch='round-00')
+    def write_group(self, group, rows, **overrides):
+        with (self.stage / 'summary' / f'{group}.csv').open('w', newline='') as handle:
+            writer = csv.writer(handle)
+            writer.writerow(['series', 'x', 'metric', 'median', 'q1', 'q3', 'n'])
+            writer.writerows(rows)
+        meta = {'xlabel': 'Backend', 'ylabel': 'Tool time / ext4', 'unit': 'ratio',
+                'logx': False, 'logy': False, 'series_order': list(dict.fromkeys(
+                    row[0] for row in rows)),
+                'source_runs': ['run-a', 'run-b'],
+                'formula': 'per-task median over repeats, ratio to ext4, median over tasks'}
+        meta.update(overrides)
+        (self.stage / 'summary' / f'{group}.json').write_text(json.dumps(meta))
 
-    def replay(self):
-        spec = {'benchmark': 'swe', 'agent': 'codex', 'model': 'qwen'}
-        samples = {'ext4': {'a': [2, 4], 'b': [10, 10], 'c': [3, 3]},
-                   'apsara': {'a': [1, 2], 'b': [20, 20], 'c': [1, None]}}
-        for target, tasks in samples.items():
-            run_id = f'run-{target}'
-            run = self.stage / 'results' / 'agent-replay' / run_id
-            run.mkdir(parents=True)
-            keys = ['target', 'case', 'benchmark', 'agent', 'task_id', 'tasks', 'sample', 'repeat']
-            snapshot = {'benchmark': 'agent-replay', 'run_id': run_id,
-                        'git_commit': 'commit', 'source_sha256': 'source',
-                        'config': {'tasks': 1, 'repeats': 2}, 'nodes': [],
-                        'planned_targets': [target], 'targets': [{'name': target,
-                            'info': {'hosts': {'machine-01': {'cases': {
-                                case: {**spec, 'task_id': case} for case in tasks}}}}}],
-                        'tables': {'outcomes': {'keys': keys + ['status'], 'metrics': ['attempts']},
-                                   'replays': {'keys': keys, 'metrics': ['tool_s']}}}
-            (run / 'config.json').write_text(json.dumps(snapshot))
-            outcomes, times = [], []
-            for case, repeats in tasks.items():
-                for repeat, seconds in enumerate(repeats, 1):
-                    row = dict(zip(keys, [target, case, 'swe', 'codex', case, 1, 0, repeat]))
-                    outcomes.append({**row, 'status': 'ok' if seconds is not None else 'divergence',
-                                     'attempts': 1})
-                    if seconds is not None:
-                        times.append({**row, 'tool_s': seconds})
-            for table, rows in (('outcomes', outcomes), ('replays', times)):
-                with (run / f'{table}.csv').open('w', newline='') as handle:
-                    writer = csv.DictWriter(handle, fieldnames=rows[0])
-                    writer.writeheader()
-                    writer.writerows(rows)
-        export_packet(self.stage, self.packet, kind='results', batch='replay-01')
-
-    def test_inventory_keeps_old_data_and_nested_commands_as_text(self):
-        self.inventory()
+    def test_round_trip_restores_verified_summaries_and_receipt(self):
+        result = export_packet(self.stage, self.packet, batch='results-20261115-01')
+        self.assertGreater(result['document_bytes'], 0)
         receipt = import_packet(self.packet, self.destination)
-        self.assertEqual(read_table(self.destination / 'legacy' / 'old.csv'),
-                         [{'task': 'small', 'seconds': '0.125'}])
-        self.assertEqual((self.destination / 'plan.md').read_text(),
-                         (self.stage / 'plan.md').read_text())
-        self.assertNotIn('\r', (self.destination / 'inventory' / 'issues.csv').read_text())
         self.assertEqual(receipt['packet_sha256'], hashlib.sha256(self.packet.read_bytes()).hexdigest())
-        self.assertFalse((self.destination / 'results').exists())
+        def normalized(path):
+            text = (self.stage / path).read_text().replace('\r\n', '\n')
+            return (text + '\n' if not text.endswith('\n') else text).encode()
 
-    def test_paired_report_is_unchanged_after_single_document_round_trip(self):
-        self.replay()
-        before = summarize(sorted((self.stage / 'results' / 'agent-replay').iterdir()), 'ext4')
-        import_packet(self.packet, self.destination)
-        after = summarize(sorted((self.destination / 'results' / 'agent-replay').iterdir()), 'ext4')
-        self.assertEqual(after, before)
-        panel, = after['panels']
-        self.assertEqual(panel['task_ratios']['apsara'], {'a': 0.5, 'b': 2.0})
-        self.assertEqual(panel['outcomes']['apsara']['divergence'], 1)
+        self.assertEqual((self.destination / 'summary' / 'replay.csv').read_bytes(),
+                         normalized('summary/replay.csv'))
+        expected = [{'path': path, 'bytes': len(normalized(path)),
+                     'sha256': hashlib.sha256(normalized(path)).hexdigest()}
+                    for path in sorted(('execution.md', 'plan.md', 'summary/failures.csv',
+                                        'summary/replay.csv', 'summary/replay.json'))]
+        self.assertEqual(json.loads((self.destination / 'exchange.json').read_text())['files'], expected)
 
-    def test_partial_run_and_failed_rows_remain_distinguishable(self):
-        run = self.stage / 'results' / 'mount-scale' / 'partial'
-        run.mkdir(parents=True)
-        snapshot = {'benchmark': 'mount-scale', 'run_id': 'partial', 'git_commit': 'commit',
-                    'source_sha256': 'source', 'config': {'tasks': 8}, 'nodes': [],
-                    'planned_targets': ['apsara', 'nas'], 'targets': [{'name': 'apsara'}],
-                    'tables': {}}
-        (run / 'config.json').write_text(json.dumps(snapshot))
-        # A first failed target can leave a CSV absent from checkpointed schemas.
-        (run / 'phases.csv').write_text('target,tasks,ops_per_s\napsara,8,10\nnas,8,999\n')
-        export_packet(self.stage, self.packet, kind='results', batch='partial-01')
-        import_packet(self.packet, self.destination)
-        imported = self.destination / 'results' / 'mount-scale' / 'partial'
-        facts, = load_snapshots([imported], ())
-        self.assertEqual(facts['planned_targets'], ['apsara', 'nas'])
-        completed = [target['name'] for target in facts['targets']]
-        accepted = [row for row in read_table(imported / 'phases.csv') if row['target'] in completed]
-        _, data = figure_data(Figure('phases', 'tasks', 'ops_per_s'), accepted, completed, (3.5, 1.5))[0]
-        self.assertEqual(data['values'], {'apsara': [[10.0]]})
+    def test_raw_per_sample_results_are_not_an_exchange_artifact(self):
+        raw = self.stage / 'results' / 'mdtest' / 'run-a'
+        raw.mkdir(parents=True)
+        (raw / 'phases.csv').write_text('target,tasks,ops_per_s\nApsara,1,100\n')
+        with self.assertRaisesRegex(ValueError, 'Raw results stay on the test machine'):
+            export_packet(self.stage, self.packet, batch='raw')
+        self.assertFalse(self.packet.exists())
 
-    def test_truncated_changed_or_duplicate_documents_do_not_write_any_files(self):
-        self.inventory()
+    def test_missing_metadata_or_invalid_quantiles_do_not_export(self):
+        (self.stage / 'summary' / 'replay.json').unlink()
+        with self.assertRaisesRegex(ValueError, 'needs both .csv and .json'):
+            export_packet(self.stage, self.packet, batch='no-meta')
+        self.write_group('replay', [('Apsara', 'all', 'x', 1.0, 1.2, 0.9, 3)])
+        with self.assertRaisesRegex(ValueError, 'q1 <= median <= q3'):
+            export_packet(self.stage, self.packet, batch='bad-order')
+        self.write_group('replay', [('Apsara', 'all', 'x', 1.0, 1.0, 1.0, 0)])
+        with self.assertRaisesRegex(ValueError, 'positive canonical integer'):
+            export_packet(self.stage, self.packet, batch='bad-n')
+        self.write_group('replay', [('Apsara', 'all', 'x', 1.0, 1.0, 1.0, 2),
+                                    ('Apsara', 'all', 'x', 2.0, 2.0, 2.0, 2)])
+        with self.assertRaisesRegex(ValueError, 'duplicate series/x/metric'):
+            export_packet(self.stage, self.packet, batch='dup')
+        self.assertFalse(self.packet.exists())
+
+    def test_metadata_must_match_series_and_every_required_field(self):
+        self.write_group('replay', [('Apsara', 'all', 'x', 1.0, 1.0, 1.0, 2)], series_order=['NAS'])
+        with self.assertRaisesRegex(ValueError, 'first-appearance order'):
+            export_packet(self.stage, self.packet, batch='order')
+        self.write_group('replay', [('Apsara', 'all', 'x', 1.0, 1.0, 1.0, 2)], source_runs=[])
+        with self.assertRaisesRegex(ValueError, 'source_runs must be nonempty'):
+            export_packet(self.stage, self.packet, batch='no-source')
+        self.write_group('replay', [('Apsara', 'all', 'x', 1.0, 1.0, 1.0, 2)], extra='unverified')
+        with self.assertRaisesRegex(ValueError, 'metadata keys'):
+            export_packet(self.stage, self.packet, batch='extra')
+        self.assertFalse(self.packet.exists())
+
+    def test_tampered_truncated_or_duplicated_documents_write_nothing(self):
+        export_packet(self.stage, self.packet, batch='tamper')
         original = self.packet.read_text()
-        variants = [original[:original.rfind('````')],
-                    original.replace('small,0.125', 'small,9.125'),
+        variants = [original.replace('0.62', '0.52'),
+                    original[:original.rfind('````')],
                     original + original]
         for index, text in enumerate(variants):
-            document = self.root / f'bad-{index}.md'
-            destination = self.root / f'bad-{index}'
+            document, destination = self.root / f'bad-{index}.md', self.root / f'bad-{index}'
             document.write_text(text)
             with self.subTest(index=index), self.assertRaises(ValueError):
                 import_packet(document, destination)
             self.assertFalse(destination.exists())
 
-    def test_manifest_cannot_write_outside_destination(self):
+    def test_unsafe_or_colliding_paths_are_rejected_before_writing(self):
         files = {'plan.md': 'plan\n', 'execution.md': 'actual\n',
-                 'inventory/../escaped.txt': 'not allowed\n'}
-        manifest = {'kind': 'inventory', 'batch': 'unsafe', 'files': [
-            {'path': path, 'bytes': len(text.encode()),
-             'sha256': hashlib.sha256(text.encode()).hexdigest()} for path, text in sorted(files.items())]}
-        text = '```afb-manifest\n' + json.dumps(manifest) + '\n```\n'
-        text += ''.join(f'```afb-file {path}\n{body}```\n' for path, body in files.items())
-        self.packet.write_text(text)
-        with self.assertRaisesRegex(ValueError, 'Unsafe packet path'):
-            import_packet(self.packet, self.destination)
-        self.assertFalse(self.destination.exists())
-        self.assertFalse((self.root / 'escaped.txt').exists())
-
-    def test_export_does_not_follow_symlinks_or_silently_drop_logs(self):
-        (self.stage / 'inventory').mkdir()
-        sensitive = self.root / 'private.txt'
-        sensitive.write_text('private')
-        link = self.stage / 'inventory' / 'linked.txt'
-        link.symlink_to(sensitive)
-        with self.assertRaisesRegex(ValueError, 'regular text files'):
-            export_packet(self.stage, self.packet, kind='inventory', batch='bad')
-        link.unlink()
-        (self.stage / 'inventory' / 'raw.log').write_text('unreviewed logs')
-        with self.assertRaisesRegex(ValueError, 'Not an exchange artifact'):
-            export_packet(self.stage, self.packet, kind='inventory', batch='bad')
-        self.assertFalse(self.packet.exists())
-
-    def test_file_directory_collision_is_rejected_before_creating_output(self):
-        files = {'plan.md': 'plan\n', 'execution.md': 'actual\n',
-                 'inventory/item.txt': 'one\n', 'inventory/item.txt/nested.md': 'two\n'}
-        manifest = {'kind': 'inventory', 'batch': 'collision', 'files': [
+                 'summary/../escaped.csv': 'series,x,metric,median,q1,q3,n\n'}
+        manifest = {'kind': 'summary', 'batch': 'unsafe', 'files': [
             {'path': path, 'bytes': len(text.encode()),
              'sha256': hashlib.sha256(text.encode()).hexdigest()} for path, text in sorted(files.items())]}
         self.packet.write_text('```afb-manifest\n' + json.dumps(manifest) + '\n```\n'
                                + ''.join(f'```afb-file {path}\n{body}```\n'
                                          for path, body in files.items()))
-        with self.assertRaisesRegex(ValueError, 'also used as a directory'):
+        with self.assertRaisesRegex(ValueError, 'Unsafe packet path'):
             import_packet(self.packet, self.destination)
         self.assertFalse(self.destination.exists())
+        self.assertFalse((self.root / 'escaped.csv').exists())
 
-
-    def test_missing_declared_table_cannot_be_passed_off_as_a_complete_transfer(self):
-        self.replay()
-        self.packet.unlink()
-        next((self.stage / 'results').glob('*/*/replays.csv')).unlink()
-        with self.assertRaisesRegex(ValueError, 'missing declared table'):
-            export_packet(self.stage, self.packet, kind='results', batch='incomplete')
-        self.assertFalse(self.packet.exists())
-
-    def test_import_never_overwrites_an_existing_directory(self):
-        self.inventory()
+    def test_existing_directories_and_links_are_never_overwritten(self):
         self.destination.mkdir()
-        existing = self.destination / 'keep.txt'
-        existing.write_text('keep')
+        (self.destination / 'keep.txt').write_text('keep')
         with self.assertRaises(FileExistsError):
             import_packet(self.packet, self.destination)
-        self.assertEqual(existing.read_text(), 'keep')
+        self.assertEqual((self.destination / 'keep.txt').read_text(), 'keep')
+        export_packet(self.stage, self.packet, batch='existing')
+        with self.assertRaises(FileExistsError):
+            export_packet(self.stage, self.packet, batch='again')
+        self.packet.unlink()
+        self.packet.symlink_to(self.stage / 'plan.md')
+        with self.assertRaises(FileExistsError):
+            export_packet(self.stage, self.packet, batch='symlink')
+
+    def test_logs_symlinks_and_other_raw_files_are_rejected(self):
+        (self.stage / 'summary' / 'stdout.log').write_text('unreviewed log')
+        with self.assertRaisesRegex(ValueError, 'Only plan.md, execution.md'):
+            export_packet(self.stage, self.packet, batch='log')
+        (self.stage / 'summary' / 'stdout.log').unlink()
+        secret = self.root / 'secret.txt'
+        secret.write_text('secret')
+        (self.stage / 'summary' / 'linked.csv').symlink_to(secret)
+        with self.assertRaisesRegex(ValueError, 'regular text files'):
+            export_packet(self.stage, self.packet, batch='link')
+        self.assertFalse(self.packet.exists())
+
+    def test_unregistered_staging_content_is_rejected(self):
+        (self.stage / 'summary' / 'orphan.json').write_text('{}')
+        with self.assertRaisesRegex(ValueError, 'Undeclared exchange artifacts'):
+            export_packet(self.stage, self.packet, batch='orphan')
+        (self.stage / 'summary' / 'orphan.json').unlink()
+        (self.stage / 'legacy').mkdir()
+        with self.assertRaisesRegex(ValueError, 'Unexpected staging directory'):
+            export_packet(self.stage, self.packet, batch='directory')
+        self.assertFalse(self.packet.exists())
+
+    def test_empty_or_unregistered_series_are_rejected(self):
+        self.write_group('replay', [('Apsara', '', 'x', 1.0, 1.0, 1.0, 2)])
+        with self.assertRaisesRegex(ValueError, 'empty series, x or metric'):
+            export_packet(self.stage, self.packet, batch='empty')
+        (self.stage / 'summary' / 'replay.csv').write_text(
+            'group,series,x,median\nx,Apsara,all,1\n')
+        with self.assertRaisesRegex(ValueError, 'columns must be'):
+            export_packet(self.stage, self.packet, batch='bad-header')
+        self.assertFalse(self.packet.exists())
 
 
 if __name__ == '__main__':
