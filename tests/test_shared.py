@@ -135,6 +135,7 @@ class RunCommandTests(unittest.TestCase):
             self.invoke(fake_workload(fail_on='b'), '--dirs', *map(str, self.dirs))
         run = self.run_dir()
         snapshot = json.loads((run / 'config.json').read_text())
+        self.assertEqual(snapshot['planned_targets'], ['a', 'b'])
         self.assertEqual([target['name'] for target in snapshot['targets']], ['a'])
         self.assertEqual([row['target'] for row in read_table(run / 'phases.csv')], ['a'] * 6 + ['b'])
 
@@ -222,6 +223,17 @@ class PlotRunsTests(unittest.TestCase):
                          (['nfs', 'ours'], {'nfs': [[1.0]], 'ours': [[2.0, 4.0]]}))
         plot(runs, [self.spec], targets=['ours', 'nfs'], output=self.root / 'figures')
         self.assertEqual(self.render.call_args.args[0]['series'], ['ours', 'nfs'])
+
+    def test_partial_rows_do_not_join_successful_same_named_target(self):
+        historical = self.make_run('historical', 'a', 10.0)
+        failed = self.make_run('failed', 'a', 100.0)
+        snapshot = json.loads((failed / 'config.json').read_text())
+        snapshot['targets'] = []
+        write_json(failed / 'config.json', snapshot)
+
+        plot([historical, failed], [self.spec], targets=['a'])
+
+        self.assertEqual(self.render.call_args.args[0]['values'], {'a': [[10.0]]})
 
     def test_differing_configs_pool_only_for_declared_keys(self):
         runs = [self.make_run('r1', 'a', 1.0), self.make_run('r2', 'b', 2.0, repeats=5)]

@@ -132,5 +132,5 @@ Default paper views:
 Each sample is one task's measurement, not an individual SQL latency.
 Select only compatible runs: `plot` refuses run directories whose configs
 differ. Each task owns its database; concurrency comes only from independent
-instances, and `tasks` is one value per run. Stock `kvtest` can report failed
-commits as successful work under contention; do not parallelize it on one DB.
+instances, and `tasks` is one value per run. The checked `kvtest` rejects failed
+operations and commits; neither workload is a shared-database scaling test.

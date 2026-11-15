@@ -47,9 +47,11 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from typing import Any, Callable, Sequence
@@ -272,29 +274,54 @@ class ProgramRun:
 
 
 def run_program(placement: Placement, launcher: Launcher, programs: Sequence[Sequence[str]],
-                log_dir: Path, label: str, stdin: str = '') -> ProgramRun:
+                log_dir: Path, label: str, stdin: str = '',
+                timeout_s: float | None = None) -> ProgramRun:
     """Run one MPI job (one program per rank); keep appfile, stdout and stderr in `log_dir`.
 
-    Progress messages of task 0 are printed while the job runs.
+    Progress messages of task 0 are printed while the job runs. With `timeout_s`, the
+    launcher process group is killed and the job fails instead of returning a run.
     """
+    assert timeout_s is None or timeout_s > 0, \
+        f'{label} timeout: expected positive seconds or None, measured {timeout_s!r}'
     log_dir.mkdir(parents=True, exist_ok=True)
     appfile_path, stderr_path = log_dir / f'{label}.appfile', log_dir / f'{label}.stderr.txt'
     appfile_path.write_text(appfile(placement, [list(map(str, p)) for p in programs]))
     lines = []
+    timed_out = threading.Event()
+
+    def stop() -> None:
+        timed_out.set()
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
     with stderr_path.open('w') as stderr:
         process = subprocess.Popen(mpiexec_argv(placement, launcher, appfile_path),
                                    cwd=PROJECT_ROOT, stdin=subprocess.PIPE,
-                                   stdout=subprocess.PIPE, stderr=stderr, text=True, bufsize=1)
-        process.stdin.write(stdin)
-        process.stdin.close()
-        for line in process.stdout:
-            lines.append(line)
-            message = decode_message(line)
-            if message is not None and message[0] == 'log':
-                print(f'  {message[1]}', flush=True)
-        returncode = process.wait()
+                                   stdout=subprocess.PIPE, stderr=stderr, text=True, bufsize=1,
+                                   start_new_session=timeout_s is not None)
+        timer = threading.Timer(timeout_s, stop) if timeout_s is not None else None
+        if timer is not None:
+            timer.start()
+        try:
+            process.stdin.write(stdin)
+            process.stdin.close()
+            for line in process.stdout:
+                lines.append(line)
+                message = decode_message(line)
+                if message is not None and message[0] == 'log':
+                    print(f'  {message[1]}', flush=True)
+            returncode = process.wait()
+        finally:
+            if timer is not None:
+                timer.cancel()
+            process.stdout.close()
     stdout = ''.join(lines)
     (log_dir / f'{label}.stdout.txt').write_text(stdout)
+    if timed_out.is_set():
+        raise RuntimeError(f'{label} MPI job exceeded {timeout_s:g}s; '
+                           f'inspect {stderr_path}')
     return ProgramRun(label, returncode, stdout, stderr_path)
 
 

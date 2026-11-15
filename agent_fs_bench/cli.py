@@ -66,11 +66,13 @@ def workload_args(module, workload_argv: list[str]) -> argparse.Namespace:
 
 
 def snapshot(benchmark: str, run_id: str, config: dict[str, Any], pool: cluster.Pool,
-             tables: Tables, targets: list[dict[str, Any]]) -> dict[str, Any]:
-    """Parameters (incl. seed) and environment baseline of one run (config.json)."""
+             tables: Tables, targets: list[dict[str, Any]],
+             planned_targets: list[str]) -> dict[str, Any]:
+    """Parameters (incl. seed), planned targets, and completed targets of one run."""
     return {'benchmark': benchmark, 'run_id': run_id,
             'git_commit': git_commit(), 'source_sha256': source_digest(), 'config': config,
             'mpi_version': pool.mpi_version, 'nodes': pool.manifest(),
+            'planned_targets': planned_targets,
             'targets': targets, 'tables': tables.schemas}
 
 
@@ -103,14 +105,17 @@ def run_benchmark(argv: list[str]) -> int:
     run_dir = RESULTS_DIR / options.benchmark / run_id
     run_dir.mkdir(parents=True)
     tables, finished = Tables(run_dir), []
-    write_json(run_dir / 'config.json',
-               snapshot(options.benchmark, run_id, config, pool, tables, finished))
-    for target in targets:
-        finished.append(run_target(module, workload_argv, options.benchmark, run_id, run_dir,
-                                   target, tables, pool))
+    planned = [target.name for target in targets]
+    try:
         write_json(run_dir / 'config.json',
-                   snapshot(options.benchmark, run_id, config, pool, tables, finished))
-    tables.close()
+                   snapshot(options.benchmark, run_id, config, pool, tables, finished, planned))
+        for target in targets:
+            finished.append(run_target(module, workload_argv, options.benchmark, run_id, run_dir,
+                                       target, tables, pool))
+            write_json(run_dir / 'config.json',
+                       snapshot(options.benchmark, run_id, config, pool, tables, finished, planned))
+    finally:
+        tables.close()
     print(f'Results: {run_dir}', flush=True)
     return 0
 

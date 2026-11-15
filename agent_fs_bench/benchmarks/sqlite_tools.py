@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -35,8 +36,75 @@ COMPILE_FLAGS = (
     "-pthread",
 )
 
+# The official kvtest update/read loop ignores statement and commit errors and
+# does not read back the effective synchronous setting. Checked into data/ so
+# the hash-verified upstream source plus this patch fully identifies the binary.
+KVTEST_PATCH = PROJECT_ROOT / "data" / "sqlite" / "kvtest-3.54.1-verify.patch"
+
+HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
 class BenchmarkError(RuntimeError):
     pass
+
+def apply_patch(original: str, patch: str) -> str:
+    """Apply one unified diff to exact pinned text; reject mismatched context.
+
+    The checked patches in ``data/`` are generated against hash-verified
+    official sources, so every hunk must match its declared location exactly.
+    This avoids requiring a ``patch`` executable on benchmark hosts.
+    """
+    source = original.splitlines(keepends=True)
+    lines = patch.splitlines(keepends=True)
+    hunks: list[tuple[int, list[str], list[str]]] = []
+    index = 0
+    while index < len(lines) and not lines[index].startswith("@@"):
+        index += 1
+    while index < len(lines):
+        header = HUNK_HEADER.match(lines[index])
+        if header is None:
+            raise BenchmarkError(
+                f"invalid patch hunk header: {lines[index].rstrip()!r}"
+            )
+        old_start = int(header.group(1))
+        old_count = int(header.group(2) or "1")
+        new_count = int(header.group(4) or "1")
+        index += 1
+        old_lines: list[str] = []
+        new_lines: list[str] = []
+        while index < len(lines) and not lines[index].startswith("@@"):
+            line = lines[index]
+            index += 1
+            if line.startswith("\\"):
+                continue
+            marker, body = line[:1], line[1:]
+            if marker == " ":
+                old_lines.append(body)
+                new_lines.append(body)
+            elif marker == "-":
+                old_lines.append(body)
+            elif marker == "+":
+                new_lines.append(body)
+            else:
+                raise BenchmarkError(f"invalid patch line: {line.rstrip()!r}")
+        if len(old_lines) != old_count or len(new_lines) != new_count:
+            raise BenchmarkError("patch hunk line counts do not match its header")
+        hunks.append((old_start, old_lines, new_lines))
+    if not hunks:
+        raise BenchmarkError("patch contains no hunks")
+
+    result: list[str] = []
+    cursor = 0
+    for old_start, old_lines, new_lines in hunks:
+        start = old_start - 1
+        if start < cursor:
+            raise BenchmarkError("patch hunks are out of order or overlap")
+        if source[start:start + len(old_lines)] != old_lines:
+            raise BenchmarkError("patch context does not match the pinned source")
+        result.extend(source[cursor:start])
+        result.extend(new_lines)
+        cursor = start + len(old_lines)
+    result.extend(source[cursor:])
+    return "".join(result)
 
 def build_directory(configured: str | Path | None, name: str) -> Path:
     """Resolve a build cache on this machine; None means this checkout's build/<name>."""
@@ -55,6 +123,25 @@ def download(url: str, destination: Path, expected_sha256: str) -> None:
         partial.unlink(missing_ok=True)
         raise
     partial.replace(destination)
+
+def checked_kvtest_source(build_dir: Path, source: Path) -> Dict[str, Path]:
+    """Apply the checked verification patch to the verified official source."""
+    try:
+        original = source.read_text(encoding="utf-8")
+        patch = KVTEST_PATCH.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise BenchmarkError(
+            f"cannot read kvtest source or checked patch {KVTEST_PATCH}: {exc}"
+        ) from exc
+    checked = build_dir / "kvtest.checked.c"
+    patched = apply_patch(original, patch)
+    if not checked.exists() or checked.read_text(encoding="utf-8") != patched:
+        checked.write_text(patched, encoding="utf-8")
+    return {
+        "kvtest": checked,
+        "kvtest_upstream": source,
+        "kvtest_patch": KVTEST_PATCH,
+    }
 
 def ensure_sources(build_dir: Path, tool: str, force: bool) -> Dict[str, Path]:
     """Fetch the pinned amalgamation and official test program."""
@@ -85,7 +172,10 @@ def ensure_sources(build_dir: Path, tool: str, force: bool) -> Dict[str, Path]:
             raise BenchmarkError(
                 f"{archive} did not contain sqlite3.c as expected"
             )
-    return {tool: source, "sqlite3": amalgamation, "sqlite3_h": header}
+    sources = {tool: source, "sqlite3": amalgamation, "sqlite3_h": header}
+    if tool == "kvtest":
+        sources.update(checked_kvtest_source(build_dir, source))
+    return sources
 
 def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()

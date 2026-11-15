@@ -94,6 +94,53 @@ class FixtureResolutionTests(unittest.TestCase):
             for name in module.fixture_names(series):
                 self.assertTrue((fixture_dir / name).is_file(), name)
 
+class SyncTests(unittest.TestCase):
+    def test_scoped_sync_uses_a_checked_command(self):
+        path = Path('/var/tmp/linux-checkout')
+        with mock.patch.object(dev_workflow, 'run_command') as command:
+            dev_workflow.sync_filesystem(
+                path, what='syncing workflow filesystem', verbose=False
+            )
+        command.assert_called_once_with(
+            ['sync', '-f', '--', str(path)], cwd=path,
+            what='syncing workflow filesystem', verbose=False,
+        )
+
+    def test_sync_is_a_declared_dependency(self):
+        self.assertIn('sync', dev_workflow.CORE_COMMANDS)
+
+
+class WorkflowBoundaryTests(unittest.TestCase):
+    def test_final_sync_is_the_last_measured_step(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixtures = root / 'fixtures'
+            fixtures.mkdir()
+            (fixtures / dev_workflow.DEFAULT_CONFIG).write_text('')
+            repo = root / 'repo'
+            repo.mkdir()
+            args = dev_workflow.parse_args([])
+            with mock.patch.object(
+                    dev_workflow, 'run_command',
+                    return_value=dev_workflow.CommandResult(1, 0, '', '')), \
+                    mock.patch.object(dev_workflow, 'sync_filesystem') as sync:
+                result = dev_workflow.run_workflow(
+                    repo,
+                    args=args,
+                    fixture_dir=fixtures,
+                    series={'base_commit': 'base', 'commits': []},
+                    base_commit='base',
+                    preparation_ms=7,
+                )
+            sync.assert_called_once_with(
+                repo, what='syncing workflow filesystem', verbose=False,
+            )
+            self.assertEqual(result['steps'][-1]['kind'], 'sync')
+            self.assertEqual(result['steps'][-1]['name'], 'final-sync')
+            self.assertNotIn('compiler_version', result)
+            self.assertNotIn('cleanup_ms', result)
+
+
 class MakeProbeTests(unittest.TestCase):
     def setUp(self):
         if not all(shutil.which(name) for name in ('make', 'cc')):

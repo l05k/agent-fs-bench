@@ -1,30 +1,31 @@
-"""Mount-scale: N client tasks over the --mode machines using global Open MPI mdtest jobs.
+"""Mount-scale: synchronized small-file I/O on N independent mounted clients.
 
 | Symbol | Definition |
 | --- | --- |
-| N | `tasks`: clients, one mdtest rank each, dealt round-robin over the machines |
-| K | `directories`: per-client directories, one private workspace + K-1 shared resources |
-| F, S | `files` per client and phase, `file_size_bytes` |
-| T_p | Aggregate mdtest phase time (maximum client time including the end barrier) |
-| X_p | `ops_per_s = N*F / T_p`; never summed per machine |
-| D_a | `controller_dispatch_elapsed_s`: controller time from notifying every worker of action a (mount/unmount) to receiving every reply |
+| N | `tasks`: clients, one MPI rank each, dealt round-robin over the machines |
+| K | `directories`: per-client directories; default 1 is one private workspace and one independent mount per client |
+| F, S | `files` per client and phase (default 1000), `file_size_bytes` (default 4096) |
+| T | One synchronized batch: start barrier through all tasks' completion and, for create-write, every target-scoped syncfs |
+| X | `ops_per_s = completed full files / T`; never summed per machine |
+| D_a | `controller_dispatch_elapsed_s`: controller time from notifying every worker of action a to receiving every reply |
 
-Per repeat: setup → mount → mounted-idle sample → **warm-up** (one stat+read job per shared
-resource, timings discarded) → **sampling** (private create/stat/read/remove job, then one
-stat/read job per shared resource, with per-machine resource sampling) → unmount →
-released-idle sample → validation → tables. Each table has one observation granularity:
+The canonical paper scenario is K=1. Each client has one private `read/` fixture and one
+fresh `write/` target behind its own real backend mount. Per repeat: setup -> first mount
+-> create the durable read fixture through that mount and sync it -> unmount -> measured
+remount -> **read** the whole fixture -> **create-write** the separate fresh target ->
+unmount. Read starts after the remount; no cache drop, fadvise or direct I/O is used.
+Create-write counts only files whose full S bytes were written and closed, then includes
+each client's target-scoped ``sync -f`` for file data and directory entries in T. Mounts,
+fixture preparation and cleanup are outside I/O timing. A failed or incomplete batch
+cannot emit a throughput row.
 
-| Table | One row per |
-| --- | --- |
-| `phases` | repeat × phase: ops, elapsed_s, ops_per_s, ops_per_s_per_task, rank_mean_us_per_op |
-| `bandwidth` | repeat × create/read phase: bytes, elapsed_s, mib_per_s |
-| `ranks` | repeat × phase × client: elapsed_s |
-| `dispatch` | repeat × action: controller_dispatch_elapsed_s |
-| `host_mounts`, `host_unmounts` | repeat × machine: elapsed_s, measured_mounts / remaining_mounts |
-| `agents` | repeat × machine × action × client: elapsed_s |
-| `resource_levels` | repeat × machine × idle state: raw levels and sampling interval |
-| `resource_deltas` | repeat × machine × mounted/released-idle state: level − baseline |
-| `resource_workload` | repeat × machine: sampling interval, peaks and peak − start |
+K>1 retains the earlier shared read-only ablation with upstream mdtest, in the same run
+protocol but separate from the canonical phases. It is selected explicitly and is not a
+paper default; its private four-phase job and shared phases remain labeled as such.
+
+Per repeat tables: `phases` (read/create-write or ablation phases), `bandwidth` (logical
+full-file bytes), `ranks`, `dispatch`, `host_mounts`, `host_unmounts`, `agents`,
+`resource_levels`, `resource_deltas`, `resource_workload`.
 """
 
 from __future__ import annotations
@@ -41,27 +42,31 @@ from agent_fs_bench import cluster
 from agent_fs_bench.analysis import Figure
 from agent_fs_bench.results import PROJECT_ROOT, RunContext
 from .mount_scale_cluster import Worker, parallel
+from .mount_scale_io import CREATE_WRITE, READ, PosixIo
 from .mount_scale_mdtest import VERSION as MDTEST_VERSION, Mdtest, Phase, Rank
 from .mount_scale_mounts import Profile, parse_profile
 
 CONFIG = {
     'profiles': PROJECT_ROOT / 'local' / 'mounts.toml',
     # One N per run, dealt round-robin over the --mode machines; N above the CPU count
-    # oversubscribes them.
+    # oversubscribes them. The intended paper sweep keeps one fixed node budget and
+    # measures separate N values in separate runs.
     'tasks': 64,
-    'directories': 3,  # K: one private workspace + K-1 shared resources per client.
+    'directories': 1,  # K=1 canonical; >1 selects the shared-scope ablation.
     'files': 1000,
     'file_size_bytes': 4096,
     'repeats': 3,
-    'mdtest': 'mdtest',  # Same binary on every machine; prefer an absolute path.
-    'command_timeout_s': 300,
+    'mdtest': 'mdtest',  # Used only by the explicitly selected K>1 ablation.
+    'command_timeout_s': 300,  # Worker control replies and each mount/unmount command.
+    'job_timeout_s': 900,  # Each native MPI job: read, create-write or mdtest.
+    'fixture_timeout_s': 1800,  # Per-repeat fixture creation and cleanup control replies.
     'idle_sample_s': 1.0,
     'resource_sample_s': 0.1,
 }
 
 FIGURES = [
     Figure('phases', 'tasks', 'ops_per_s', split=('topology', 'phase'),
-           xlabel='Tasks', ylabel='Throughput (Kops/s)', yscale=1000,
+           xlabel='Tasks', ylabel='Throughput (Kfiles/s)', yscale=1000,
            logx=True, name='throughput'),
     Figure('dispatch', 'tasks', 'controller_dispatch_elapsed_s', split=('topology', 'action'),
            xlabel='Tasks', ylabel='Controller dispatch time (s)',
@@ -78,7 +83,12 @@ INTERVAL = ('sample_elapsed_s', 'cpu_busy_s', 'cpu_busy_cores', 'cpu_busy_percen
 DELTAS = ('used_bytes', 'slab_bytes', 'slab_unreclaimable_bytes', 'mount_entries')
 PEAKS = ('used_bytes', 'cached_bytes', 'dirty_bytes', 'slab_bytes',
          'slab_reclaimable_bytes', 'slab_unreclaimable_bytes')
-DATA_PHASES = ('/create', '/read')
+DATA_PHASES = (READ, CREATE_WRITE)
+
+
+def bandwidth_phase(name: str) -> bool:
+    """Canonical read/create-write and the old ablation's create/read phases."""
+    return name in DATA_PHASES or name.endswith(('/create', '/read'))
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -89,8 +99,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     options = parser.parse_args(argv)
     values = dict(CONFIG)
     if options.directory_smoke:
-        values.update(tasks=2, files=32, repeats=1, idle_sample_s=0.1)
-    return argparse.Namespace(**values, directory_smoke=options.directory_smoke)
+        values.update(tasks=2, directories=1, files=32, repeats=1, idle_sample_s=0.1)
+    args = argparse.Namespace(**values, directory_smoke=options.directory_smoke)
+    for name in ('tasks', 'directories', 'files', 'file_size_bytes', 'repeats',
+                 'command_timeout_s', 'job_timeout_s', 'fixture_timeout_s',
+                 'idle_sample_s', 'resource_sample_s'):
+        value = getattr(args, name)
+        assert type(value) in (int, float) and value > 0, \
+            f'{name}: expected positive number, measured {value!r}'
+    return args
 
 
 # Metrics (pure) ------------------------------------------------------------------------------
@@ -103,7 +120,7 @@ def phase_metrics(phase: Phase, tasks: int) -> dict[str, float]:
 
 
 def bandwidth_metrics(phase: Phase, file_size_bytes: int) -> dict[str, float]:
-    """Logical create/read bytes; shared data is read N times, not physical bytes."""
+    """Logical completed file bytes; read bytes are not physical network/disk bytes."""
     byte_count = phase.operations * file_size_bytes
     return {'bytes': byte_count, 'elapsed_s': phase.elapsed_s,
             'mib_per_s': byte_count / phase.elapsed_s / MIB}
@@ -132,7 +149,8 @@ class Experiment:
     data_root: Path
     placement: cluster.Placement
     workers: list[Worker]
-    engine: Mdtest
+    engine: Mdtest | None
+    io: PosixIo
 
 
 @dataclass(frozen=True)
@@ -174,6 +192,7 @@ def worker_job(ctx: RunContext, args: argparse.Namespace, name: str, data_root: 
         'directories': args.directories, 'idle_sample_s': args.idle_sample_s,
         'resource_sample_s': args.resource_sample_s,
         'command_timeout_s': args.command_timeout_s,
+        'fixture_timeout_s': args.fixture_timeout_s,
     }
 
 
@@ -191,6 +210,7 @@ def start(ctx: RunContext, args: argparse.Namespace, profile: Profile | None,
     if profile is None:
         assert len(nodes) == 1, f'--directory-smoke machines: expected 1, measured {len(nodes)}'
     launcher = ctx.pool.launcher
+    tag = f'{ctx.run_id}-{ctx.target.name}'
     # run_id is unique per run and identical on every machine: the admin-view sentinel.
     workers = [Worker(node, worker_job(ctx, args, node.name, data_root, ctx.run_id,
                                        profile_text),
@@ -198,11 +218,21 @@ def start(ctx: RunContext, args: argparse.Namespace, profile: Profile | None,
                       launcher.connect_timeout_s) for node in nodes]
     return Experiment('directory-smoke' if profile is None else profile.topology, profile,
                       data_root, placement, workers,
-                      Mdtest(args.mdtest, launcher, f'{ctx.run_id}-{ctx.target.name}'))
+                      (None if args.directories == 1 else
+                       Mdtest(args.mdtest, launcher, tag, args.job_timeout_s)),
+                      PosixIo(launcher, args.job_timeout_s))
 
 
 def prepare(ctx: RunContext, args: argparse.Namespace, experiment: Experiment) -> dict[str, Any]:
-    """Validate the binary and create the shared fixtures once, before any repeat."""
+    """Create the run's data root and, for the explicit K>1 ablation, shared fixtures."""
+    info: dict[str, Any] = {'placement': cluster.placement_record(experiment.placement)}
+    if args.directories == 1:
+        experiment.workers[0].call('init-data')
+        info.update(cache_control='unmount-remount-no-cache-drop',
+                    completion='exact-full-file',
+                    durability='target-scoped-syncfs-final-batch')
+        return info
+    assert experiment.engine is not None, 'K>1: expected an mdtest engine'
     digests = cluster.binary_digests(cluster.machines(experiment.placement), ctx.pool.launcher,
                                      args.mdtest)
     sha256 = cluster.validate_binary(args.mdtest, digests)
@@ -211,8 +241,9 @@ def prepare(ctx: RunContext, args: argparse.Namespace, experiment: Experiment) -
                    for number in range(1, args.directories))
     experiment.engine.prepare(experiment.placement[0], shared, args.files, args.file_size_bytes,
                               ctx.result_dir / 'prepare')
-    return {'mdtest': {'sha256': sha256, 'version': MDTEST_VERSION},
-            'placement': cluster.placement_record(experiment.placement)}
+    info.update(mdtest={'sha256': sha256, 'version': MDTEST_VERSION},
+                ablation='shared-scope-mdtest')
+    return info
 
 
 # One repeat: run → validate → write ----------------------------------------------------------
@@ -236,14 +267,57 @@ def timed(workers: list[Worker], action: str) -> tuple[list[dict], float]:
     return replies, time.perf_counter() - started
 
 
-def measure_repeat(ctx: RunContext, args: argparse.Namespace, experiment: Experiment,
-                   number: int) -> Repeat:
+def measure_small_file_repeat(ctx: RunContext, args: argparse.Namespace,
+                              experiment: Experiment, number: int) -> Repeat:
+    """Canonical K=1: durable read fixture, remount, read, then fresh create-write."""
+    name = f'N{len(experiment.placement)}-R{number}'
+    print(f'  {experiment.topology} {name}, K=1, '
+          f'{args.files}x{args.file_size_bytes} B/client, hosts={len(experiment.workers)}',
+          flush=True)
+    diagnostics = ctx.result_dir / name
+    diagnostics.mkdir()
+    workers, io = experiment.workers, experiment.io
+    ranks, setup_baselines = setup_clients(experiment, number)
+    # Fixture preparation uses the first mount; its lifecycle cost is not measured.
+    if experiment.profile is not None:
+        parallel(workers, 'mount')
+    parallel(workers, 'prepare-read', files=args.files,
+             file_size_bytes=args.file_size_bytes)
+    mounts: list[dict] = []
+    dispatch_s: dict[str, float] = {}
+    if experiment.profile is not None:
+        parallel(workers, 'unmount')
+        baselines = parallel(workers, 'idle')
+        mounts, dispatch_s['mount'] = timed(workers, 'mount')
+    else:
+        baselines = setup_baselines
+    mounted = parallel(workers, 'idle')
+    parallel(workers, 'sample-start')
+    phases = [
+        io.measure(READ, ranks, READ, args.files, args.file_size_bytes,
+                   diagnostics / 'measured'),
+        io.measure(CREATE_WRITE, ranks, CREATE_WRITE, args.files, args.file_size_bytes,
+                   diagnostics / 'measured'),
+    ]
+    workload = parallel(workers, 'sample-stop')
+    unmounts: list[dict] = []
+    if experiment.profile is not None:
+        unmounts, dispatch_s['unmount'] = timed(workers, 'unmount')
+    released = parallel(workers, 'idle')
+    return Repeat(number, name, baselines, mounted, workload, released, mounts, unmounts,
+                  dispatch_s, phases, [rank.node.name for rank in ranks])
+
+
+def measure_ablation_repeat(ctx: RunContext, args: argparse.Namespace,
+                            experiment: Experiment, number: int) -> Repeat:
+    """Explicit K>1 shared-scope ablation: the previous mdtest phases, unchanged."""
     name = f'N{len(experiment.placement)}-R{number}'
     print(f'  {experiment.topology} {name}, K={args.directories}, '
           f'hosts={len(experiment.workers)}', flush=True)
     diagnostics = ctx.result_dir / name
     diagnostics.mkdir()
     workers, engine = experiment.workers, experiment.engine
+    assert engine is not None, 'K>1: expected an mdtest engine'
     ranks, baselines = setup_clients(experiment, number)
     mounts, dispatch_s = [], {}
     if experiment.profile is not None:
@@ -261,6 +335,13 @@ def measure_repeat(ctx: RunContext, args: argparse.Namespace, experiment: Experi
                   dispatch_s, phases, [rank.node.name for rank in ranks])
 
 
+def measure_repeat(ctx: RunContext, args: argparse.Namespace, experiment: Experiment,
+                   number: int) -> Repeat:
+    measure = (measure_small_file_repeat if args.directories == 1
+               else measure_ablation_repeat)
+    return measure(ctx, args, experiment, number)
+
+
 def validate_repeat(experiment: Experiment, result: Repeat) -> None:
     """Every placed client answered with its own alias (setup replies, not the plan)."""
     expected = len(experiment.placement)
@@ -274,7 +355,7 @@ def write_phases(ctx: RunContext, keys: dict[str, Any], phases: list[Phase], hos
     for phase in phases:
         phase_keys = {**keys, 'phase': phase.name}
         ctx.emit('phases', phase_keys, phase_metrics(phase, tasks))
-        if phase.name.endswith(DATA_PHASES):
+        if bandwidth_phase(phase.name):
             ctx.emit('bandwidth', phase_keys, bandwidth_metrics(phase, file_size_bytes))
         for sample, elapsed in enumerate(phase.rank_elapsed_s):
             ctx.emit('ranks', {**phase_keys, 'sample': sample, 'host': hosts[sample]},

@@ -80,11 +80,12 @@ the harness's fixed build parallelism; a larger value fails the run.
 
 Both require Linux on every machine of the pool, Python 3.12+, Git supporting
 worktrees and `core.fsync=committed`/`core.fsyncMethod=fsync`, Bash, Make, grep,
-sed, `python3` on PATH, and a working compiler/linker. Python dependencies are
-pinned by `uv.lock`: run `uv sync --locked` once per machine. Install system
-prerequisites yourself. `findmnt` is required when `CONFIG["require_fstype"]` is
-set. Tool presence and versions are checked on each node leader, the machine
-that does the work.
+sed, `python3` on PATH, and a working compiler/linker. The kernel workload also
+requires GNU coreutils `sync` for its scoped `sync -f -- <repo>` calls. Python
+dependencies are pinned by `uv.lock`: run `uv sync --locked` once per machine.
+Install system prerequisites yourself. `findmnt` is required when
+`CONFIG["require_fstype"]` is set. Tool presence and versions are checked on
+each node leader, the machine that does the work.
 
 Mini needs a compiler selected by its Makefile, libc development files, and all
 of `data/mini-dev-workflow/`, including `source-repo.bundle`. The fixture uses
@@ -207,7 +208,9 @@ resolved to a full commit ID before measurement.
 
 1. **Per-task preparation (untimed):** clone, verify repository/object
    availability, clean, detached checkout of the base, clean, check
-   HEAD/cleanliness. Each task clones into its own `task-NNNN/repo`.
+   HEAD/cleanliness, then flush the checkout's filesystem with
+   `sync -f -- <repo>` before the measured barrier. Each task clones into its
+   own `task-NNNN/repo`; `preparation_ms` includes the scoped sync.
 2. **Measured configuration:** all instances meet at a barrier, then
    `make tinyconfig`, copy the fixture to `.config`, `make olddefconfig`; these
    remain one configuration step. Every make call inherits the build environment
@@ -217,10 +220,16 @@ resolved to a full commit ID before measurement.
    Command-file loading is measured separately from command execution.
 4. **Measured assertions:** after every commit, `HEAD^{tree}` must equal the
    fixture commit's tree. A mismatch fails the run.
-5. **Untimed provenance:** query the compiler version through the actual
-   Makefile's `$(CC)`. This happens after the workload timer, before cleanup.
-6. **Cleanup per task:** `git reset --hard <base>` and `git clean -fdx`,
-   separately timed.
+5. **Measured final sync:** after all commits and tree assertions, each task runs
+   `sync -f -- <repo>` under the workload timer, covering build outputs and
+   checkout data/directory entries. A scoped-sync failure stops the run. This is
+   one timed `steps` row with kind `sync` and name `final-sync`.
+6. **Untimed provenance and cleanup:** every task meets at a global barrier that
+   closes the measured phase, so no task's cleanup can overlap another task's
+   timed workflow. After that barrier each task queries the compiler version
+   through the actual Makefile's `$(CC)`, then runs `git reset --hard <base>` and
+   `git clean -fdx`; both are outside `elapsed_ms`, and cleanup is separately
+   timed.
 
 The shipped fixture has five commits, 15 search + 10 read + 41 edit commands,
 one full build and five incremental builds per task.
@@ -268,10 +277,11 @@ column identifies each row.
 `tasks` repeats the run's task count, `sample` is the task index and `host` is
 the node name (`local` or the `hosts.toml` name). Both tables therefore have a
 pooled sample index, so figures pool every task's rows. `kind` groups steps for
-figures: `config`, `build`, `command`, `git` and `verify` for the kernel workload;
-`worktree`, `build`, `command` and `git` for mini. `name` is the concrete
-operation (`initial-build`, `search-load`, `search`, `commit`, ...). The `commit`
-column holds the fixture commit for commit-specific steps and is empty otherwise.
+figures: `config`, `build`, `command`, `git`, `verify` and `sync` for the kernel
+workload; `worktree`, `build`, `command` and `git` for mini. `name` is the
+concrete operation (`initial-build`, `search-load`, `search`, `commit`,
+`final-sync`, ...). The `commit` column holds the fixture commit for
+commit-specific steps and is empty otherwise.
 
 `config.json` records the run configuration and per-target facts. Each node's
 `targets[].info.hosts[<node>]` entry holds `fixture_sha256` and the Git, Make and
@@ -309,10 +319,11 @@ to plot. Rows from earlier successful targets remain in the run directory.
 ## Durability, limitations and provenance
 
 Git receives `core.fsync=committed` and `core.fsyncMethod=fsync`. Git commits
-flush committed repository data; editing/building does not add explicit fsync.
-No cache is dropped, so reads are warm. These are throughput/efficiency
-measurements, **not crash-durability measurements**. No cgroup controls are
-introduced.
+flush committed repository data; the kernel workload additionally flushes the
+checkout's filesystem before the measured phase and again at the end of the
+timed workflow, covering build outputs and directory entries. These are
+throughput/efficiency measurements, **not crash-durability measurements**. No
+cache is dropped, so reads are warm. No cgroup controls are introduced.
 
 Unlike upstream's backend-managed transitions, these workflows perform no
 checkpoints or snapshots and emit no placeholder checkpoint steps. Fixture commands run under

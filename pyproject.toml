@@ -5,6 +5,7 @@ description = "Benchmarking agent workloads on filesystems."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "alibabacloud_polardb20170801>=9.4.0,<10",
     "matplotlib>=3.10,<4",
     "mpi4py>=4.1",
 ]

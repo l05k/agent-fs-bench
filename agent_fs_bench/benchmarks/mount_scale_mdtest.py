@@ -1,4 +1,8 @@
-"""Mount-scale file phases with the original IOR 4.0.0 mdtest binary.
+"""K>1 shared-scope ablation phases with the original IOR 4.0.0 mdtest binary.
+
+The canonical K=1 mount-scale path uses synchronized POSIX read/create-write jobs and
+does not execute mdtest. This module remains for the explicitly selected K>1
+shared read-only layout comparison; each job is launched with its configured timeout.
 
 | Symbol | Definition |
 | --- | --- |
@@ -127,7 +131,7 @@ def phases_of(prefix: str, labels: Sequence[str], names: Sequence[str], timings:
 
 def run_job(launcher: cluster.Launcher, binary: str, tag: str, label: str, ranks: Sequence[Rank],
             groups: Sequence[Sequence[str]], phases: Sequence[str], log_dir: Path,
-            files: int, private: bool = False) -> Timings:
+            files: int, timeout_s: float, private: bool = False) -> Timings:
     """Run one global MPMD job and return its validated timings."""
     capture = Path('/tmp') / f'agent-fs-bench-{tag}-{label}.csv'
     placement = tuple(rank.node for rank in ranks)
@@ -138,7 +142,8 @@ def run_job(launcher: cluster.Launcher, binary: str, tag: str, label: str, ranks
         cluster.make_directories(launcher, directories)
     programs = [[binary, *group, '--saveRankPerformanceDetails', str(capture)]
                 for group in groups]
-    run = cluster.run_program(placement, launcher, programs, log_dir, label)
+    run = cluster.run_program(placement, launcher, programs, log_dir, label,
+                              timeout_s=timeout_s)
     cluster.validate_exit(run)
     check_banner(label, run.stdout, len(ranks))
     timings = read_timings(label, cluster.fetch_file(placement[0], launcher, capture),
@@ -155,11 +160,12 @@ class Mdtest:
     binary: str
     launcher: cluster.Launcher
     tag: str  # Unique per run and target: names rank 0's CSV file.
+    timeout_s: float  # One MPI job; run_program kills the launcher group on expiry.
 
     def job(self, label: str, ranks: Sequence[Rank], groups: Sequence[Sequence[str]],
             phases: Sequence[str], log_dir: Path, files: int, private: bool = False) -> Timings:
         return run_job(self.launcher, self.binary, self.tag, label, ranks, groups, phases,
-                       log_dir, files, private)
+                       log_dir, files, self.timeout_s, private)
 
     def prepare(self, node: cluster.Node, shared_paths: Sequence[Path], files: int, size: int,
                 log_dir: Path) -> None:

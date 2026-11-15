@@ -150,14 +150,11 @@ value:
     which gives the batch wall time.
   - Clocks of different machines are never compared; per-task durations are measured
     by each task on its own machine.
-- **Native MPI programs** are started by `mpiexec` directly: mdtest and mdtest-peak one
-  MPI job per repeat; mount-scale one job per shared fixture, then per repeat one warm-up
-  job per shared resource, the private job and one job per shared resource.
-  - Before a job the controller creates the directories mdtest expects on each machine
-    (`mkdir -p` over SSH); after it, the controller fetches rank 0's CSV from rank 0's
-    machine.
-  - mount-scale also keeps one lifecycle worker per participating machine (over SSH
-    for remote machines) for mounts, sampling and cleanup between the jobs.
+- **Native workload jobs:** mdtest and mdtest-peak launch upstream MPI directly.
+  Mount-scale uses one synchronized POSIX read job and one durable create-write
+  job per K=1 repeat. K>1 separately uses mdtest for the shared-scope ablation.
+  Mount-scale has a lifecycle worker on each participating machine; it prepares
+  private files and manages mounts, sampling and cleanup outside I/O timing.
 
 ## Directories and data
 
@@ -175,6 +172,6 @@ value:
   - Experiments that need one directory seen by every task need a shared target:
     mdtest's `shared` layout and mount-scale's `admin_root`.
 
-Any error stops the run. A failing task aborts the whole MPI job, and the controller
-reports the tail of the launcher stderr. There is no retry, failover or smaller N; work
-directories and diagnostics stay for inspection.
+Unexpected errors stop the run. A failing task aborts the whole MPI job; see
+the launcher stderr. Classified replay divergence, error and timeout are raw
+outcomes, not timings. There is no retry, failover or smaller N.

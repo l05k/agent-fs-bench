@@ -1,11 +1,13 @@
 """Persistent per-machine lifecycle workers for mount-scale.
 
-All file-operation timing belongs to the separate, global Open MPI mdtest jobs. Each
-machine of the run keeps one worker in its own checkout (started over SSH for remote
-machines) that holds Layout/Sampler state across those jobs. Protocol: the controller
-writes the job, then one JSON request per line; the worker answers each with one JSON
-result line. A failing worker exits with its traceback in `worker.stderr.txt`; mounts and
-data stay for inspection.
+File-operation timing belongs to separate global MPI jobs: synchronized POSIX
+read/create-write for the canonical K=1 path, and mdtest only for the explicit K>1
+shared-scope ablation. Each machine keeps one worker in its own checkout (started over
+SSH for remote machines) that holds Layout/Sampler state across those jobs. The worker
+also prepares each read fixture through the first mount, outside measured I/O timing.
+Protocol: the controller writes the job, then one JSON request per line; the worker
+answers each with one JSON result line. A failing worker exits with its traceback in
+`worker.stderr.txt`; mounts and data stay for inspection.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from agent_fs_bench import cluster
 from agent_fs_bench.results import PROJECT_ROOT
 from agent_fs_bench.ssh import ssh_argv
 from .mount_scale_mounts import Client, Layout, parse_profile
+from . import mount_scale_io as io
 from . import mount_scale_resources as resources
 
 
@@ -85,7 +88,10 @@ class Worker:
     def call(self, action: str, **data) -> dict:
         self._send({'action': action, **data})
         steps = self.job['directories'] if action in ('mount', 'unmount') else 1
-        return self._reply(self.timeout_s * steps)
+        timeout_s = (self.job['fixture_timeout_s']
+                     if action in ('prepare-read', 'cleanup', 'remove-data')
+                     else self.timeout_s * steps)
+        return self._reply(timeout_s)
 
     def collect(self) -> None:
         for relative, content in self.call('diagnostics').items():
@@ -125,11 +131,13 @@ class Lifecycle:
         self.sampler: resources.Sampler | None = None
         self.private: Path | None = None
         self.local: Path | None = None
+        self.clients: tuple[Client, ...] = ()
 
     def command(self, request: dict) -> dict:
         actions = {
             'init-data': self.init_data, 'setup': self.setup, 'mount': self.mount,
-            'unmount': self.unmount, 'idle': self.idle, 'sample-start': self.sample_start,
+            'unmount': self.unmount, 'prepare-read': self.prepare_read,
+            'idle': self.idle, 'sample-start': self.sample_start,
             'sample-stop': self.sample_stop, 'cleanup': self.cleanup,
             'remove-repeat': self.remove_repeat, 'remove-data': self.remove_data,
             'diagnostics': self.diagnostics, 'finish': self.finish,
@@ -141,6 +149,24 @@ class Lifecycle:
 
     def unmount(self, request: dict) -> dict:
         return {**self.layout.unmount(), 'agent_elapsed_s': self.layout.unmount_agent_elapsed_s}
+
+    def prepare_read(self, request: dict) -> dict:
+        """Create each client's durable read fixture through its first mount.
+
+        This runs before the measured remount and is never part of I/O timing.
+        """
+        files, size = request['files'], request['file_size_bytes']
+        assert self.clients, 'prepare-read: expected clients from setup'
+        def prepare(entry: tuple[int, Client]) -> dict:
+            index, client = entry
+            read = client.workspace / 'read'
+            write = client.workspace / 'write'
+            write.mkdir()
+            total = io.prepare_fixture(read, files, size, f'{self.job["name"]}-read-{index}')
+            return {'files': files, 'bytes': total}
+        with ThreadPoolExecutor(max_workers=len(self.clients)) as pool:
+            values = list(pool.map(prepare, enumerate(self.clients)))
+        return {'clients': values}
 
     def idle(self, request: dict) -> dict:
         return idle(self.job['idle_sample_s'])
@@ -214,6 +240,7 @@ class Lifecycle:
                                  log_dir=self.logs / name / 'lifecycle',
                                  timeout_s=self.job['command_timeout_s'])
             aliases = self.layout.clients
+        self.clients = tuple(aliases)
         baseline = idle(self.job['idle_sample_s'])
         return {'clients': [{'workspace': str(client.workspace),
                              'shared': [str(p) for p in client.shared]} for client in aliases],

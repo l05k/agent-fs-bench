@@ -34,8 +34,12 @@ it is not converted from the pnpm lockfile.
 ## SQLite
 
 `kvtest` and `sqlite-speedtest` build pinned official SQLite sources; version and
-hashes are recorded in results. See [sqlite-speedtest](bench-sqlite-speedtest.md)
-and [kvtest](bench-kvtest-openclaw.md).
+hashes are recorded in results. `kvtest` also applies
+`data/sqlite/kvtest-3.54.1-verify.patch` to the SHA-256-verified official
+`kvtest.c`. The patch only adds error checks, effective-setting readback and
+completed-operation counts; the upstream source and patch hashes are both part
+of the build provenance. See [sqlite-speedtest](bench-sqlite-speedtest.md) and
+[kvtest](bench-kvtest-openclaw.md).
 
 ## Licensing
 
