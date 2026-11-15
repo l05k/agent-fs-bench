@@ -202,12 +202,26 @@ class BuildProvenanceTests(unittest.TestCase):
 KVTEST_RUN_STDOUT = (
     "SQLite version: 3.54.1\n"
     "--count 2000 --max-id 2000 --random\n"
-    "--cache-size -1000 --jmode wal\n"
+    "--cache-size -1000 --jmode wal --synchronous 2\n"
     "--mmap 0\n"
+    "Completed updates: 2000 of 2000\n"
+    "Committed transactions: 2000\n"
     "Database page size: 4096\n"
     "Total elapsed time: 6.123\n"
     "Microseconds per BLOB write: 3061.500\n"
     "Content write rate: 12.3 MB/s\n"
+)
+
+KVTEST_READ_STDOUT = (
+    "SQLite version: 3.54.1\n"
+    "--count 2000 --max-id 2000 --random\n"
+    "--cache-size -1000 --jmode wal --synchronous 2\n"
+    "--mmap 0\n"
+    "Completed reads: 2000 of 2000\n"
+    "Database page size: 4096\n"
+    "Total elapsed time: 3.045\n"
+    "Microseconds per BLOB read: 1522.500\n"
+    "Content read rate: 25.0 MB/s\n"
 )
 
 KVTEST_STAT_STDOUT = (
@@ -222,41 +236,66 @@ KVTEST_STAT_STDOUT = (
 )
 
 class OutputParsingTests(unittest.TestCase):
-    def test_parses_official_output_and_reports_measured_fields(self):
-        parsed = kvtest.parse_kvtest_output(KVTEST_RUN_STDOUT)
+    def test_parses_write_output_and_reports_measured_fields(self):
+        parsed = kvtest.parse_kvtest_output(KVTEST_RUN_STDOUT, update=True)
         self.assertEqual(
             parsed,
             {
                 "sqlite_version": "3.54.1",
                 "journal_mode": "wal",
                 "cache_size": -1000,
+                "synchronous": 2,
                 "page_size": 4096,
                 "total_elapsed_s": 6.123,
                 "microseconds_per_write": 3061.5,
                 "write_rate_mb_s": 12.3,
+                "completed_updates": 2000,
+                "attempted_updates": 2000,
+                "committed_transactions": 2000,
             },
         )
-        # --mmap and --synchronous are never read back, so they are not here.
+        # --mmap is only echoed by kvtest, so it is not reported as observed.
         self.assertNotIn("mmap", parsed)
         self.assertNotIn("mmap_bytes", parsed)
-        self.assertNotIn("synchronous", parsed)
 
-    def test_parses_non_default_request_echoes_without_promoting_them(self):
+    def test_parses_separate_read_output(self):
+        parsed = kvtest.parse_kvtest_output(KVTEST_READ_STDOUT, update=False)
+        self.assertEqual(
+            parsed,
+            {
+                "sqlite_version": "3.54.1",
+                "journal_mode": "wal",
+                "cache_size": -1000,
+                "synchronous": 2,
+                "page_size": 4096,
+                "total_elapsed_s": 3.045,
+                "microseconds_per_read": 1522.5,
+                "read_rate_mb_s": 25.0,
+                "completed_reads": 2000,
+                "attempted_reads": 2000,
+            },
+        )
+
+    def test_parses_non_default_request_echoes(self):
         text = KVTEST_RUN_STDOUT.replace(
             "--jmode wal", "--jmode delete"
+        ).replace(
+            "--synchronous 2", "--synchronous 0"
         ).replace("--mmap 0\n", "--mmap 1048576\n--nosync\n")
-        parsed = kvtest.parse_kvtest_output(text)
+        parsed = kvtest.parse_kvtest_output(text, update=True)
         self.assertEqual(parsed["journal_mode"], "delete")
-        self.assertNotIn("synchronous", parsed)
+        self.assertEqual(parsed["synchronous"], 0)
 
     def test_missing_measured_field_is_an_error(self):
         cases = {
             "SQLite version:": "sqlite_version",
-            "--cache-size": "cache_size_and_journal_mode",
+            "--cache-size": "settings",
             "Database page size:": "page_size",
             "Total elapsed time:": "total_elapsed_s",
             "Microseconds per BLOB write:": "microseconds_per_write",
             "Content write rate:": "write_rate_mb_s",
+            "Completed updates:": "completed_updates",
+            "Committed transactions:": "committed_transactions",
         }
         for prefix, field in cases.items():
             with self.subTest(prefix=prefix):
@@ -268,7 +307,88 @@ class OutputParsingTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     sqlite_tools.BenchmarkError, "missing .*" + field
                 ):
-                    kvtest.parse_kvtest_output(text)
+                    kvtest.parse_kvtest_output(text, update=True)
+
+    def test_missing_read_field_is_an_error(self):
+        with self.assertRaisesRegex(
+            sqlite_tools.BenchmarkError, "missing .*completed_reads"
+        ):
+            kvtest.parse_kvtest_output(
+                KVTEST_READ_STDOUT.replace("Completed reads: 2000 of 2000\n", ""),
+                update=False,
+            )
+
+    def test_effective_settings_must_match_requested(self):
+        args = kvtest.parse_args([])
+        args.jmode = "wal"
+        cases = {
+            "journal_mode": KVTEST_RUN_STDOUT.replace(
+                "--jmode wal", "--jmode truncate"),
+            "cache_size": KVTEST_RUN_STDOUT.replace(
+                "--cache-size -1000", "--cache-size -2000"),
+            "synchronous": KVTEST_RUN_STDOUT.replace(
+                "--synchronous 2", "--synchronous 1"),
+        }
+        for field, text in cases.items():
+            with self.subTest(field=field):
+                parsed = kvtest.parse_kvtest_output(text, update=True)
+                with self.assertRaisesRegex(
+                    sqlite_tools.BenchmarkError, field
+                ):
+                    kvtest.verify_output(
+                        parsed, args, update=True, where="task 0 on host"
+                    )
+
+    def test_completed_and_committed_counts_are_checked(self):
+        args = kvtest.parse_args([])
+        args.jmode = "wal"
+        parsed = kvtest.parse_kvtest_output(KVTEST_RUN_STDOUT, update=True)
+        kvtest.verify_output(parsed, args, update=True, where="task 0 on host")
+
+        cases = {
+            "completed_updates": KVTEST_RUN_STDOUT.replace(
+                "Completed updates: 2000 of 2000",
+                "Completed updates: 1999 of 2000"),
+            "attempted_updates": KVTEST_RUN_STDOUT.replace(
+                "Completed updates: 2000 of 2000",
+                "Completed updates: 2000 of 2001"),
+            "committed_transactions": KVTEST_RUN_STDOUT.replace(
+                "Committed transactions: 2000",
+                "Committed transactions: 1"),
+        }
+        for field, text in cases.items():
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    sqlite_tools.BenchmarkError, field
+                ):
+                    kvtest.verify_output(
+                        kvtest.parse_kvtest_output(text, update=True),
+                        args, update=True, where="task 0 on host",
+                    )
+
+    def test_batch_mode_expects_one_committed_transaction(self):
+        args = kvtest.parse_args([])
+        args.jmode = "wal"
+        args.multitrans = False
+        text = KVTEST_RUN_STDOUT.replace(
+            "Committed transactions: 2000", "Committed transactions: 1")
+        kvtest.verify_output(
+            kvtest.parse_kvtest_output(text, update=True),
+            args, update=True, where="task 0 on host",
+        )
+
+    def test_read_counts_are_checked(self):
+        args = kvtest.parse_args([])
+        args.jmode = "wal"
+        bad = KVTEST_READ_STDOUT.replace(
+            "Completed reads: 2000 of 2000", "Completed reads: 1999 of 2000")
+        with self.assertRaisesRegex(
+            sqlite_tools.BenchmarkError, "completed_reads"
+        ):
+            kvtest.verify_output(
+                kvtest.parse_kvtest_output(bad, update=False),
+                args, update=False, where="task 0 on host",
+            )
 
     def test_requires_integrity_line_in_stat_output(self):
         text = "".join(
@@ -295,16 +415,22 @@ class OutputParsingTests(unittest.TestCase):
             kvtest.parse_integrity_check(text)
 
 class ConfigurationTests(unittest.TestCase):
-    def test_run_argv_adds_only_the_requested_mode_flags(self):
+    def test_run_argv_separates_write_and_read_phases(self):
         binary, database = Path("kvtest"), Path("kvtest.sqlite")
         args = kvtest.parse_args([])
-        argv = kvtest.run_argv(binary, database, args)
+        argv = kvtest.run_argv(binary, database, args, update=True)
+        self.assertIn("--update", argv)
         self.assertIn("--multitrans", argv)
         self.assertNotIn("--nosync", argv)
         args.multitrans = False
         args.nosync = True
-        argv = kvtest.run_argv(binary, database, args)
+        argv = kvtest.run_argv(binary, database, args, update=True)
         self.assertNotIn("--multitrans", argv)
+        self.assertIn("--nosync", argv)
+        argv = kvtest.run_argv(binary, database, args, update=False)
+        self.assertNotIn("--update", argv)
+        self.assertNotIn("--multitrans", argv)
+        self.assertIn("--random", argv)
         self.assertIn("--nosync", argv)
 
 if __name__ == "__main__":

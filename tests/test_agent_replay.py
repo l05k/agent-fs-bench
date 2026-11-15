@@ -1,4 +1,3 @@
-import json
 import os
 from pathlib import Path
 import shutil
@@ -29,18 +28,18 @@ class ReplayInputTests(unittest.TestCase):
         self.config = self.root / 'cases.toml'
         self.config.write_text(
             '[[cases]]\nname = "task-a"\ntask = "task"\ncassette = "cassette"\n'
+            'benchmark = "smoke"\ntask_id = "one"\nagent = "codex"\n'
             '[[cases.mounts]]\nsource = "initial"\ncontainer = "/app"\n'
         )
 
-    def test_unaccepted_cassette_cannot_become_a_performance_sample(self):
-        with self.assertRaisesRegex(ValueError, 'validate cassette'):
-            load_cases(self.config)
-        (self.cassette / 'validation.json').write_text(json.dumps({'minimum_reward': 1.0}))
+    def test_uncaptured_case_remains_in_planned_cohort(self):
+        self.cassette.rmdir()
         case, = load_cases(self.config)
+        self.assertEqual((case.benchmark, case.task_id, case.agent), ('smoke', 'one', 'codex'))
+        self.assertEqual(case.cassette, self.cassette)
         self.assertEqual(case.mounts[0].source, self.source.resolve())
 
     def test_overlapping_mounts_cannot_hide_restored_data(self):
-        (self.cassette / 'validation.json').write_text('{}')
         with self.config.open('a') as handle:
             handle.write('[[cases.mounts]]\nsource = "initial"\ncontainer = "/app/data"\n')
         with self.assertRaisesRegex(ValueError, 'overlapping container mounts'):
@@ -52,7 +51,7 @@ class ReplayInputTests(unittest.TestCase):
         self.assertEqual(cases_path(str(self.config)), self.config)
 
     def test_inputs_must_stay_outside_the_measured_target(self):
-        case = ReplayCase('task-a', self.task, self.cassette,
+        case = ReplayCase('task-a', 'smoke', 'one', 'codex', self.task, self.cassette,
                           (Mount(self.source, '/app'),))
         target = self.root / 'target'
         target.mkdir()
@@ -60,7 +59,7 @@ class ReplayInputTests(unittest.TestCase):
         inside = target / 'initial'
         inside.mkdir()
         with self.assertRaisesRegex(ValueError, 'must be outside target'):
-            check_storage(ReplayCase('task-a', self.task, self.cassette,
+            check_storage(ReplayCase('task-a', 'smoke', 'one', 'codex', self.task, self.cassette,
                                      (Mount(inside, '/app'),)), target, self.config)
 
     def test_machines_must_fingerprint_the_same_inputs(self):
@@ -72,19 +71,12 @@ class ReplayInputTests(unittest.TestCase):
             check_consistent([{'node': 'local', 'facts': facts},
                               {'node': 'node-a', 'facts': other}])
 
-    def test_only_a_measured_replay_yields_measurements(self):
-        summary = {'mode': 'replay', 'checked': False, 'measured': True,
-                   'elapsed_sec': 12.5, 'model_requests': 3,
-                   'phase_seconds': {'environment_setup': 1.5, 'verifier': None}}
-        self.assertEqual(measurements(summary, self.root / 'output'),
-                         {'elapsed_s': 12.5, 'model_requests': 3,
-                          'phases': {'environment_setup': 1.5}})
-        for name in ('checked', 'measured'):
-            with self.subTest(field=name):
-                with self.assertRaisesRegex(ValueError, 'not a measured replay'):
-                    measurements({**summary, name: not summary[name]}, self.root / 'output')
-        with self.assertRaisesRegex(ValueError, 'not a measured replay'):
-            measurements({**summary, 'mode': 'validate'}, self.root / 'output')
+    def test_classified_failures_do_not_need_a_timing_sample(self):
+        for status in ('divergence', 'timeout', 'error'):
+            result = measurements({'mode': 'replay', 'status': status}, self.root)
+            self.assertNotIn('tool_s', result)
+        with self.assertRaisesRegex(ValueError, 'not a replay outcome'):
+            measurements({'mode': 'record', 'status': 'ok'}, self.root)
 
     def test_content_modes_and_links_distinguish_experiment_inputs(self):
         payload = self.source / '.hidden'

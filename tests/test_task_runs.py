@@ -23,7 +23,7 @@ from agent_fs_bench.benchmarks import (agent_replay, clone, kvtest, mini_dev_wor
                                        npm_install, sqlite_speedtest, sqlite_tools)
 import fake_task
 from fake_task import run_tasks
-from test_kvtest import KVTEST_RUN_STDOUT
+from test_kvtest import KVTEST_READ_STDOUT, KVTEST_RUN_STDOUT
 from test_sqlite_speedtest import SPEEDTEST_STDOUT
 
 LINUX = sys.platform.startswith('linux')
@@ -47,12 +47,16 @@ class TaskRunTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.tools = Path(temporary.name)
 
-    def fake_sqlite_build(self, tool: str, stdout: str):
-        """A prebuilt binary that prints recorded official output."""
+    def fake_sqlite_build(self, tool: str, stdout: str, read_stdout: str | None = None):
+        """A prebuilt binary that prints representative SQLite output."""
         (self.tools / 'stdout.txt').write_text(stdout)
         (self.tools / 'stat.txt').write_text('Integrity-check: ok\n')
+        run = f'cat {self.tools}/stdout.txt'
+        if read_stdout is not None:
+            (self.tools / 'read.txt').write_text(read_stdout)
+            run = f'case " $* " in *" --update "*) {run} ;; *) cat {self.tools}/read.txt ;; esac'
         program(self.tools / tool, f'case "$1" in\n'
-                f'  run) cat {self.tools}/stdout.txt ;;\n'
+                f'  run) {run} ;;\n'
                 f'  stat) cat {self.tools}/stat.txt ;;\n'
                 f'  init) ;;\n'
                 f'  *) cat {self.tools}/stdout.txt ;;\nesac\n')
@@ -87,7 +91,9 @@ class TaskRunTests(unittest.TestCase):
     def test_kvtest(self):
         args = kvtest.parse_args([])
         args.build_dir, args.repeats = str(self.tools), 1
-        sources, build = self.fake_sqlite_build('kvtest', KVTEST_RUN_STDOUT)
+        sources, build = self.fake_sqlite_build('kvtest',
+            KVTEST_RUN_STDOUT.replace('--jmode wal', '--jmode delete'),
+            KVTEST_READ_STDOUT.replace('--jmode wal', '--jmode delete'))
         for label, slots in LAYOUTS.items():
             with self.subTest(layout=label):
                 with sources, build:
@@ -96,6 +102,7 @@ class TaskRunTests(unittest.TestCase):
                                   for row in rows['repeats']],
                                  [('2', str(index), slot[0])
                                   for index, slot in enumerate(slots)])
+                self.assertEqual([row['host'] for row in rows['reads']], [slot[0] for slot in slots])
 
     def test_sqlite_speedtest(self):
         args = sqlite_speedtest.parse_args([])
@@ -150,8 +157,8 @@ class TaskRunTests(unittest.TestCase):
             (replay / name).write_text('')
         program(replay / '.venv' / 'bin' / 'python',
                 """echo '{"python": "3.13", "harbor": "0.24.0", "mitmproxy": "12.2.3"}'\n""")
-        summary = json.dumps({'mode': 'replay', 'checked': False, 'measured': True,
-                              'elapsed_sec': 1.5, 'model_requests': 2,
+        summary = json.dumps({'mode': 'replay', 'status': 'ok', 'agent': 'codex',
+                              'tool_s': 0.5, 'harbor_s': 1.5, 'model_requests': 2,
                               'phase_seconds': {'agent_execution': 1.0, 'verifier': 0.25}})
         program(replay / '.venv' / 'bin' / 'agent-mitm-replay',
                 'while [ $# -gt 0 ]; do [ "$1" = --output ] && out=$2; shift; done\n'
@@ -161,13 +168,15 @@ class TaskRunTests(unittest.TestCase):
         (cases / 'task' / 'task.toml').write_text('')
         cassette = cases / 'cassette'
         cassette.mkdir()
-        for name in ('validation.json', 'flows.mitm', 'commands.json', 'task.toml'):
+        for name in ('flows.mitm', 'tools.json'):
             (cassette / name).write_text('{}')
-        (cassette / 'manifest.json').write_text('{"model": "scripted"}')
+        (cassette / 'manifest.json').write_text(json.dumps({
+            'schema_version': 3, 'agent': 'codex', 'agent_version': '0.169.0', 'model': 'scripted'}))
         (cases / 'initial').mkdir()
         (cases / 'initial' / 'file').write_text('data')
         (cases / 'cases.toml').write_text(
             '[[cases]]\nname = "smoke"\ntask = "task"\ncassette = "cassette"\n'
+            'benchmark = "smoke"\ntask_id = "one"\nagent = "codex"\n'
             '[[cases.mounts]]\nsource = "initial"\ncontainer = "/app"\n')
         args = agent_replay.parse_args([])
         args.cases_file, args.repeats = str(cases / 'cases.toml'), 1
@@ -175,12 +184,13 @@ class TaskRunTests(unittest.TestCase):
             for label, slots in LAYOUTS.items():
                 with self.subTest(layout=label):
                     rows = run_tasks(agent_replay, args, slots)
-                    self.assertEqual([(row['case'], row['sample'], row['elapsed_s'])
+                    self.assertEqual([(row['case'], row['sample'], row['tool_s'])
                                       for row in rows['replays']],
-                                     [('smoke', str(index), '1.5')
+                                     [('smoke', str(index), '0.5')
                                       for index, _slot in enumerate(slots)])
                     self.assertEqual({row['phase'] for row in rows['phases']},
                                      {'agent_execution', 'verifier'})
+                    self.assertEqual([row['status'] for row in rows['outcomes']], ['ok', 'ok'])
 
 
 class FakeWorldTests(unittest.TestCase):

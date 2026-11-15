@@ -9,27 +9,29 @@ results/<bench>/<run-id>/
   <target>/            # per-target launcher logs (appfiles, stdout, stderr) and diagnostics
 ```
 
-`run` writes only raw data. Each workload doc lists its tables and default
-figures; figures come only from `plot`. Rows are appended and flushed one at a
-time outside timed regions, so a crash keeps every completed measurement. A
-failed check emits no row.
+`run` writes raw observations; figures come only from `plot`. Native workloads
+may leave partial rows in the CSV when a target fails. Python MPI workloads
+publish rows only after the job completes. Replay has a separate `outcomes`
+table for planned failures and emits no latency for those trials.
 
 ## config.json
 
 | Field | Meaning |
 | --- | --- |
 | `benchmark`, `run_id` | Workload; UTC run ID with microseconds |
-| `seed` | Always `null`: no harness code draws random numbers that shape a measurement |
+| `config.seed` | Fixed input-generation seed, used for clone payload bytes |
 | `git_commit` | `git rev-parse HEAD` of the checkout |
 | `source_sha256` | Fingerprint of benchmark sources and fixed inputs, including uncommitted edits; each workload's `CONFIG` literal is excluded because `config` records it |
 | `config` | The workload's settings: `CONFIG` plus workload flags, the run `mode`, and the launcher settings as `launcher` (`mpiexec`, `mpiexec_args`, `env`) |
 | `mpi_version` | Open MPI version of the launcher |
 | `nodes` | Each machine of the mode: name, hostname, cpu_model (lscpu "Model name"), cpu_count, system, kernel, machine (architecture), python, mpi4py, mpi_library |
+| `planned_targets` | Target names selected before the run, including unfinished targets |
 | `targets[]` | `name`, `path` and `info` of each finished target: tool versions, binary hashes and fstype (per machine under `hosts`), and the task count per machine (`placement`) |
 | `tables` | `keys` and `metrics` columns of each table |
 
-`config.json` is rewritten after each target. A failed target is absent; its
-partial rows stay in the CSV.
+`config.json` is rewritten after each target. An unfinished target remains in
+`planned_targets` but is absent from `targets`. `plot` filters CSV rows against
+the completed targets **of their own run** before pooling.
 
 ## Tables
 

@@ -67,45 +67,27 @@ schedules them, and N above the CPU count oversubscribes. List remote machines i
 `local/hosts.toml` (see `experiments/hosts.example.toml`); every machine needs the same
 checkout. Setup, placement and launcher settings: [run modes](docs/run-modes.md).
 
-Experiment flow (`cli.py` → `cluster.py` → workload), warm-up → sampling → validate →
-metrics → write:
-
-```text
-launcher = Launcher(**cluster.CONFIG)                      # recorded as config.launcher
-pool = open_pool(mode, launcher); validate_pool(pool, source)   # hosts, arch, source, MPI
-write config.json (seed=null, git_commit, config, nodes)
-for target in targets:
-    placement = place(pool.nodes, CONFIG.tasks)            # round-robin, contiguous ranks
-    if python workload:                                    # one MPI job, task(t) per rank
-        run = run_program(placement, launcher, task argv, stdin=JobSpec)
-        messages = parse_messages(run.stdout); validate_job(run, messages, placement)
-        ctx.emit(rows) -> <table>.csv;  ctx.info |= job_info(messages, placement)
-    else:                                                  # native mdtest
-        validate_binary(bin, binary_digests(machines(placement), launcher, bin))
-        [mount-scale: prepare fixtures; per repeat setup, mount, warm-up (discarded)]
-        for repeat:                                        # sampling
-            run = run_program(placement, launcher, mdtest argv per rank); validate(run)
-            csv = fetch_file(placement[0], launcher, rank0_csv)
-            metrics = read_phases(csv), read_rank_times(csv)   # pure: W / T_p, t_{p,r}
-            ctx.emit("phases" | "ranks" | ..., metrics)        # one table per granularity
-    rewrite config.json with targets[].info
-```
+The controller records the launcher, node facts and planned targets before
+running any workload. It appends validated raw observations and marks a target
+complete only after the workload returns. Mount-scale runs its two synchronized
+I/O batches under the mount lifecycle; mdtest has its own phase counters. The
+per-workload docs define each timing boundary.
 
 ## Workloads
 
 | Command | Workload | Doc |
 | --- | --- | --- |
-| `dev-workflow` | N concurrent Linux kernel workflows: configure, build, search, edit, commit, tree check | [dev workflow](docs/bench-dev-workflow.md) |
+| `dev-workflow` | N concurrent Linux kernel workflows: build, search, edit, Git, tree check and final filesystem sync | [dev workflow](docs/bench-dev-workflow.md) |
 | `mini-dev-workflow` | Same Git worktree workflow on a small C project | [dev workflow](docs/bench-dev-workflow.md) |
 | `npm-install` | N concurrent offline npm or pnpm installs into cold `node_modules` | [npm install](docs/bench-npm-install.md) |
 | `npm-install-nofsync` | Same, with no harness fsync; install timing, throughput and tree stats, no flush/durable metrics | [npm install](docs/bench-npm-install.md#no-fsync-variant) |
-| `clone` | N concurrent durable same-filesystem clones of one directory shape | [clone](docs/bench-clone.md) |
-| `kvtest` | N independent SQLite `kvtest` random BLOB overwrites, per-write or batched commits | [kvtest](docs/bench-kvtest-openclaw.md) |
+| `clone` | Durable directory copies and native LakeBase Clone OpenAPI latency | [clone](docs/bench-clone.md) |
+| `kvtest` | SQLite small-BLOB reads and checked synchronous overwrites | [kvtest](docs/bench-kvtest-openclaw.md) |
 | `sqlite-speedtest` | N independent SQLite `speedtest1 main` SQL phases | [sqlite-speedtest](docs/bench-sqlite-speedtest.md) |
-| `mount-scale` | N mdtest clients per mount topology; Open MPI mdtest and mount lifecycle | [mount scale](docs/bench-mount-scale.md) |
+| `mount-scale` | N independent mounts running remounted whole-file reads and batch-durable creates | [mount scale](docs/bench-mount-scale.md) |
 | `mdtest` | POSIX file or directory metadata throughput of N tasks at fixed total work | [mdtest](docs/bench-mdtest.md) |
 | `mdtest-peak` | Weak-scaling file create/stat/read/unlink ops/s and MiB/s of N tasks, up to 2× CPUs | [mdtest peak](docs/bench-mdtest-peak.md) |
-| `agent-replay` | N concurrent real Harbor/Docker tasks driven by accepted model-response cassettes | [agent replay](docs/bench-agent-replay.md) |
+| `agent-replay` | Paired Codex/OpenClaw model-response replay with native tool timing and per-trial verification | [agent replay](docs/bench-agent-replay.md) |
 
 ```sh
 uv run python -m agent_fs_bench run <command> --dirs /mnt/fs-a
@@ -156,8 +138,8 @@ Columns and plot options: [results and figures](docs/results-and-analysis.md).
   compare tool versions (in each target's `info`), kernel, mount options or host
   environment; keep those consistent yourself. `config.json` records each machine's
   probed facts (`nodes`, incl. CPU model) and every target's task count per machine.
-- No result is cold-cache. Page cache, FUSE client cache and server cache are
-  separate layers, and each workload keeps its own sync and cache semantics.
+- Cache semantics are workload-specific. `mount-scale` remounts the clients
+  before reads; this does not evict server or persistent/shared client caches.
 - Tasks are not bound to CPUs; resource limits (cgroups, cpusets) for FUSE clients,
   servers and the benchmark are set externally.
 - Smoke runs only prove the pipeline works; they are not performance or

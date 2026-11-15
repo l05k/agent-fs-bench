@@ -109,13 +109,17 @@ def plot(run_dirs: list[Path], figures: list[Figure] | None = None, *,
     (e.g. `LakeBase/cp-r`); the first is the primary system.
     """
     snapshots = load_snapshots(run_dirs, vary)
+    completed = [{target['name'] for target in snapshot['targets']}
+                 for snapshot in snapshots]
     finished = list(dict.fromkeys(
         target['name'] for snapshot in snapshots for target in snapshot['targets']))
     required = figures is not None
     figures = figures if required else getattr(workload(snapshots[0]['benchmark']), 'FIGURES', [])
-    tables = {spec.table: [row for run in run_dirs if (run / f'{spec.table}.csv').exists()
-                           for row in read_table(run / f'{spec.table}.csv')]
-              for spec in figures}
+    tables = {}
+    for table in {spec.table for spec in figures}:
+        tables[table] = [row for run, names in zip(run_dirs, completed, strict=True)
+                         if (path := run / f'{table}.csv').is_file()
+                         for row in read_table(path) if row['target'] in names]
     if targets:
         known = set(finished) | {'/'.join(row[key] for key in spec.series)
                                  for spec in figures for row in tables[spec.table]}

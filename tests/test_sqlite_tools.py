@@ -58,26 +58,80 @@ class DownloadIntegrityTests(unittest.TestCase):
             archive.writestr("sqlite-amalgamation-3540100/sqlite3.h", "release header")
         payloads = {
             sqlite_tools.SQLITE_AMALGAMATION: archive_buffer.getvalue(),
-            "kvtest.c": b"release kvtest",
+            "kvtest.c": b"release kvtest\n",
         }
         expected = {name: hashlib.sha256(content).hexdigest()
                     for name, content in payloads.items()}
         for corrupt_name in payloads:
             with self.subTest(corrupt_name=corrupt_name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
+                patch = root / "kvtest-verify.patch"
+                patch.write_text(
+                    "--- a/kvtest.c\n+++ b/kvtest.c\n"
+                    "@@ -1 +1 @@\n-release kvtest\n+release kvtest checked\n",
+                    encoding="utf-8",
+                )
                 for name, content in payloads.items():
                     (root / name).write_bytes(content)
                 (root / corrupt_name).write_bytes(b"<html>not a source file</html>")
                 with mock.patch.dict(sqlite_tools.DOWNLOAD_SHA256, expected), \
+                        mock.patch.object(sqlite_tools, "KVTEST_PATCH", patch), \
                         mock.patch.object(sqlite_tools.urllib.request, "urlopen") as fetch:
                     with self.assertRaisesRegex(sqlite_tools.BenchmarkError, "SHA-256 mismatch"):
                         sqlite_tools.ensure_sources(root, "kvtest", force=False)
                     fetch.assert_not_called()
                     fetch.side_effect = [io.BytesIO(content) for content in payloads.values()]
                     sources = sqlite_tools.ensure_sources(root, "kvtest", force=True)
-                self.assertEqual(sources["kvtest"].read_bytes(), payloads["kvtest.c"])
+                self.assertEqual(sources["kvtest"].read_text(), "release kvtest checked\n")
+                self.assertEqual(sources["kvtest_upstream"].read_bytes(), payloads["kvtest.c"])
+                self.assertEqual(sources["kvtest_patch"], patch)
                 self.assertEqual(sources["sqlite3"].read_text(), "release amalgamation")
                 self.assertEqual(sources["sqlite3_h"].read_text(), "release header")
+
+    def test_missing_checked_patch_is_an_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "kvtest.c"
+            source.write_text("official\n", encoding="utf-8")
+            with mock.patch.object(sqlite_tools, "KVTEST_PATCH", root / "missing.patch"):
+                with self.assertRaisesRegex(sqlite_tools.BenchmarkError, "checked patch"):
+                    sqlite_tools.checked_kvtest_source(root, source)
+
+
+class PatchApplicationTests(unittest.TestCase):
+    def test_applies_ordered_hunks_to_exact_context(self):
+        original = "one\ntwo\nthree\nfour\n"
+        patch = (
+            "--- a/file\n+++ b/file\n"
+            "@@ -1,2 +1,2 @@\n"
+            " one\n"
+            "-two\n"
+            "+TWO\n"
+            "@@ -4 +4 @@\n"
+            "-four\n"
+            "+FOUR\n"
+        )
+        self.assertEqual(
+            sqlite_tools.apply_patch(original, patch),
+            "one\nTWO\nthree\nFOUR\n",
+        )
+
+    def test_rejects_mismatched_context(self):
+        with self.assertRaisesRegex(sqlite_tools.BenchmarkError, "context"):
+            sqlite_tools.apply_patch(
+                "one\nTWO\n",
+                "--- a/file\n+++ b/file\n@@ -2 +2 @@\n-two\n+three\n",
+            )
+
+    def test_rejects_empty_patch(self):
+        with self.assertRaisesRegex(sqlite_tools.BenchmarkError, "no hunks"):
+            sqlite_tools.apply_patch("one\n", "--- a/file\n+++ b/file\n")
+
+    def test_rejects_hunk_count_mismatch(self):
+        with self.assertRaisesRegex(sqlite_tools.BenchmarkError, "line counts"):
+            sqlite_tools.apply_patch(
+                "one\n", "--- a/file\n+++ b/file\n@@ -1,2 +1 @@\n-one\n+ONE\n"
+            )
 
 
 if __name__ == "__main__":

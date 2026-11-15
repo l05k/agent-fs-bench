@@ -176,9 +176,13 @@ class Layout:
         self._write_sentinels()
 
     def mount(self) -> dict[str, int | float]:
-        """Run every client's mount commands, then verify outside the timer."""
-        if self._before is not None:
-            raise RuntimeError("mount() has already been attempted")
+        """Run every client's mount commands, then verify outside the timer.
+
+        A successful unmount clears the prior mountinfo baseline, so the same Layout
+        can remount after the read fixture has been prepared through its first mount.
+        """
+        if self._mounted or self._before is not None:
+            raise RuntimeError("mount() requires no active or unverified mount attempt")
         if self.profile.topology == SHARED_DIRECTORY:
             targets = (
                 self.data_root / f"agent-{index:04d}" / f"shared-{number}"
@@ -252,6 +256,7 @@ class Layout:
                 f"remain; inspect {self.work_dir} and {self.data_root}"
             )
         self._mounted = False
+        self._before = None
         return {"unmount_elapsed_s": wall, "remaining_mounts": 0}
 
     def _commands(self, index: int) -> list[tuple[tuple[str, ...], dict[str, object]]]:

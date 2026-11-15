@@ -6,6 +6,10 @@
 # pointing to the same volume. Admin mounts stay mounted and are excluded from
 # measured per-agent mount entries, but may still count toward provider quotas.
 # {source}/{subdir}/{binds} use volume-absolute paths, relative to admin_root.
+#
+# The canonical paper scenario uses directories = 1 (K=1): one real backend mount
+# and one private set per agent. The commands below then expose exactly one mount.
+# K>1 profiles are an explicitly selected shared-scope ablation, not the default.
 
 [profiles.nfs]
 topology = "multi-mount"
@@ -13,16 +17,38 @@ admin_root = "/mnt/nfs-admin"
 private_mount = ["mount", "-t", "nfs", "-o", "rw", "server:/export{source}", "{mountpoint}"]
 shared_mount = ["mount", "-t", "nfs", "-o", "ro", "server:/export{source}", "{mountpoint}"]
 unmount = ["umount", "{mountpoint}"]
+# A few Linux NFS mounts of one server/export may share one superblock, cache and
+# connection set. One mount entry is not one independent NFS TCP client. This profile
+# keeps normal cache defaults rather than silently adding nosharecache.
 
-# Example only: actual LakeBase path/permissions/options must be configured by the
-# experimenter. This repository cannot verify LakeBase without a real service.
+[profiles.cephfs]
+topology = "multi-mount"
+admin_root = "/mnt/cephfs-admin"
+# Replace CLIENT, FS_NAME, MONITORS and the secret path with the actual deployment.
+# noshare creates a new kernel client instance per mount instead of sharing one
+# instance among mounts of the same cluster, so each agent has independent client
+# caches. Use the same options for the pre-mounted admin view.
+private_mount = ["mount", "-t", "ceph", "CLIENT@.FS_NAME={source}", "{mountpoint}", "-o",
+                 "rw,relatime,ms_mode=secure,acl,noshare,mon_addr=MONITORS,secretfile=/etc/ceph/CLIENT.secret"]
+shared_mount = ["mount", "-t", "ceph", "CLIENT@.FS_NAME={source}", "{mountpoint}", "-o",
+                "ro,relatime,ms_mode=secure,acl,noshare,mon_addr=MONITORS,secretfile=/etc/ceph/CLIENT.secret"]
+unmount = ["umount", "{mountpoint}"]
+
+# Canonical K=1 LakeBase profile: one subdir mount per agent, no shared bind.
 [profiles.lakebase]
+topology = "shared-directory"
+admin_root = "/mnt/lakebase-admin"
+private_mount = ["lakebase-client", "mount", "META_URL", "{mountpoint}", "--subdir", "{subdir}"]
+unmount = ["lakebase-client", "umount", "{mountpoint}"]
+
+# K>1 shared-scope ablation only: selected by directories > 1 and a matching target.
+[profiles.lakebase-shared]
 topology = "shared-directory"
 admin_root = "/mnt/lakebase-admin"
 private_mount = ["lakebase-client", "mount", "META_URL", "{mountpoint}", "--subdir", "{subdir}", "--bind", "{binds}"]
 unmount = ["lakebase-client", "umount", "{mountpoint}"]
 
-# Mechanism ablation: same LakeBase backend with X real mounts per agent.
+# K>1 mechanism ablation: same LakeBase backend with K real mounts per agent.
 [profiles.lakebase-multi]
 topology = "multi-mount"
 admin_root = "/mnt/lakebase-admin"

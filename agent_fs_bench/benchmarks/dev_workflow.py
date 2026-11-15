@@ -2,10 +2,11 @@
 
 Every task clones Linux into its own directory on its own machine, then all
 tasks run the same configuration/build/command/commit workflow between
-barriers. Configuration, builds, command loading/replay, commits and tree
-assertions are measured. Cloning, checkout validation and reset/clean cleanup
-are separate. No checkpoints or backend snapshots run; shell pipelines omit
-pipefail.
+barriers. Configuration, builds, command loading/replay, commits, tree
+assertions and a final scoped filesystem sync are measured. Cloning, checkout
+validation, the preparation sync, the post-workflow barrier and reset/clean
+cleanup are separate. No checkpoints or backend snapshots run; shell pipelines
+omit pipefail.
 """
 
 from __future__ import annotations
@@ -84,7 +85,7 @@ def resolve_linux_url(value: str) -> str:
     path = Path(value).expanduser()
     return str(path if path.is_absolute() else PROJECT_ROOT / path)
 
-CORE_COMMANDS = ("git", "bash", "make", "patch", "grep", "sed", "python3")
+CORE_COMMANDS = ("git", "bash", "make", "patch", "grep", "sed", "python3", "sync")
 KERNEL_COMMANDS = ("bc", "bison", "flex", "perl", "openssl")
 KERNEL_HEADERS = (
     ("OpenSSL development headers", ("/usr/include/openssl/ssl.h",)),
@@ -155,6 +156,16 @@ def run_shell(command: str, *, cwd: Path, what: str, verbose: bool) -> CommandRe
         what=what,
         verbose=verbose,
         extra_env={"LC_ALL": "C"},
+    )
+
+
+def sync_filesystem(path: Path, *, what: str, verbose: bool) -> None:
+    """Flush the filesystem containing ``path``; a sync failure stops the run."""
+    run_command(
+        ["sync", "-f", "--", str(path)],
+        cwd=path,
+        what=what,
+        verbose=verbose,
     )
 
 
@@ -601,6 +612,10 @@ def prepare_checkout(
             f"in {repo}"
         )
     begin_checkout_run(repo, base_commit=base_commit)
+    # Preparation is durable before every task enters the measured barrier.
+    sync_filesystem(
+        repo, what="syncing checkout preparation", verbose=args.verbose
+    )
     return base_commit, elapsed_ms(start)
 
 
@@ -762,20 +777,22 @@ def run_workflow(
             "ms": elapsed_ms(verify_start),
         })
 
-    workflow_ms = elapsed_ms(timed_start)
-    compiler_version = read_compiler_version(repo)
-    cleanup_start = time.perf_counter_ns()
-    cleanup_checkout(repo, base_commit=base_commit, verbose=args.verbose)
-    cleanup_ms = elapsed_ms(cleanup_start)
+    sync_start = time.perf_counter_ns()
+    sync_filesystem(
+        repo, what="syncing workflow filesystem", verbose=args.verbose
+    )
+    steps.append({
+        "kind": "sync", "name": "final-sync", "commit": "",
+        "ms": elapsed_ms(sync_start),
+    })
 
+    workflow_ms = elapsed_ms(timed_start)
     unattributed_ms = max(0, workflow_ms - sum(step["ms"] for step in steps))
 
     return {
         "base_commit": base_commit,
-        "compiler_version": compiler_version,
         "elapsed_ms": workflow_ms,
         "preparation_ms": preparation_ms,
-        "cleanup_ms": cleanup_ms,
         "unattributed_ms": unattributed_ms,
         "tree_assertions": tree_assertions,
         "steps": steps,
@@ -830,6 +847,14 @@ def task(t: cluster.Task) -> None:
         base_commit=base_commit,
         preparation_ms=preparation_ms,
     )
+
+    # End the measured workflow on every task before untimed provenance and
+    # cleanup, so one task's cleanup writes cannot overlap another's timing.
+    t.barrier()
+    summary["compiler_version"] = read_compiler_version(repo)
+    cleanup_start = time.perf_counter_ns()
+    cleanup_checkout(repo, base_commit=base_commit, verbose=args.verbose)
+    summary["cleanup_ms"] = elapsed_ms(cleanup_start)
 
     results = t.gather((t.node, summary))
     if t.leader:

@@ -1,7 +1,9 @@
 """Placement, pool and job validity of the cluster launcher; no MPI is executed."""
 
 from pathlib import Path
+import sys
 import tempfile
+import time
 import unittest
 
 from agent_fs_bench import cluster
@@ -115,6 +117,23 @@ class JobTests(unittest.TestCase):
         ):
             with self.subTest(message=message), self.assertRaisesRegex(AssertionError, message):
                 validate_job(run, parse_messages(run.stdout), self.placement)
+
+
+class ProgramTimeoutTests(unittest.TestCase):
+    def test_mpi_job_timeout_kills_the_launcher_group_and_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mpiexec = root / 'mpiexec'
+            mpiexec.write_text(f'#!{sys.executable}\nimport time\n'
+                               'print("started", flush=True)\ntime.sleep(10)\n')
+            mpiexec.chmod(0o755)
+            launcher = Launcher((str(mpiexec),), (), {}, Path('hosts.toml'), 15)
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, 'exceeded 1s'):
+                cluster.run_program(place([node('local')], 1), launcher,
+                                    [['ignored']], root, 'timeout', timeout_s=1.0)
+            self.assertLess(time.monotonic() - started, 5)
+            self.assertEqual((root / 'timeout.stdout.txt').read_text(), 'started\n')
 
 
 class TaskDirectoryTests(unittest.TestCase):

@@ -1,5 +1,6 @@
 """Consumer-visible mount topology invariants; no privileged mounts required."""
 
+import json
 import os
 from pathlib import Path
 import signal
@@ -7,11 +8,28 @@ import sys
 import tempfile
 import unittest
 
-from agent_fs_bench.benchmarks import mount_scale
+from agent_fs_bench.benchmarks import mount_scale, mount_scale_io as io
 from agent_fs_bench.benchmarks.mount_scale_mdtest import Phase, check_banner, read_timings
 from agent_fs_bench.benchmarks.mount_scale_mounts import Layout, Profile, _run
 from agent_fs_bench.results import RunContext, Tables, read_table
 from agent_fs_bench.targets import Target
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_canonical_default_is_one_private_mount_and_1000_4k_files(self):
+        args = mount_scale.parse_args([])
+        self.assertEqual((args.directories, args.files, args.file_size_bytes), (1, 1000, 4096))
+
+    def test_directory_smoke_is_private_only(self):
+        args = mount_scale.parse_args(['--directory-smoke'])
+        self.assertEqual((args.directories, args.files, args.repeats), (1, 32, 1))
+
+    def test_bandwidth_rows_cover_canonical_and_ablation_reads(self):
+        for phase in ('read', 'create-write', 'private/create', 'private/read',
+                      'shared-1/read'):
+            self.assertTrue(mount_scale.bandwidth_phase(phase))
+        for phase in ('private/stat', 'private/remove', 'shared-1/stat'):
+            self.assertFalse(mount_scale.bandwidth_phase(phase))
 
 
 class MountTopologyTests(unittest.TestCase):
@@ -147,6 +165,56 @@ all,32,,,,,,,,,,,4.9618383734e+04,1.2898445129e-03,1.1046726584e+06,5.7935714722
             check_banner('private', self.BANNER, 4)
 
 
+class SmallFileIOTests(unittest.TestCase):
+    SIZE = 4096
+
+    def test_write_and_read_count_only_exact_full_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = b'a' * self.SIZE + b'b' * self.SIZE + b'c' * self.SIZE
+            count, total = io.write_files(root, 3, self.SIZE, payload)
+            self.assertEqual((count, total), (3, 3 * self.SIZE))
+            self.assertEqual(
+                [path.name for path in sorted(root.iterdir())],
+                ['file-00000.bin', 'file-00001.bin', 'file-00002.bin'])
+            self.assertEqual((root / 'file-00001.bin').read_bytes(), b'b' * self.SIZE)
+            self.assertEqual(io.read_files(root, 3, self.SIZE), (3, 3 * self.SIZE))
+            (root / 'file-00001.bin').write_bytes(bytes(self.SIZE - 1))
+            self.assertEqual(io.read_files(root, 3, self.SIZE), (2, 2 * self.SIZE))
+
+    def test_create_write_requires_fresh_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertEqual(io.write_files(root, 1, 16, b'a' * 16), (1, 16))
+            self.assertEqual(io.write_files(root, 1, 16, b'b' * 16), (0, 0))
+            self.assertEqual((root / 'file-00000.bin').read_bytes(), b'a' * 16)
+
+    def result(self, mode, counts, sync_ok=None):
+        return io.RESULT_PREFIX + json.dumps({
+            'mode': mode, 'tasks': len(counts), 'rank_files': counts,
+            'rank_bytes': [count * self.SIZE for count in counts],
+            'rank_elapsed_s': [0.2 + index for index in range(len(counts))],
+            'sync_ok': sync_ok})
+
+    def test_complete_batch_uses_slowest_client_and_exact_successes(self):
+        phase = io.parse_batch('create-write', self.result('create-write', [4, 4], True),
+                               2, 'create-write', 4, self.SIZE)
+        self.assertEqual((phase.name, phase.operations, phase.elapsed_s),
+                         ('create-write', 8, 1.2))
+        self.assertEqual(phase.rank_elapsed_s, [0.2, 1.2])
+
+    def test_missing_file_or_sync_cannot_become_a_throughput_row(self):
+        with self.assertRaisesRegex(AssertionError, 'full-file successes'):
+            io.parse_batch('create-write', self.result('create-write', [4, 3], True),
+                           2, 'create-write', 4, self.SIZE)
+        with self.assertRaisesRegex(AssertionError, 'target syncfs'):
+            io.parse_batch('create-write', self.result('create-write', [4, 4], False),
+                           2, 'create-write', 4, self.SIZE)
+        with self.assertRaisesRegex(AssertionError, 'read sync'):
+            io.parse_batch('read', self.result('read', [4, 4], True),
+                           2, 'read', 4, self.SIZE)
+
+
 class TableEmissionTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -197,23 +265,27 @@ class TableEmissionTests(unittest.TestCase):
         self.assertFalse((self.root / 'resource_workload.csv').exists())
 
     def test_rank_samples_and_bandwidth_share_the_phase_identity(self):
-        phases = [Phase('private/create', 4, 0.5, [0.2, 0.3]),
-                  Phase('private/stat', 4, 0.25, [0.1, 0.15])]
+        phases = [Phase('read', 4, 0.5, [0.2, 0.3]),
+                  Phase('create-write', 4, 0.25, [0.1, 0.15]),
+                  Phase('private/stat', 4, 0.1, [0.05, 0.05])]
         keys = {'topology': 'multi-mount', 'tasks': 2, 'repeat': 1}
         mount_scale.write_phases(self.ctx, keys, phases, ['local', 'node-a'], 4096)
         rows = read_table(self.root / 'phases.csv')
-        self.assertEqual([row['phase'] for row in rows], ['private/create', 'private/stat'])
+        self.assertEqual([row['phase'] for row in rows],
+                         ['read', 'create-write', 'private/stat'])
         self.assertEqual([(row['phase'], row['bytes'])
                           for row in read_table(self.root / 'bandwidth.csv')],
-                         [('private/create', str(4 * 4096))])
+                         [('read', str(4 * 4096)), ('create-write', str(4 * 4096))])
         ranks = read_table(self.root / 'ranks.csv')
         self.assertEqual(
             [(row['phase'], row['sample'], row['host'], row['elapsed_s'])
              for row in ranks],
-            [('private/create', '0', 'local', '0.2'),
-             ('private/create', '1', 'node-a', '0.3'),
-             ('private/stat', '0', 'local', '0.1'),
-             ('private/stat', '1', 'node-a', '0.15')])
+            [('read', '0', 'local', '0.2'),
+             ('read', '1', 'node-a', '0.3'),
+             ('create-write', '0', 'local', '0.1'),
+             ('create-write', '1', 'node-a', '0.15'),
+             ('private/stat', '0', 'local', '0.05'),
+             ('private/stat', '1', 'node-a', '0.05')])
 
 if __name__ == '__main__':
     unittest.main()
