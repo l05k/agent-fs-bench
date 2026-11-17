@@ -25,10 +25,12 @@ Files contain seeded pseudorandom data, distinct across clients and files in
 each phase. The 4 MiB per-client write payload is allocated before timing so
 compression of zero-filled files and payload generation do not drive the result.
 
-**One run measures one N on a fixed host pool; there is no implicit sweep.** Use
-`--mode remote` with the same ordered client pool for a multi-host curve and
-`--mode local` for density. N above the CPU count oversubscribes the host; report
-placement and keep curves with different host budgets separate.
+**One run measures one N; there is no implicit sweep.** Set N with `--tasks`
+(default 64). Use `--mode remote` with the same ordered client pool and storage
+deployment for a multi-host curve, and `--mode local` for density. Record actual
+rank placement. The main three-host curve uses all three hosts at its planned
+N > 1 points. N=1 uses only the first host and is a single-host reference.
+N above the CPU count oversubscribes the hosts; keep different host budgets separate.
 
 The archived K>1 `io` experiment uses mdtest for private and shared-scope phases.
 It is not in the active matrix, and its rows must not be pooled with private I/O.
@@ -146,9 +148,11 @@ released. With K=1 the LakeBase profile must omit the empty `--bind` argument; t
 variant in the example file adds it. The canonical read fixture travels through the first
 mount, so the read phase starts after an unmount/remount boundary.
 
-For a K=1 FUSE resource ablation, set `cgroup = true` in both arms' profiles and
-use site-owned mount/unmount wrappers. Before starting the FUSE daemon, the mount
-wrapper must put it in `/sys/fs/cgroup/agent-fs-bench/<sha256(resolved mountpoint)[:20]>`
+For the archived K=1 FUSE resource ablation, set `cgroup = true` only in each
+filesystem's limited profile. Omit it in the unlimited control, whose wrapper
+must not impose the per-client limit. Use site-owned mount/unmount wrappers.
+Before starting the FUSE daemon in the limited arm, the mount wrapper must put
+it in `/sys/fs/cgroup/agent-fs-bench/<sha256(resolved mountpoint)[:20]>`
 with `cpu.max = 100000 100000` and `memory.max = 2147483648`. The site enables CPU
 and memory controllers at that root; the unmount wrapper removes the leaf after the
 daemon has exited. The harness checks both limits and a nonempty process list on each
@@ -326,8 +330,9 @@ namespace, so a daemon must create mounts in that namespace.
 
 ## Paper claim boundaries
 
-- The canonical design holds one fixed host budget and one fixed storage deployment.
-  Adding N clients does not add nodes. Do not attribute a curve to node expansion.
+- Keep the client pool and storage deployment fixed for a multi-host curve.
+  The N=1 reference uses one participating host; do not treat it as a
+  same-budget baseline for scaling efficiency.
 - Each agent has one independent real backend mount and one private data set. A mount
   entry is not automatically a distinct NFS TCP connection, kernel client or cache; state
   the actual mount type/options and admin-view sharing. CephFS `noshare` is the example
