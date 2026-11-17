@@ -1,4 +1,9 @@
-"""K>1 shared-scope ablation phases with the original IOR 4.0.0 mdtest binary.
+"""Native mdtest phases for mount-scale, using the original IOR 4.0.0 binary.
+
+Besides the K>1 shared-scope ablation, this module builds the K=1 zero-byte create job
+and the native create-then-read job with per-file fsync (`-y`) used by the new
+workloads. Both keep mdtest's own phase times and rank CSV; removal runs outside the
+reported create/read phases.
 
 The canonical K=1 mount-scale path uses synchronized POSIX read/create-write jobs and
 does not execute mdtest. This module remains for the explicitly selected K>1
@@ -90,6 +95,18 @@ def private_job(path: Path, files: int, size: int) -> tuple[str, ...]:
     return ('-F', '-u', '-C', '-T', '-E', '-r', '-d', str(path), *_options(files, size))
 
 
+def zero_create_job(path: Path, files: int) -> tuple[str, ...]:
+    """File creation only, zero bytes per file; removal runs after the create phase."""
+    return ('-F', '-u', '-C', '-r', '-w', '0', '-d', str(path), '-n', str(files),
+            '-i', '1', '--warningAsErrors')
+
+
+def native_io_job(path: Path, files: int, size: int) -> tuple[str, ...]:
+    """Native create then read, with a per-file fsync in the create phase."""
+    return ('-F', '-u', '-C', '-E', '-r', '-y', '-d', str(path), '-n', str(files),
+            '-w', str(size), '-e', str(size), '-i', '1', '--warningAsErrors')
+
+
 # Validation and parsing (pure) ---------------------------------------------------------------
 
 def check_banner(label: str, stdout: str, tasks: int) -> None:
@@ -133,7 +150,7 @@ def phases_of(prefix: str, labels: Sequence[str], names: Sequence[str], timings:
 def run_job(launcher: cluster.Launcher, binary: str, tag: str, label: str, ranks: Sequence[Rank],
             groups: Sequence[Sequence[str]], phases: Sequence[str], log_dir: Path,
             files: int, timeout_s: float, startup_timeout_s: float,
-            private: bool = False) -> Timings:
+            private: bool = False, strict: bool = False) -> Timings:
     """Run one global MPMD job and return its validated timings."""
     capture = Path('/tmp') / f'agent-fs-bench-{tag}-{label}.csv'
     placement = tuple(rank.node for rank in ranks)
@@ -142,13 +159,27 @@ def run_job(launcher: cluster.Launcher, binary: str, tag: str, label: str, ranks
         for rank in ranks:
             directories.setdefault(rank.node, []).append(rank.workspace / _TEST_DIR)
         cluster.make_directories(launcher, directories)
-    programs = [[rank.node.python, '-u', '-m', 'agent_fs_bench.cluster', 'rank-exec',
-                 binary, *group, '--saveRankPerformanceDetails', str(capture)]
-                for rank, group in zip(ranks, groups, strict=True)]
+    programs = []
+    for rank, group in zip(ranks, groups, strict=True):
+        arguments = [binary, *group, '--saveRankPerformanceDetails', str(capture)]
+        if rank.cgroup is None:
+            programs.append([rank.node.python, '-u', '-m', 'agent_fs_bench.cluster',
+                             'rank-exec', *arguments])
+        else:
+            programs.append([rank.node.python, '-u', '-m',
+                             'agent_fs_bench.benchmarks.mount_scale_runner', 'exec',
+                             '--cgroup', str(rank.cgroup), '--', *arguments])
     run = cluster.run_program(placement, launcher, programs, log_dir, label,
                               timeout_s=timeout_s, startup_timeout_s=startup_timeout_s)
     cluster.validate_exit(run)
     check_banner(label, run.stdout, len(ranks))
+    if strict:
+        warnings = [line.strip() for line in run.stdout.splitlines()
+                    if line.startswith('WARNING:')]
+        assert not warnings, f'{label} mdtest warnings: expected none, measured {warnings}'
+        counts = re.findall(r'^(\d+) tasks, (\d+) files$', run.stdout, re.MULTILINE)
+        expected = [(str(len(ranks)), str(len(ranks) * files))]
+        assert counts == expected, f'{label} workload: expected {expected}, measured {counts}'
     timings = read_timings(label, cluster.fetch_file(placement[0], launcher, capture),
                            phases, len(ranks))
     assert timings.items == files, f'{label} items per task: expected {files}, ' \
@@ -167,9 +198,11 @@ class Mdtest:
     startup_timeout_s: float
 
     def job(self, label: str, ranks: Sequence[Rank], groups: Sequence[Sequence[str]],
-            phases: Sequence[str], log_dir: Path, files: int, private: bool = False) -> Timings:
+            phases: Sequence[str], log_dir: Path, files: int, private: bool = False,
+            strict: bool = False) -> Timings:
         return run_job(self.launcher, self.binary, self.tag, label, ranks, groups, phases,
-                       log_dir, files, self.timeout_s, self.startup_timeout_s, private)
+                       log_dir, files, self.timeout_s, self.startup_timeout_s, private,
+                       strict)
 
     def prepare(self, node: cluster.Node, shared_paths: Sequence[Path], files: int, size: int,
                 log_dir: Path) -> None:
@@ -178,6 +211,21 @@ class Mdtest:
             self.job(f'prepare-{index}', [Rank(node, path, ())],
                      [('-S', '-C', '-d', str(path), *_options(files, size))],
                      ('File creation',), log_dir, files)
+
+    def create_timings(self, ranks: Sequence[Rank], files: int, log_dir: Path) -> Timings:
+        """Native zero-byte file creation; removal follows in the same job, unmeasured."""
+        return self.job('private-create', ranks,
+                        [zero_create_job(rank.workspace, files) for rank in ranks],
+                        ('File creation',), log_dir, files, private=True,
+                        strict=True)
+
+    def native_io_timings(self, ranks: Sequence[Rank], files: int, size: int,
+                          log_dir: Path) -> Timings:
+        """Native create then read, with per-file fsync in the create phase."""
+        return self.job('private-io', ranks,
+                        [native_io_job(rank.workspace, files, size) for rank in ranks],
+                        ('File creation', 'File read'), log_dir, files, private=True,
+                        strict=True)
 
     def warm(self, ranks: Sequence[Rank], files: int, size: int, log_dir: Path) -> None:
         """Warm-up: stat and read every client alias once; the timings are discarded."""

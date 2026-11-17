@@ -1,47 +1,37 @@
-# Mount scale: independent-client small-file I/O
+# Mount scale: independent clients and mount density
 
-Purpose: hold per-client small-file work fixed on a fixed compute-node budget and measure
-whole-file read and create-write throughput as concurrent agents grow. The canonical paper
-scenario uses one real backend mount and one private data set per agent. This is a proxy
-workload for agent file operations, not an end-to-end agent benchmark.
+The [active paper matrix](../experiments/round-03.md) measures native mdtest file
+throughput, mount-command latency, and the effect of idle and active mounts on one
+client host. Each active task has its own real backend mount and private directory.
 
 Entry point: `agent_fs_bench/benchmarks/mount_scale.py`.
 - `mount_scale_io.py` runs the synchronized read and create-write POSIX batches.
 - `mount_scale_cluster.py` holds the persistent per-machine lifecycle workers.
-- `mount_scale_mdtest.py` remains only for the explicitly selected K>1 shared-scope
-  ablation; the canonical K=1 path does not execute mdtest.
+- `mount_scale_mdtest.py` runs native IOR 4.0.0 through real client mounts.
 - Placement, machine probing and MPI launch come from `agent_fs_bench/cluster.py`
   ([run modes](run-modes.md)).
 
 ## Experiment unit and placement
 
-Each client is one MPI rank with its own real backend mount. With the default K=1
-(`CONFIG['directories'] = 1`) each client has one private set containing:
-- `read/`: 1,000 precreated 4 KiB files, prepared durably before the measured read;
-- `write/`: an empty target for the measured create-write batch.
+Each active client is one MPI rank with its own mount. `--idle-mounts M` adds M
+real mounts on the same host without adding ranks; they remain mounted across the
+point's active repeats. The active file batches use **1,000 files per rank**;
+`mdtest-io` uses **4 KiB per file**, and `mdtest-create` uses empty files.
 
-The paper scenario fixes **1,000 files × 4 KiB per client**. `files` and
-`file_size_bytes` are recorded in `config.json`; formal runs keep them fixed across
-systems and client counts.
+The archived `--workload io` protocol prepares separate read and write data sets.
+Its `read/` contains precreated files and its `write/` starts empty. The run
+snapshot records the file count and size; hold both fixed across a comparison.
 Files contain seeded pseudorandom data, distinct across clients and files in
 each phase. The 4 MiB per-client write payload is allocated before timing so
 compression of zero-filled files and payload generation do not drive the result.
 
-**One run measures one N on one fixed host budget; there is no default sweep.** Use
-`--mode local` and increase N only across separate runs; do not add machines as N grows.
-`CONFIG['tasks']` (default 64) selects N. N above the machine's CPU count oversubscribes
-it, exactly as concurrent clients behave; the kernel schedules them. Do not treat added
-machines as free concurrency or describe placement changes as an N-only scaling effect.
+**One run measures one N on a fixed host pool; there is no implicit sweep.** Use
+`--mode remote` with the same ordered client pool for a multi-host curve and
+`--mode local` for density. N above the CPU count oversubscribes the host; report
+placement and keep curves with different host budgets separate.
 
-`directories > 1` selects the earlier shared read-only ablation. That path keeps its
-upstream mdtest create/stat/read/remove private phases plus shared stat/read phases and is
-reported under those phase names. It is not a paper default, and its shared phases are
-never merged into the canonical `read` / `create-write` numbers.
-
-Use one fixed machine for the intended sweep; increasing N does not add nodes. If a run
-uses `--mode` with several machines anyway, placement is recorded per machine, but that
-is no longer the canonical fixed-node-budget experiment and must not be presented as an
-N-only scaling result.
+The archived K>1 `io` experiment uses mdtest for private and shared-scope phases.
+It is not in the active matrix, and its rows must not be pooled with private I/O.
 
 ## Dependencies and network
 
@@ -49,11 +39,9 @@ Every participating machine needs:
 - Linux and Python 3.12+;
 - this repository's checkout with `uv sync --locked`, at the same path by default;
 - the same Open MPI 4.1.x version and architecture;
-- GNU coreutils `sync` with `-f` (`syncfs`) for the create-write persistence boundary.
-
-The K>1 shared-scope ablation additionally needs the **same upstream IOR 4.0.0 mdtest
-binary on every machine**, linked against that Open MPI. The canonical K=1 path neither
-builds nor validates mdtest.
+- GNU coreutils `sync -f` (`syncfs`) for archived `--workload io` at K=1.
+- For `mdtest-create`, `mdtest-io`, or the archived K>1 path: the same upstream
+  IOR 4.0.0 `mdtest`, linked against that Open MPI. `mount` needs no mdtest binary.
 
 Open MPI requires:
 1. Non-interactive SSH from the controller to each worker, with host keys trusted.
@@ -68,7 +56,7 @@ Open MPI requires:
 The controller also needs the Arial font for `plot`; a missing font fails only figure
 rendering, not a run. The benchmark installs no tools and uses no sudo.
 
-For the K>1 ablation, build upstream IOR:
+For native mdtest workloads, build upstream IOR:
 
 ```sh
 # Unpack the official ior-4.0.0.tar.gz and enter its source directory.
@@ -80,23 +68,25 @@ make -j
 
 ## Configuration and runs
 
-Pass `--tasks`, `--repeats`, `--startup-timeout-s`, `--job-timeout-s` and
-`--fixture-timeout-s` after `--` for an experiment. Other parameters live in `CONFIG`
-at the top of `mount_scale.py`.
+Pass `--workload`, `--idle-mounts`, `--tasks`, `--repeats`, `--startup-timeout-s`,
+`--job-timeout-s` and `--fixture-timeout-s` after `--`. Other parameters live in
+`CONFIG` at the top of `mount_scale.py`.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `tasks` | `64` | Single N per run, one client per rank |
+| `tasks` | `64` | Active mounts, one rank per client |
+| `workload` | `io` | `mdtest-io`, `mdtest-create`, `mount`, or archived `io`; select explicitly for the paper |
+| `idle_mounts` | `0` | Extra mounts, no ranks; one participating host, `mount` or `mdtest-create` only |
 | `profiles` | `local/mounts.toml` | Target mount profile, read on the controller |
-| `directories` | `1` | K; default one private workspace and one mount per client; >1 selects the shared ablation |
-| `files` | `1000` | Files per client in each canonical batch |
-| `file_size_bytes` | `4096` | Bytes per file |
+| `directories` | `1` | Keep at 1 for all active experiments; K>1 selects the archived shared-scope path |
+| `files` | `1000` | Files per active client in an I/O batch |
+| `file_size_bytes` | `4096` | Bytes per `mdtest-io` / POSIX I/O file; `mdtest-create` always uses 0 B |
 | `repeats` | `3` | Complete repetitions at the same N |
-| `mdtest` | `mdtest` | Upstream binary used only by the K>1 ablation |
+| `mdtest` | `mdtest` | Upstream binary for native phases |
 | `command_timeout_s` | `360` | Each mount/unmount command and short worker replies |
 | `lifecycle_timeout_s` | `900` | Each worker's full mount/unmount action, including verification |
 | `startup_timeout_s` | `180` | Deadline for every MPI rank to report its rank and planned host before `MPI_Init` |
-| `job_timeout_s` | `900` | Each native MPI job: read, create-write or ablation mdtest |
+| `job_timeout_s` | `900` | Whole MPI job, including native I/O or the active mount wrappers |
 | `fixture_timeout_s` | `1800` | Per-repeat read-fixture preparation and cleanup control replies |
 | `idle_sample_s` | `1.0` | Machine idle sampling duration for baseline/mounted/released |
 | `resource_sample_s` | `0.1` | Machine resource sampling period during the workload |
@@ -167,8 +157,12 @@ rejects leftover leaves after unmount. Fixture preparation is outside that rank'
 budget. Do not apply this profile to a kernel filesystem client.
 
 ```sh
-uv run python -m agent_fs_bench run mount-scale --mode remote --target cephfs -- --tasks 768 --repeats 3
-uv run python -m agent_fs_bench run mount-scale --mode local --target lakebase
+uv run python -m agent_fs_bench run mount-scale --mode remote --target cephfs -- \
+  --workload mdtest-io --tasks 768 --repeats 3
+uv run python -m agent_fs_bench run mount-scale --mode local --target apsara-1conn -- \
+  --workload mount --tasks 1 --idle-mounts 64 --repeats 100
+uv run python -m agent_fs_bench run mount-scale --mode local --target apsara-1conn -- \
+  --workload mdtest-create --tasks 1 --idle-mounts 64 --repeats 100
 
 # Two clients, ordinary directories, 32 files, one repeat; mounts nothing.
 uv run python -m agent_fs_bench run mount-scale --mode local \
@@ -182,6 +176,29 @@ starting workers/MPI. It exercises the read/create-write code without mounts and
 storage-performance evidence.
 
 ## Execution and timing boundaries
+
+For `mount`, each active MPI rank crosses a start barrier, then runs one site
+mount wrapper. The latency is from invocation to its ready return, not MPI
+startup, controller dispatch, or the post-return mount and path verification.
+No file workload runs. Do not insert artificial sleeps or a stagger inside the
+timed wrapper. The worker verifies and unmounts all active mounts in every repeat.
+
+`mdtest-create` records only `file-create`: zero-byte create and close, without
+write or `fsync`. Cleanup does not contribute to create time. `mdtest-io`
+records `create-write` and `read` from the same native job: create and write
+with `-y` per-file `fsync`, then read without remount or cache eviction. The
+file `fsync` is not a separate directory sync. Both modes use native aggregate
+phase times and check the work count and rank completion. Ignore neither a
+short phase nor a warning about failed I/O.
+
+When configured, the worker creates and verifies the idle cohort **before** any
+active repeat and releases it at the end. Idle clients contribute no active
+mount samples or file operations. Use a complete `idle_unmounts` record and
+the actual verified idle count before accepting density results.
+
+### Archived POSIX I/O (`--workload io`)
+
+The following sequence applies to the Round 02 POSIX path, not native mdtest.
 
 1. Allocate N tasks over the selected machines from the cluster probe, and start one
    persistent lifecycle worker on each participating machine (over SSH for listed
@@ -251,10 +268,12 @@ Figures come only from `plot`.
 | `resource_levels` | target, topology, tasks, host, state, repeat | raw levels and sampling interval |
 | `resource_deltas` | target, topology, tasks, host, state, repeat | used_bytes_delta, slab_bytes_delta, slab_unreclaimable_bytes_delta, mount_entries_delta |
 | `resource_workload` | target, topology, tasks, host, repeat | sampling interval, peak_* and peak_*_delta |
+| `idle_mounts` / `idle_unmounts` | target, topology, tasks, idle_clients, host | Lifecycle elapsed time and measured/residual mount counts for the idle cohort |
 
-Canonical phase values are `read` and `create-write`. The K>1 ablation values remain
-`private/create`, `private/stat`, `private/read`, `private/remove`, and
-`shared-<n>/stat` / `shared-<n>/read`; do not treat a shared row as private work.
+Native phase values are `file-create` or `create-write` and `read` according to
+the workload. Archived K>1 phase names start with `private/` or `shared-<n>/`.
+`mount` emits no I/O or resource workload rows. Keep results separated by
+`config.workload`, `config.idle_mounts` and the mount profile.
 
 Column values:
 - `action`: `mount` or `unmount`.
@@ -265,14 +284,14 @@ Column values:
 
 | Metric | Definition |
 | --- | --- |
-| `phases.ops` | Canonical: exact full files completed by all clients; ablation: N×files per mdtest phase |
-| `phases.elapsed_s` | Canonical: T from the synchronized start through all completions and, for create-write, all target syncfs calls, using the slowest client; ablation: upstream mdtest all-row phase time including its end barrier |
+| `phases.ops` | POSIX: exact full-file completions; native: N×files for the validated mdtest phase |
+| `phases.elapsed_s` | POSIX: time through the slowest client and final write syncfs; native: the mdtest all-row phase time including the end barrier |
 | `phases.ops_per_s` | ops / elapsed_s; per-machine rates are never summed |
 | `phases.ops_per_s_per_task` | Aggregate throughput / N; not an independent per-client sample |
 | `phases.rank_mean_us_per_op` | sum(task times)/(ops)×1e6; phase mean, not per-operation latency/p99 |
 | `bandwidth.bytes`, `bandwidth.mib_per_s` | Logical completed file bytes; read bytes are not physical network/disk bytes |
-| `ranks.elapsed_s` | One task's start-to-end batch time |
-| `host_mounts.elapsed_s`, `host_unmounts.elapsed_s` | Wall time of all client mount or unmount commands on that machine; excludes verification |
+| `ranks.elapsed_s` | One rank's batch time (native CSV: before the end barrier); not a single file latency |
+| `host_mounts.elapsed_s`, `host_unmounts.elapsed_s` | Worker-launched commands: host wall time excluding verification. `--workload mount` mounts instead report the longest active rank's wrapper duration on that host; use `agents` for the distribution. |
 | `agents.elapsed_s` | One client's mount or unmount command sequence on that machine |
 | `dispatch.controller_dispatch_elapsed_s` | From notifying all workers to receiving all replies, including control channel and mount verification; not a sum of per-machine times |
 | `host_mounts.measured_mounts`, `host_unmounts.remaining_mounts` | New/residual entries after per-machine verification; mount entries are not inferred connection or daemon counts |
@@ -282,9 +301,9 @@ paper needs efficiency, choose a comparable baseline in separate runs; the harne
 not add experiment points implicitly.
 
 `config.json` stores the parsed configuration and `mode` once, the launcher's Open MPI
-version (`mpi_version`), and each machine's probed facts. `targets[i].info` stores the
-placement and, for K>1 only, the mdtest SHA-256 and version. The canonical K=1 path also
-records `cache_control`, `completion` and `durability` facts.
+version (`mpi_version`), and each machine's probed facts. `targets[i].info` stores
+placement, native binary identity as applicable, and the completion/durability
+boundary for the selected path.
 
 `plot` writes the default figures; a figure whose table has no rows is skipped. Render
 with `uv run python -m agent_fs_bench plot <run-dir>...`.
@@ -313,16 +332,15 @@ namespace, so a daemon must create mounts in that namespace.
   entry is not automatically a distinct NFS TCP connection, kernel client or cache; state
   the actual mount type/options and admin-view sharing. CephFS `noshare` is the example
   that creates a separate client instance per mount.
-- Read and create-write are separate targets. The read fixture is durable before timing,
-  and the read trial starts after a remount. Do not read back the write trial and call it
-  a cold read, and do not claim per-file durability from the batch syncfs.
-- No cache-drop or direct-I/O trick is used. Remounting does not guarantee cold persistent,
-  server or provider caches.
-- The default K=1 path emits no shared-phase rows. The K>1 shared-scope ablation is a
-  separately selected layout experiment and must not be pooled into canonical private
-  throughput.
-- The workload is not an end-to-end agent benchmark: no models, containers or real agents
-  run, and there are no tail-latency, malicious-write isolation or recovery claims.
+- State the protocol: the native read phase follows creation, and its write uses
+  per-file `fsync`. The archived POSIX path remounts before a separate read and
+  uses batch-end `syncfs` for writes. Neither establishes cold provider caches.
+- For mount p50/p99 use the active `agents.csv` command durations. For density
+  create p50/p99 use the active `ranks.csv` create-batch durations. Give both the
+  number of commands or ranks and the number of measured batches; never
+  describe either as per-file tail latency.
+- These workloads do not establish end-to-end agent latency, crash durability,
+  or isolation correctness.
 
 ## Validation performed
 
@@ -331,6 +349,13 @@ The K=1 directory smoke on Linux with Open MPI 4.1.8 started both ranks and veri
 startup, I/O and cleanup, not real backend mounts, cgroups, multi-host placement or
 storage performance.
 
+Round 03 also exercised `mount`, `mdtest-create`, and `mdtest-io` with real
+Linux bind mounts in a private namespace, Open MPI 4.1.6, and IOR 4.0.0.
+Two active ranks ran with three extra idle mounts for the density paths; both
+native data phases completed 64 files each. All mounts and data were released.
+This validates the lifecycle and result counts, not independent FUSE/NFS
+clients, remote placement, one-to-one backend connections, or performance.
+
 ## References
 
 - [Linux `sync(1)` / syncfs](https://man7.org/linux/man-pages/man1/sync.1.html)
@@ -338,5 +363,5 @@ storage performance.
 - [Linux NFS mount/cache semantics](https://man7.org/linux/man-pages/man5/nfs.5.html)
 - [Open MPI v4.1 mpirun](https://www.open-mpi.org/doc/v4.1/man1/mpirun.1.php) and
   [TCP transport](https://docs.open-mpi.org/en/main/tuning-apps/networking/tcp.html)
-- [IOR 4.0.0 mdtest](https://github.com/hpc/ior/tree/4.0.0/src) for the K>1 ablation
+- [IOR 4.0.0 mdtest](https://github.com/hpc/ior/tree/4.0.0/src)
 - [LakeBase shared directory](https://help.aliyun.com/zh/polardb/polardb-for-postgresql/polardb-agent-lakebase-shared-directory)

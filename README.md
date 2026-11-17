@@ -69,32 +69,36 @@ checkout. Setup, placement and launcher settings: [run modes](docs/run-modes.md)
 
 The controller records the launcher, node facts and planned targets before
 running any workload. It appends validated raw observations and marks a target
-complete only after the workload returns. Mount-scale runs its two synchronized
-I/O batches under the mount lifecycle; mdtest has its own phase counters. The
-per-workload docs define each timing boundary.
+complete only after the workload returns. Mount-scale runs native mdtest or
+measures mount commands under the same real mount lifecycle. The per-workload
+docs define each timing boundary.
 
 ## Workloads
+
+[Round 03](experiments/round-03.md) is the active paper matrix. The
+[experiment archive](experiments/archive.md) records superseded plans and
+measurements; those workloads are not part of the active matrix.
 
 | Command | Workload | Doc |
 | --- | --- | --- |
 | `dev-workflow` | N concurrent Linux kernel workflows: build, search, edit, Git, tree check and final filesystem sync | [dev workflow](docs/bench-dev-workflow.md) |
-| `mini-dev-workflow` | Same Git worktree workflow on a small C project | [dev workflow](docs/bench-dev-workflow.md) |
 | `npm-install` | N concurrent offline npm or pnpm installs into cold `node_modules` | [npm install](docs/bench-npm-install.md) |
-| `npm-install-nofsync` | Same, with no harness fsync; install timing, throughput and tree stats, no flush/durable metrics | [npm install](docs/bench-npm-install.md#no-fsync-variant) |
 | `clone` | Durable directory copies and native LakeBase Clone OpenAPI latency | [clone](docs/bench-clone.md) |
 | `kvtest` | SQLite small-BLOB reads and checked synchronous overwrites | [kvtest](docs/bench-kvtest-openclaw.md) |
-| `sqlite-speedtest` | N independent SQLite `speedtest1 main` SQL phases | [sqlite-speedtest](docs/bench-sqlite-speedtest.md) |
-| `mount-scale` | N independent mounts running remounted whole-file reads and batch-durable creates | [mount scale](docs/bench-mount-scale.md) |
-| `mdtest` | POSIX file or directory metadata throughput of N tasks at fixed total work | [mdtest](docs/bench-mdtest.md) |
-| `mdtest-peak` | Weak-scaling file create/stat/read/unlink ops/s and MiB/s of N tasks, up to 2× CPUs | [mdtest peak](docs/bench-mdtest-peak.md) |
+| `mount-scale` | One real mount per agent: native mdtest scaling, mount-command latency, and single-node density | [mount scale](docs/bench-mount-scale.md) |
+| `mdtest-peak` | Native file create/stat/read/unlink phases; use one rank for per-repeat average operation latency | [mdtest peak](docs/bench-mdtest-peak.md) |
 | `agent-replay` | Paired Codex/OpenClaw model-response replay with native tool timing and per-trial verification | [agent replay](docs/bench-agent-replay.md) |
+
+The cache ablation also uses `tools/npm_workspace_pack.py`: one offline
+`npm pack` over installed packages, with archives and npm state off-target.
+See the [execution matrix](experiments/round-03.md) for its inputs and timing.
 
 ```sh
 uv run python -m agent_fs_bench run <command> --dirs /mnt/fs-a
 ```
 
-Workload flags (after `--`): `--smoke` for `clone`, `mdtest`, `mdtest-peak`,
-`kvtest` and `sqlite-speedtest`, and `--directory-smoke` for `mount-scale`. All other
+Workload flags go after `--`: `--smoke` for `clone`, `mdtest-peak` and `kvtest`,
+and `--workload`, `--idle-mounts` and `--directory-smoke` for `mount-scale`. Other
 settings (tasks, scale, repeats, PRAGMAs, tool versions, paths) live in the `CONFIG`
 dict at the top of each module in `agent_fs_bench/benchmarks/`. Changing an
 experiment means editing `CONFIG`; each run's `config.json` records the resulting
@@ -165,6 +169,6 @@ agent_fs_bench/   CLI, task placement and Open MPI dispatch (cluster.py), analys
 experiments/      example TOML configs (copy to local/, which is git-ignored)
 data/             fixed inputs, lockfiles, Git bundles (see docs/fixtures.md)
 third_party/      agent-mitm-replay submodule
-tools/            fixture maintenance
+tools/            fixture maintenance and npm workspace packing
 docs/             run modes, per-workload configuration and timing boundaries
 ```

@@ -201,8 +201,16 @@ class Layout:
         A successful unmount clears the prior mountinfo baseline, so the same Layout
         can remount after the read fixture has been prepared through its first mount.
         """
+        self.begin_mount()
+        plans = [self._plan(index) for index in range(len(self.clients))]
+        wall, self.mount_agent_elapsed_s = self._time(plans, "mount")
+        counts = self.accept_mount()
+        return {"mount_elapsed_s": wall, **counts}
+
+    def begin_mount(self) -> None:
+        """Snapshot mountinfo before commands run elsewhere (e.g. inside MPI ranks)."""
         if self._mounted or self._before is not None:
-            raise RuntimeError("mount() requires no active or unverified mount attempt")
+            raise RuntimeError("begin_mount() requires no active or unverified mount attempt")
         if self.profile.topology == SHARED_DIRECTORY:
             targets = (
                 self.data_root / f"agent-{index:04d}" / f"shared-{number}"
@@ -221,8 +229,10 @@ class Layout:
                for point in self._before.values()):
             raise RuntimeError("a client subtree already contains a mountpoint")
 
-        plans = [self._plan(index) for index in range(len(self.clients))]
-        wall, self.mount_agent_elapsed_s = self._time(plans, "mount")
+    def accept_mount(self) -> dict[str, int]:
+        """Verify mounts established outside this Layout and mark it mounted."""
+        if self._before is None:
+            raise RuntimeError("accept_mount() requires begin_mount()")
         try:
             counts = self.verify()
         except RuntimeError as exc:
@@ -231,7 +241,16 @@ class Layout:
                 f"inspect {self.work_dir} and {self.data_root}"
             ) from exc
         self._mounted = True
-        return {"mount_elapsed_s": wall, **counts}
+        return counts
+
+    def mount_command(self, index: int) -> list[str]:
+        """The single real mount command of one K=1 client."""
+        commands = self._plan(index)
+        if len(commands) != 1:
+            raise RuntimeError(
+                f"agent {index:04d} mount commands: expected 1, measured {len(commands)}"
+            )
+        return commands[0]
 
     def _roots(self) -> list[Path]:
         return [(self.work_dir / f"agent-{i:04d}").resolve()

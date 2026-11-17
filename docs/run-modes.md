@@ -151,11 +151,13 @@ value:
     which gives the batch wall time.
   - Clocks of different machines are never compared; per-task durations are measured
     by each task on its own machine.
-- **Native workload jobs:** mdtest and mdtest-peak launch upstream MPI directly.
-  Mount-scale uses one synchronized POSIX read job and one durable create-write
-  job per K=1 repeat. K>1 separately uses mdtest for the shared-scope ablation.
-  Mount-scale has a lifecycle worker on each participating machine; it prepares
-  private files and manages mounts, sampling and cleanup outside I/O timing.
+- **Native workload jobs:** mdtest and mdtest-peak launch upstream mdtest directly.
+  `mount-scale --workload mdtest-io` and `mdtest-create` use native mdtest on one
+  verified mount per active MPI rank. `--workload mount` instead starts one
+  wrapper command per rank behind a start barrier and measures no file I/O.
+  The per-machine lifecycle worker verifies mounts and manages setup and
+  cleanup outside phase timing. Optional single-host idle mounts never run ranks.
+  Archived `io` runs use the older POSIX batches or K>1 shared mdtest path.
 
 ## Directories and data
 

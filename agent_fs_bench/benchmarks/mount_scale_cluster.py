@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import platform
 from queue import Empty, Queue
@@ -139,6 +140,7 @@ class Lifecycle:
         self.logs = Path(job['work_dir']) / 'diagnostics' / job['name']
         self.logs.mkdir(parents=True, exist_ok=True)
         self.layout: Layout | None = None
+        self.idle_layout: Layout | None = None
         self.sampler: resources.Sampler | None = None
         self.private: Path | None = None
         self.local: Path | None = None
@@ -147,6 +149,8 @@ class Lifecycle:
     def command(self, request: dict) -> dict:
         actions = {
             'init-data': self.init_data, 'setup': self.setup, 'mount': self.mount,
+            'mount-plan': self.mount_plan, 'verify-mount': self.verify_mount,
+            'mount-idle': self.mount_idle, 'unmount-idle': self.unmount_idle,
             'unmount': self.unmount, 'prepare-read': self.prepare_read,
             'idle': self.idle, 'sample-start': self.sample_start,
             'sample-stop': self.sample_stop, 'cleanup': self.cleanup,
@@ -157,6 +161,57 @@ class Lifecycle:
 
     def mount(self, request: dict) -> dict:
         return {**self.layout.mount(), 'agent_elapsed_s': self.layout.mount_agent_elapsed_s}
+
+    def mount_plan(self, request: dict) -> dict:
+        """Write each active client's single mount argv to a private local file.
+
+        The MPI rank reads only that path, so no command text (and no credential a
+        site wrapper might carry) enters the appfile, stdout or controller results.
+        """
+        assert self.layout is not None, 'mount-plan: expected a layout from setup'
+        assert self.local is not None, 'mount-plan: expected a local setup from setup'
+        self.layout.begin_mount()
+        paths = []
+        for index in range(len(self.clients)):
+            path = self.local / f'mount-command-{index:04d}.json'
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+                handle.write(json.dumps(self.layout.mount_command(index)))
+            paths.append(str(path))
+        return {'commands': paths}
+
+    def verify_mount(self, request: dict) -> dict:
+        assert self.layout is not None, 'verify-mount: expected a layout from setup'
+        return self.layout.accept_mount()
+
+    def mount_idle(self, request: dict) -> dict:
+        """Mount a run-level idle cohort once; it stays mounted across active repeats."""
+        assert self.profile is not None, 'mount-idle: expected a real mount profile'
+        assert self.idle_layout is None, 'mount-idle: idle cohort already mounted'
+        clients = request['clients']
+        assert type(clients) is int and clients > 0, \
+            f'idle clients: expected a positive integer, measured {clients!r}'
+        private = self.data_root / 'idle'
+        local = Path(self.job['work_dir']) / 'idle'
+        if private.exists() or local.exists():
+            raise RuntimeError(f'idle cohort paths already exist: {private}, {local}')
+        private.mkdir()
+        local.mkdir(parents=True)
+        self.idle_layout = Layout(
+            self.profile, local, private, (), clients,
+            log_dir=local / 'lifecycle',
+            timeout_s=self.job['command_timeout_s'],
+        )
+        return self.idle_layout.mount()
+
+    def unmount_idle(self, request: dict) -> dict:
+        assert self.idle_layout is not None, 'unmount-idle: idle cohort is not mounted'
+        self.idle_layout.verify()
+        result = self.idle_layout.unmount()
+        shutil.rmtree(self.idle_layout.data_root)
+        shutil.rmtree(self.idle_layout.work_dir)
+        self.idle_layout = None
+        return result
 
     def unmount(self, request: dict) -> dict:
         return {**self.layout.unmount(), 'agent_elapsed_s': self.layout.unmount_agent_elapsed_s}
@@ -213,6 +268,7 @@ class Lifecycle:
 
     def finish(self, request: dict) -> dict:
         assert self.sampler is None, 'resource sampling at finish: expected stopped, measured active'
+        assert self.idle_layout is None, 'idle mounts at finish: expected released, measured active'
         return {}
 
     def init_data(self, request: dict) -> dict:
@@ -247,8 +303,11 @@ class Lifecycle:
             self.layout = None
             aliases = tuple(values)
         else:
+            log_dir = (self.logs / name / 'lifecycle'
+                       if self.job['workload'] == 'io'
+                       else local / 'lifecycle')
             self.layout = Layout(self.profile, local, private, shared, clients,
-                                 log_dir=self.logs / name / 'lifecycle',
+                                 log_dir=log_dir,
                                  timeout_s=self.job['command_timeout_s'])
             aliases = self.layout.clients
         self.clients = tuple(aliases)

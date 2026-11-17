@@ -7,18 +7,19 @@
 # measured per-agent mount entries, but may still count toward provider quotas.
 # {source}/{subdir}/{binds} use volume-absolute paths, relative to admin_root.
 #
-# The canonical paper scenario uses directories = 1 (K=1): one real backend mount
-# and one private set per agent. The commands below then expose exactly one mount.
-# K>1 profiles are an explicitly selected shared-scope ablation, not the default.
-# cgroup = true is only for the separate K=1 FUSE resource ablation. The site's
-# mount/unmount wrappers must create/enter/remove the per-client leaf; see
-# docs/bench-mount-scale.md. Leave it unset for the main comparison.
+# Round 03 uses directories = 1: one real backend mount and private workspace
+# per active agent or idle client. K>1 is for archived experiments only.
+# The site's wrapper establishes each client's actual session. For Experiments
+# 6/8, cap and verify one Apsara metadata connection per mount, with no sleeps
+# in the timed command. This example does not set a provider connection limit.
+# For the archived resource ablation, cgroup = true uses the site-owned wrapper
+# contract in docs/bench-mount-scale.md. Leave it unset for the scale matrix.
 
 [profiles.nfs]
 topology = "multi-mount"
 admin_root = "/mnt/nfs-admin"
-private_mount = ["mount", "-t", "nfs", "-o", "rw", "server:/export{source}", "{mountpoint}"]
-shared_mount = ["mount", "-t", "nfs", "-o", "ro", "server:/export{source}", "{mountpoint}"]
+private_mount = ["mount", "-t", "nfs", "-o", "rw,vers=4", "server:/export{source}", "{mountpoint}"]
+shared_mount = ["mount", "-t", "nfs", "-o", "ro,vers=4", "server:/export{source}", "{mountpoint}"]
 unmount = ["umount", "{mountpoint}"]
 # A few Linux NFS mounts of one server/export may share one superblock, cache and
 # connection set. One mount entry is not one independent NFS TCP client. This profile
