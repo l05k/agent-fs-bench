@@ -67,10 +67,10 @@ uv run python -m agent_fs_bench run <benchmark> --mode <mode> --dirs <target-ali
 
 每组要求：
 
-- 每个图点一行：`median/q1/q3` 在同一聚合层计算，`n` 是独立观测数；`q1 <= median <= q3`。
+- 每个有有效观测的图点一行：`median/q1/q3` 在同一聚合层计算，`n` 是独立观测数；`q1 <= median <= q3`，`n=1` 时三者相等。
 - `series_order` 固定图例顺序，主系统第一。
 - `source_runs` 使用执行报告中的稳定别名。
-- 失败/超时/发散/缺失进入 `summary/failures.csv`，不进入 `n`，不补零。
+- 失败/超时/发散/缺失进入 `summary/failures.csv`，不进入 `n`，不补零。没有有效值的组只写失败账目，不造空摘要对。
 - 原始样本保留在测试机；执行报告记录提取命令、脚本别名/哈希和源结果指纹。
 
 ```csv

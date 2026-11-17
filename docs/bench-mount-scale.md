@@ -27,21 +27,17 @@ Files contain seeded pseudorandom data, distinct across clients and files in
 each phase. The 4 MiB per-client write payload is allocated before timing so
 compression of zero-filled files and payload generation do not drive the result.
 
-**One run measures one N on one fixed host budget; there is no default sweep.** Use
-`--mode local` and increase N only across separate runs; do not add machines as N grows.
-`CONFIG['tasks']` (default 64) selects N. N above the machine's CPU count oversubscribes
-it, exactly as concurrent clients behave; the kernel schedules them. Do not treat added
-machines as free concurrency or describe placement changes as an N-only scaling effect.
+**One run measures one N; there is no implicit sweep.** Set N with `--tasks`
+(default 64). For a multi-host sweep, use `--mode remote` with the same ordered
+client pool and storage deployment at every point. Change only client concurrency,
+and record the actual rank placement. The main three-host curve uses all three
+hosts at N > 1 in its planned sweep. N=1 runs on the pool's first host only: it
+is a single-host reference, not a point with the same participating-host budget.
 
 `directories > 1` selects the earlier shared read-only ablation. That path keeps its
 upstream mdtest create/stat/read/remove private phases plus shared stat/read phases and is
 reported under those phase names. It is not a paper default, and its shared phases are
 never merged into the canonical `read` / `create-write` numbers.
-
-Use one fixed machine for the intended sweep; increasing N does not add nodes. If a run
-uses `--mode` with several machines anyway, placement is recorded per machine, but that
-is no longer the canonical fixed-node-budget experiment and must not be presented as an
-N-only scaling result.
 
 ## Dependencies and network
 
@@ -80,8 +76,9 @@ make -j
 
 ## Configuration and runs
 
-Experiment parameters live in `CONFIG` at the top of `mount_scale.py`; there are no
-scaling or fault-tolerance CLI flags.
+Pass `--tasks`, `--repeats`, `--startup-timeout-s`, `--job-timeout-s` and
+`--fixture-timeout-s` after `--` for an experiment. Other parameters live in `CONFIG`
+at the top of `mount_scale.py`.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -92,7 +89,9 @@ scaling or fault-tolerance CLI flags.
 | `file_size_bytes` | `4096` | Bytes per file |
 | `repeats` | `3` | Complete repetitions at the same N |
 | `mdtest` | `mdtest` | Upstream binary used only by the K>1 ablation |
-| `command_timeout_s` | `300` | Worker control replies and each mount/unmount command |
+| `command_timeout_s` | `360` | Each mount/unmount command and short worker replies |
+| `lifecycle_timeout_s` | `900` | Each worker's full mount/unmount action, including verification |
+| `startup_timeout_s` | `180` | Deadline for every MPI rank to report its rank and planned host before `MPI_Init` |
 | `job_timeout_s` | `900` | Each native MPI job: read, create-write or ablation mdtest |
 | `fixture_timeout_s` | `1800` | Per-repeat read-fixture preparation and cleanup control replies |
 | `idle_sample_s` | `1.0` | Machine idle sampling duration for baseline/mounted/released |
@@ -153,11 +152,23 @@ released. With K=1 the LakeBase profile must omit the empty `--bind` argument; t
 variant in the example file adds it. The canonical read fixture travels through the first
 mount, so the read phase starts after an unmount/remount boundary.
 
+For a K=1 FUSE resource ablation, set `cgroup = true` only in each filesystem's
+limited profile. Omit it in the unlimited control, whose wrapper must not apply
+the per-client limit. Use site-owned mount/unmount wrappers. Before starting the
+FUSE daemon in the limited arm, the mount wrapper must put it in
+`/sys/fs/cgroup/agent-fs-bench/<sha256(resolved mountpoint)[:20]>`
+with `cpu.max = 100000 100000` and `memory.max = 2147483648`. The site enables CPU
+and memory controllers at that root; the unmount wrapper removes the leaf after the
+daemon has exited. The harness checks both limits and a nonempty process list on each
+mount, moves the measured rank into the same leaf before MPI initialization, and
+rejects leftover leaves after unmount. Fixture preparation is outside that rank's
+budget. Do not apply this profile to a kernel filesystem client.
+
 ```sh
-uv run python -m agent_fs_bench run mount-scale --mode local --target cephfs
+uv run python -m agent_fs_bench run mount-scale --mode remote --target cephfs -- --tasks 768 --repeats 3
 uv run python -m agent_fs_bench run mount-scale --mode local --target lakebase
 
-# Two clients, ordinary directories, 32 files, one repeat; reads no profile and mounts nothing.
+# Two clients, ordinary directories, 32 files, one repeat; mounts nothing.
 uv run python -m agent_fs_bench run mount-scale --mode local \
   --dirs /tmp/mdtest-directory-smoke -- --directory-smoke
 ```
@@ -193,15 +204,17 @@ storage-performance evidence.
    filesystem containing each client's target; when mounts share a superblock it may
    persist other clients' pending writes too.
 6. Stop resource sampling, unmount concurrently in reverse order on each machine, verify
-   no residue, and sample released-idle. On success, emit the repeat's results and delete
-   the unmounted private data and empty repeat directory. After all repeats succeed,
+   no residue, sample released-idle, and delete the unmounted private data and empty
+   repeat directory. Only then emit the repeat's results. After all repeats succeed,
    collect lifecycle logs and delete the run's data.
 
-The canonical MPI jobs use `cluster.run_program` with `job_timeout_s` applied to the
-launcher process group. A timeout, nonzero exit, short read/write count,
-missing file, failed `sync -f`, or nonfinite timing fails the run. A failed or incomplete
-batch emits **no** throughput row. Mounting, fixture preparation and cleanup never enter a
-phase timer.
+The launcher checks a startup report from each planned rank before `MPI_Init`. A missed
+startup deadline fails with the missing rank count per host; a duplicate or misplaced
+rank fails immediately. This is separate from the full `job_timeout_s` deadline, which
+also bounds hangs after all ranks have spawned. Both deadlines terminate the local MPI
+launcher process group, retaining stdout and stderr. A timeout, nonzero exit, short
+read/write count, missing file, failed `sync -f`, or nonfinite timing fails the repeat
+without emitting throughput. Mounting, fixture preparation and cleanup are untimed.
 
 A failure stops the run and leaves mounts and data in place for inspection: no automatic
 unmount, retry, failover or shrinking to a smaller N.
@@ -281,9 +294,8 @@ with `uv run python -m agent_fs_bench plot <run-dir>...`.
 | `memory-delta-<topology>` | `resource_deltas` | tasks | used_bytes_delta for `mounted-idle` | topology |
 
 Each run measures one N, so its default figures hold one x point. Pool separate N runs
-with `uv run python -m agent_fs_bench plot <run-N1> <run-N2>... --vary tasks`. All other
-configuration, the mode and the source fingerprint must match; the fingerprint ignores
-each module's `CONFIG` literal, so editing `CONFIG['tasks']` between runs is fine.
+with `uv run python -m agent_fs_bench plot <run-N1> <run-N2>... --vary tasks`. Keep
+all other measurement settings, the mode and the source fingerprint fixed.
 
 Resources come from **whole-machine counters on each machine**: CPU busy, MemTotal−
 MemAvailable, cache, dirty, slab and mount entries. They include Python, MPI, daemons, the
@@ -293,8 +305,9 @@ namespace, so a daemon must create mounts in that namespace.
 
 ## Paper claim boundaries
 
-- The canonical design holds one fixed host budget and one fixed storage deployment.
-  Adding N clients does not add nodes. Do not attribute a curve to node expansion.
+- For the multi-host curve, keep the client pool and storage deployment fixed.
+  The N=1 reference uses only one participating host; do not use it as a
+  same-budget baseline for scaling efficiency.
 - Each agent has one independent real backend mount and one private data set. A mount
   entry is not automatically a distinct NFS TCP connection, kernel client or cache; state
   the actual mount type/options and admin-view sharing. CephFS `noshare` is the example
@@ -312,11 +325,10 @@ namespace, so a daemon must create mounts in that namespace.
 
 ## Validation performed
 
-No post-change smoke run was performed while preparing this revision. The previous
-implementation's directory and two-lab-server smokes validated its mount/lifecycle
-harness but used the previous four-phase private workload; they are not evidence for the
-read/create-write path. The directory smoke is still only a harness check, not storage
-performance data.
+The K=1 directory smoke on Linux with Open MPI 4.1.8 started both ranks and verified
+64 complete files in each of the read and create-write batches. It checks local MPI
+startup, I/O and cleanup, not real backend mounts, cgroups, multi-host placement or
+storage performance.
 
 ## References
 

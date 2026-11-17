@@ -135,6 +135,34 @@ class ProgramTimeoutTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 5)
             self.assertEqual((root / 'timeout.stdout.txt').read_text(), 'started\n')
 
+    def test_mpi_startup_timeout_counts_missing_ranks_by_host(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mpiexec = root / 'mpiexec'
+            proof = cluster.encode_message('started', (0, 'local-host'))
+            mpiexec.write_text(f'#!{sys.executable}\nimport time\n'
+                               f'print({proof!r}, end="", flush=True)\ntime.sleep(10)\n')
+            mpiexec.chmod(0o755)
+            launcher = Launcher((str(mpiexec),), (), {}, Path('hosts.toml'), 15)
+            placement = place([node('local'), node('worker')], 2)
+            with self.assertRaisesRegex(RuntimeError,
+                                        r"MPI startup exceeded 1s: 1/2 ranks started;.*'worker': 1"):
+                cluster.run_program(placement, launcher, [['ignored']] * 2, root, 'partial',
+                                    timeout_s=5, startup_timeout_s=1)
+            self.assertEqual((root / 'partial.stdout.txt').read_text(), proof)
+
+    def test_duplicate_rank_cannot_satisfy_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mpiexec = root / 'mpiexec'
+            proof = cluster.encode_message('started', (0, 'local-host')) * 2
+            mpiexec.write_text(f'#!{sys.executable}\nprint({proof!r}, end="")\n')
+            mpiexec.chmod(0o755)
+            launcher = Launcher((str(mpiexec),), (), {}, Path('hosts.toml'), 15)
+            with self.assertRaisesRegex(RuntimeError, 'duplicate or unexpected MPI rank 0'):
+                cluster.run_program(place([node('local')], 2), launcher, [['ignored']] * 2,
+                                    root, 'duplicate', timeout_s=5, startup_timeout_s=2)
+
 
 class TaskDirectoryTests(unittest.TestCase):
     class Comm:
