@@ -27,21 +27,17 @@ Files contain seeded pseudorandom data, distinct across clients and files in
 each phase. The 4 MiB per-client write payload is allocated before timing so
 compression of zero-filled files and payload generation do not drive the result.
 
-**One run measures one N on one fixed host budget; there is no default sweep.** Use
-`--mode local` and increase N only across separate runs; do not add machines as N grows.
-`CONFIG['tasks']` (default 64) selects N. N above the machine's CPU count oversubscribes
-it, exactly as concurrent clients behave; the kernel schedules them. Do not treat added
-machines as free concurrency or describe placement changes as an N-only scaling effect.
+**One run measures one N; there is no implicit sweep.** Set N with `--tasks`
+(default 64). For a multi-host sweep, use `--mode remote` with the same ordered
+client pool and storage deployment at every point. Change only client concurrency,
+and record the actual rank placement. The main three-host curve uses all three
+hosts at N > 1 in its planned sweep. N=1 runs on the pool's first host only: it
+is a single-host reference, not a point with the same participating-host budget.
 
 `directories > 1` selects the earlier shared read-only ablation. That path keeps its
 upstream mdtest create/stat/read/remove private phases plus shared stat/read phases and is
 reported under those phase names. It is not a paper default, and its shared phases are
 never merged into the canonical `read` / `create-write` numbers.
-
-Use one fixed machine for the intended sweep; increasing N does not add nodes. If a run
-uses `--mode` with several machines anyway, placement is recorded per machine, but that
-is no longer the canonical fixed-node-budget experiment and must not be presented as an
-N-only scaling result.
 
 ## Dependencies and network
 
@@ -156,9 +152,11 @@ released. With K=1 the LakeBase profile must omit the empty `--bind` argument; t
 variant in the example file adds it. The canonical read fixture travels through the first
 mount, so the read phase starts after an unmount/remount boundary.
 
-For a K=1 FUSE resource ablation, set `cgroup = true` in both arms' profiles and
-use site-owned mount/unmount wrappers. Before starting the FUSE daemon, the mount
-wrapper must put it in `/sys/fs/cgroup/agent-fs-bench/<sha256(resolved mountpoint)[:20]>`
+For a K=1 FUSE resource ablation, set `cgroup = true` only in each filesystem's
+limited profile. Omit it in the unlimited control, whose wrapper must not apply
+the per-client limit. Use site-owned mount/unmount wrappers. Before starting the
+FUSE daemon in the limited arm, the mount wrapper must put it in
+`/sys/fs/cgroup/agent-fs-bench/<sha256(resolved mountpoint)[:20]>`
 with `cpu.max = 100000 100000` and `memory.max = 2147483648`. The site enables CPU
 and memory controllers at that root; the unmount wrapper removes the leaf after the
 daemon has exited. The harness checks both limits and a nonempty process list on each
@@ -307,8 +305,9 @@ namespace, so a daemon must create mounts in that namespace.
 
 ## Paper claim boundaries
 
-- The canonical design holds one fixed host budget and one fixed storage deployment.
-  Adding N clients does not add nodes. Do not attribute a curve to node expansion.
+- For the multi-host curve, keep the client pool and storage deployment fixed.
+  The N=1 reference uses only one participating host; do not use it as a
+  same-budget baseline for scaling efficiency.
 - Each agent has one independent real backend mount and one private data set. A mount
   entry is not automatically a distinct NFS TCP connection, kernel client or cache; state
   the actual mount type/options and admin-view sharing. CephFS `noshare` is the example

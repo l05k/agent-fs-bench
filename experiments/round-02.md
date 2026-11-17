@@ -1,10 +1,10 @@
 # Round 02｜Apsara 评估：核验旧实测，补齐论文口径
 
-你在测试机上执行本方案。旧仓、`results/` 和 `packages/` 只读保留；新实验使用独立 checkout、独立数据目录。不要修改服务端、清理历史会话、自动重试、换配置救失败样本、填零或以小规模成功代替计划点。预检不过就不启动对应组；运行失败停该组后续依赖点，保留诊断并记账。只有确认互不干扰的其他组才能继续。
+这是 Round 02 的可执行测试机方案。旧仓、`results/` 和 `packages/` 只读保留；新实验使用独立 checkout、独立数据目录。不要修改服务端、清理历史会话、自动重试、换配置救失败样本、填零或以小规模成功代替计划点。预检不过就不启动对应组；运行失败停该组后续依赖点，保留诊断并记账。只有确认互不干扰的其他组才能继续。
 
 ## 1. 固定代码与现场
 
-从 `l05k/agent-fs-bench` 的 `bench/round-02-validation` 获取方案，先把本文件原样保存为 staging 的 `plan.md`，再在 controller 与客户端的全新 checkout 固定代码 commit：
+从 `l05k/agent-fs-bench` 的 `bench/round-02-validation` 获取方案。在 controller 的独立 checkout 切换到固定代码前，先把本文原样保存为 `local/round-02-stage/plan.md`。controller 与客户端均固定代码 commit：
 
 ```text
 9a10d2809c2a9389ee75ea63b25e513c2d54643f
@@ -36,7 +36,7 @@
 
 | 组 | 固定资源与系列 | N | 每点 |
 | --- | --- | --- | --- |
-| `smallfile-main` | 同一份 3 台宿主机池；Apsara fast、NAS v4、CephFS kernel；无 per-agent 限额 | 1、24、96、384、768 | 每点 3 repeats；N=1 仅在固定池第一台跑，报告实际放置。NAS 的 768 挂载及常驻挂载预算未确认时，三方共同的 768 点均记 `not_run`，不临时换 N。 |
+| `smallfile-main` | 同一份 3 台宿主机池；Apsara fast、NAS v4、CephFS kernel；无 per-agent 限额 | 1、24、96、384、768 | 每点 3 repeats，报告实际放置。N=1 仅用池中第一台，是单机参考，不是三台全参与的同预算点；其余计划点都用这 3 台。NAS 的 768 挂载及常驻挂载预算未确认时，三方共同的 768 点均记 `not_run`，不临时换 N。 |
 | `smallfile-capacity` | 同一份 10 台池；Apsara fast、CephFS kernel；无 per-agent 限额 | 3,200（每台 320） | 预先做 N=10、2,560 各一轮门禁，不进入正式点；门禁通过后 3 repeats。单列容量，不接到三系统主曲线。 |
 | `smallfile-quota` | 同一份 3 台池；Apsara fast 与 CephFS FUSE 各测无限额和 1 CPU/2 GiB；不混 NAS/kernel | 192 | 3 repeats。`cgroup = true` 仅在限额臂；按 `docs/bench-mount-scale.md` 沿用站点 wrapper，真实核对每个 leaf 的 daemon 与 rank 同组且卸载后消失。CPU quota 不是独占 CPU；fixture 准备不受 rank 限额。 |
 
@@ -65,13 +65,16 @@ uv run python -m agent_fs_bench run mount-scale --mode remote --target apsara-fa
 
 小文件每个有效 repeat 的 `aggregate_files_per_s = completed_files / elapsed_s`，聚合单位是整个 repeat，读/写分别成组（如 `smallfile-main-read`、`smallfile-main-write`），绝不把 rank 或文件当独立样本。工具和 Clone 在各自上节指定的指标、相同操作/形状和单位内对有效 repeats 聚合。统一分位数算法：将 n 个有效观察排序，按零基位置 `(n-1)·p` 对相邻值线性插值，`p=0.25/0.5/0.75`；`n=1` 三值相同。没有足够证据则只进诊断/失败账目，不伪造统计值。
 
-- `plan.md` 是本文原文；`execution.md` 用 [执行报告模板](execution-report.template.md) 记录实际 matrix/placement、目标版本与别名、边界/偏离、全部计划行的状态与失败原因、原始 run/提取脚本指纹、冻结轴及期望/有效次数。用 `planned = valid + failed + not_run + excluded` 按组/系列/图点对账，已验收的早期 repeat 不能被后续失败覆盖。只记录合计及必要已核实证据，不贴逐文件、逐 rank、逐 repeat 或逐 task 原始表。Legacy 同组中对已核验值不漏列；对未提取值列出确切组、点和原因。
-- 按 [交换约定](../docs/markdown-exchange.md) 生产 `summary/<group>.csv`（`series,x,metric,median,q1,q3,n`）和同名 JSON（`xlabel,ylabel,unit,logx,logy,series_order,source_runs,formula`）。Apsara 在已观察系列中排首；旧组使用单独的 `legacy-` 前缀，smoke 数值不进入正式组。`summary/failures.csv` 用 `group,series,label,count`；没有有效点的组只写失败账目，并在 `execution.md` 标出 x、阶段和受影响次数。全批无有效值也能只导出失败账目。不向工作树提交结果。测试机不画论文图。
-- 主机、路径、端点、实例、账户和 bucket 用稳定别名。不要回传原始 CSV/JSONL、日志、命令环境、cassette、模型响应、配置全文或凭证；raw 与映射留测试机。检查未执行或失败点已计数；人工审核后生成一份 UTF-8 Markdown 源文档，复制完整源文本，不手改或拼接。容量不足只压缩文字；不能完整回传时显式列出未装入的组/点，不抽样、不写成完成。
+- 在 `local/round-02-stage/` 放入原样的 `plan.md`、按[执行报告模板](execution-report.template.md)填写的 `execution.md` 和 `summary/`。run 状态沿用模板；记录实际放置、目标别名、测量边界、偏离及来源指纹，不贴逐文件、逐 rank、逐 repeat 或逐 task 表。
+- **图点与 repeat 分开记账。** 每个计划图点按组、系列、x、指标对账。`n≥1` 即为有效点，写一行摘要，即使同一 run 后续 repeat 失败；`n=0` 不写数值，在 `summary/failures.csv` 记 `failed`（已尝试但无有效值）或 `not_run`（未执行）。在 `execution.md` 逐点列计划、有效、失败、未执行及排除的 repeat 合计，后四项之和应等于计划数。失败、未执行及排除的 repeat 另在失败账目用 `repeat_failed`、`repeat_not_run`、`repeat_excluded` 计数，不与点数相加。
+- 按[交换约定](../docs/markdown-exchange.md)生成 `summary/<group>.csv`（`series,x,metric,median,q1,q3,n`）和同名 JSON（`xlabel,ylabel,unit,logx,logy,series_order,source_runs,formula`）。Apsara 在已观察系列中排首；旧组用 `legacy-` 前缀；smoke 数值不进入正式组。`summary/failures.csv` 用 `group,series,label,count`，同键计数合并；在 `execution.md` 列各缺失点的 x、原因及涉及的 run。全批无有效值时只写失败账目，不造空摘要对。不提交实验结果，不在测试机画论文图。
+- 主机、路径、端点、实例、账户和 bucket 用稳定别名。原始 CSV/JSONL、日志、命令环境、cassette、模型响应、配置和凭证不出站。容量不足先压缩说明，不截断或抽样；本包仍放不下的计划点以 `label=not_run` 纳入 `summary/failures.csv`，每个遗漏点算一次。在 `execution.md` 标出具体点及传输原因，保留真实执行状态，区分未执行与已执行但未回传。
+
+人工审核 staging 后，从基准仓库根目录运行（输出文件必须尚不存在）：
 
 ```sh
 python3 -m agent_fs_bench.exchange export --batch round-02 \
-  --root "$AFB_STAGE" --output "$AFB_OUT/round-02.md" --reviewed
+  --root local/round-02-stage --output local/round-02.md --reviewed
 ```
 
-唯一回传是 `round-02.md`；其余检查产物、日志和样本保留在测试机。
+只回传 `local/round-02.md` 的完整 UTF-8 源文本，不手改或拼接；其余检查产物、日志和样本留测试机。
