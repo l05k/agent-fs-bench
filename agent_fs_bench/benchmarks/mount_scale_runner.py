@@ -1,9 +1,8 @@
-"""Internal MPI ranks for the mount-scale mount and native-program workloads.
+"""Internal MPI ranks for the mount-scale mount workload.
 
 `mount` runs one site profiled mount command inside each rank: the command file holds
 the site wrapper argv, the rank times only the command from invocation to its ready
-return, and the wrapper's output stays in the private lifecycle work tree. `exec`
-optionally joins a per-client cgroup leaf before exec'ing a native program (mdtest).
+return, and the wrapper's output stays in the private lifecycle work tree.
 """
 
 from __future__ import annotations
@@ -92,28 +91,9 @@ def mount_main(argv: Sequence[str]) -> int:
     return 0
 
 
-def exec_main(argv: Sequence[str]) -> int:
-    """Optionally join a cgroup leaf, report startup, then replace this process."""
-    cgroup = None
-    if argv[:1] == ['--cgroup']:
-        assert len(argv) >= 3, 'exec: expected --cgroup PATH before the program'
-        cgroup = Path(argv[1])
-        argv = argv[2:]
-    if argv[:1] == ['--']:
-        argv = argv[1:]
-    assert argv, 'exec: expected a program to run'
-    if cgroup is not None:
-        (cgroup / 'cgroup.procs').write_text(str(os.getpid()), encoding='ascii')
-    cluster.report_rank_start()
-    os.execvp(argv[0], list(argv))
-    return 1
-
-
 def main(argv: Sequence[str]) -> int:
     if argv[:1] == ['mount']:
         return mount_main(argv[1:])
-    if argv[:1] == ['exec']:
-        return exec_main(argv[1:])
     raise SystemExit('internal mount-scale rank runner; use agent-fs-bench run mount-scale')
 
 

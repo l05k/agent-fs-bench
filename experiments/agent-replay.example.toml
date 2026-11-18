@@ -2,6 +2,9 @@
 # digests before capture. List every selected task/harness, even when its
 # cassette is missing, so capture failures stay in the planned denominator.
 # Paths are relative to this file. Keep them outside measured targets.
+# Use this same cohort for `python -m agent_fs_bench.replay_capture collect`;
+# task and source paths must exist on each capture/replay host in its checkout.
+# distribute installs accepted cassettes at the paths below; they must be new.
 
 [[cases]]
 name = "task-a-codex"

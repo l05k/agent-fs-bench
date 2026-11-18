@@ -1,12 +1,20 @@
 # mdtest peak
 
-Push a client to its throughput ceiling with the unmodified **IOR mdtest 4.0.0**. This complements the fixed-total-work [`mdtest`](bench-mdtest.md) runs, which cannot show a ceiling: their fixed 65536-object total leaves a few thousand objects per task at high N, so phases are short enough for barrier and launch overhead to dominate. They also move no file data.
+Push a client to its throughput ceiling with the unmodified **IOR mdtest 4.0.0**. This
+complements the retired fixed-total `mdtest` command, which cannot show a ceiling: its
+fixed 65536-object total leaves a few thousand objects per task at high N, so phases are
+short enough for barrier and launch overhead to dominate. That command is no longer an
+entry point on this branch; its implementation remains in
+`agent_fs_bench/benchmarks/mdtest.py` and is reused here. The retired runs also move no
+file data.
 
 `mdtest-peak` uses **weak scaling**. Each task gets a fixed file count, so the total is n×N and phase time grows once the target saturates. That growth makes the plateau visible. Every point reports file ops/s; create and read with non-empty files also report MiB/s.
 
 ## Commands
 
-Prerequisites match [`mdtest`](bench-mdtest.md): the same `mdtest` 4.0.0 on every task machine, Open MPI 4.1, and targets mounted externally. Machine placement follows [run modes](run-modes.md).
+Prerequisites: the same `mdtest` 4.0.0 on every task machine, Open MPI 4.1, and targets
+mounted externally. Launch helpers and validation are shared through
+`agent_fs_bench/benchmarks/mdtest.py`. Machine placement follows [run modes](run-modes.md).
 
 ```sh
 # Default: 128 tasks dealt round-robin over the --mode machines.
@@ -43,6 +51,8 @@ Each launch is `mdtest -a POSIX -F -i 1 -n <n> -w S -e S -y [-u]`:
 
 `-y` makes mdtest fsync after each write. IOR 4.0.0 skips the write for S=0, so the 0 B create has no fsync; it measures pure create/close metadata cost. Measured repeats follow `warmup_repeats` identical, discarded launches, and reads follow writes in the same launch with **no cache drop** (`cache_state = after-warmup-write-then-read-same-launch-no-drop`), so read MiB/s can come from the client page cache. Do not report it as storage-server read bandwidth.
 
+`mdtest-peak` sets no CPU or memory quota. Experiments 1–4 use the external common 1 CPU / 2 GiB budget around each workload and its FUSE daemon where present; experiments 5–8 use fixed host resources without a per-agent quota. Upstream mdtest itself has no built-in limit.
+
 ## Results
 
 Each run writes one flat CSV per record kind plus a `config.json`:
@@ -63,7 +73,7 @@ Each run writes one flat CSV per record kind plus a `config.json`:
 | `bytes` | ops×S, logical create/read bytes |
 | `mib_per_s` | bytes / MiB / elapsed_s, for create/read with S>0 |
 
-Timing, validation, the per-machine directories and the IOR 4.0.0 CSV item-count caveat are identical to [`mdtest`](bench-mdtest.md#timing-and-results); launch checks and helpers are shared with that module. `config.json` records each machine's facts (`nodes`) and the task count per machine (`placement`).
+Timing, validation, the per-machine directories and the IOR 4.0.0 CSV item-count caveat are shared with the retired fixed-total implementation through `agent_fs_bench/benchmarks/mdtest.py`; launch checks and helpers are reused from that module. `config.json` records each machine's facts (`nodes`) and the task count per machine (`placement`).
 
 ## Default figures
 

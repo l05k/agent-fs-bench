@@ -33,6 +33,8 @@ from typing import Sequence
 from agent_fs_bench import cluster
 
 VERSION = '4.0.0'
+READ = 'read'
+CREATE_WRITE = 'create-write'
 # mdtest's mdtest_test_num_t order; the rank CSV header repeats every name.
 _PHASES = (
     'Directory creation', 'Directory stat', 'Directory read', 'Directory rename',
@@ -56,7 +58,6 @@ class Rank:
 
     node: cluster.Node
     workspace: Path  # Private test directory parent; exists on that machine only.
-    cgroup: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -133,13 +134,8 @@ def run_job(launcher: cluster.Launcher, binary: str, tag: str, label: str, ranks
     programs = []
     for rank, group in zip(ranks, groups, strict=True):
         arguments = [binary, *group, '--saveRankPerformanceDetails', str(capture)]
-        if rank.cgroup is None:
-            programs.append([rank.node.python, '-u', '-m', 'agent_fs_bench.cluster',
-                             'rank-exec', *arguments])
-        else:
-            programs.append([rank.node.python, '-u', '-m',
-                             'agent_fs_bench.benchmarks.mount_scale_runner', 'exec',
-                             '--cgroup', str(rank.cgroup), '--', *arguments])
+        programs.append([rank.node.python, '-u', '-m', 'agent_fs_bench.cluster',
+                         'rank-exec', *arguments])
     run = cluster.run_program(placement, launcher, programs, log_dir, label,
                               timeout_s=timeout_s, startup_timeout_s=startup_timeout_s)
     cluster.validate_exit(run)

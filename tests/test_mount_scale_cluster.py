@@ -13,15 +13,26 @@ class WorkerDataTests(unittest.TestCase):
     def test_worker_requires_same_shared_namespace_before_creating_private_data(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            data, work = root / 'data', root / 'staging'
-            data.mkdir()
+            admin, work = root / 'admin', root / 'staging'
+            admin.mkdir()
             work.mkdir()
+            data = admin / 'data'
+            data.mkdir()
             (data / '.owner').write_text('another-volume')
-            lifecycle = Lifecycle({'directory_smoke': True, 'data_root': str(data),
-                                   'work_dir': str(work), 'name': 'local', 'token': 'expected'})
+            profile = f'''[profiles.fs]
+topology = "multi-mount"
+admin_root = "{admin}"
+private_mount = ["mount", "{{subdir}}", "{{mountpoint}}"]
+unmount = ["umount", "{{mountpoint}}"]
+'''
+            lifecycle = Lifecycle({'profile': profile, 'target': 'fs',
+                                   'data_root': str(data), 'work_dir': str(work),
+                                   'name': 'local', 'token': 'expected',
+                                   'command_timeout_s': 5, 'idle_sample_s': 0.1})
             with self.assertRaisesRegex(AssertionError, 'run sentinel'):
                 lifecycle.setup({'repeat': 1, 'clients': 2, 'total_clients': 2})
             self.assertFalse((data / 'N2-R1').exists())
+
 
 class WorkerDeadlineTests(unittest.TestCase):
     def test_mount_lifecycle_replies_can_exceed_the_command_deadline(self):

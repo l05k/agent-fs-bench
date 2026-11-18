@@ -11,9 +11,8 @@
 # idle client. The site's wrapper establishes each client's actual session. For
 # Experiments 6/8, cap and verify one Apsara metadata connection per mount, with
 # no sleeps in the timed command. This example does not set a provider connection
-# limit. cgroup = true uses the site-owned wrapper contract in
-# docs/bench-mount-scale.md; --workload mount rejects it, and only mdtest-* runs
-# record mount_cgroup. Leave it unset for the scale matrix.
+# limit. The harness sets no CPU/memory budget and creates no cgroup; Experiments
+# 1–4 budgets are applied externally around the workload and its FUSE daemon.
 
 [profiles.nfs]
 topology = "multi-mount"

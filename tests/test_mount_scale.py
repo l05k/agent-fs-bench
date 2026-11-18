@@ -1,6 +1,5 @@
 """Consumer-visible mount topology invariants; no privileged mounts required."""
 
-import json
 import os
 from pathlib import Path
 import signal
@@ -9,38 +8,34 @@ import tempfile
 import unittest
 from unittest import mock
 
-from agent_fs_bench.benchmarks import mount_scale, mount_scale_io as io
+from agent_fs_bench.benchmarks import mount_scale
 from agent_fs_bench.benchmarks import mount_scale_mdtest as native
 from agent_fs_bench.benchmarks.mount_scale_mdtest import Phase, check_banner, read_timings
-from agent_fs_bench.benchmarks.mount_scale_mounts import Layout, Profile, _run
+from agent_fs_bench.benchmarks.mount_scale_mounts import Layout, Profile, _run, parse_profile
 from agent_fs_bench.results import RunContext, Tables, read_table
 from agent_fs_bench.targets import Target
 
 
 class ConfigurationTests(unittest.TestCase):
-    def test_rejects_cgroup_mount_before_starting_workers(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            profile = root / 'mounts.toml'
-            profile.write_text(f'''[profiles.fs]
+    def test_removed_io_and_directory_smoke_are_rejected(self):
+        for argv in (['--workload', 'io'], ['--directory-smoke']):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                mount_scale.parse_args(argv)
+
+    def test_idle_cohort_is_mount_only(self):
+        with self.assertRaisesRegex(AssertionError, 'idle-mounts'):
+            mount_scale.parse_args(['--idle-mounts', '4'])
+
+    def test_cgroup_profile_key_is_not_retained(self):
+        text = '''[profiles.fs]
 topology = "multi-mount"
-admin_root = "{root / 'admin'}"
+admin_root = "/admin"
 private_mount = ["mount"]
 unmount = ["umount"]
 cgroup = true
-''')
-            args = mount_scale.parse_args(['--workload', 'mount'])
-            args.profiles = profile
-            ctx = RunContext('mount-scale', 'run', Target('fs', root / 'stage'),
-                             root / 'work', root / 'results', None)
-            with mock.patch.object(mount_scale, 'start') as start:
-                with self.assertRaisesRegex(AssertionError, 'cgroup.*mount'):
-                    mount_scale.run(ctx, args)
-                start.assert_not_called()
-
-    def test_directory_smoke_is_private_only(self):
-        args = mount_scale.parse_args(['--directory-smoke'])
-        self.assertEqual((args.tasks, args.files, args.repeats), (2, 32, 1))
+'''
+        with self.assertRaisesRegex(ValueError, 'unknown profile keys.*cgroup'):
+            parse_profile(text, 'fs')
 
 
 class MountTopologyTests(unittest.TestCase):
@@ -87,20 +82,6 @@ class MountTopologyTests(unittest.TestCase):
                 Layout(profile, stage, admin / 'escape', 1,
                        log_dir=root / 'logs', timeout_s=5)
             self.assertFalse((outside / 'agent-0000').exists())
-
-    def test_existing_but_unbounded_mount_cgroup_is_rejected(self):
-        with tempfile.TemporaryDirectory() as directory:
-            leaf = Path(directory)
-            (leaf / 'cpu.max').write_text('100000 100000\n')
-            (leaf / 'memory.max').write_text('max\n')
-            (leaf / 'cgroup.procs').write_text('42\n')
-            with self.assertRaisesRegex(RuntimeError, 'expected 1 CPU / 2 GiB'):
-                Layout._check_cgroup(leaf)
-
-            (leaf / 'memory.max').write_text('2147483648\n')
-            (leaf / 'cgroup.procs').write_text('')
-            with self.assertRaisesRegex(RuntimeError, 'no mount client process'):
-                Layout._check_cgroup(leaf)
 
 
 @unittest.skipUnless(hasattr(os, 'fork'), 'requires POSIX daemon behavior')
@@ -204,56 +185,6 @@ all,32,,,,,,,,,,,4.9618383734e+04,1.2898445129e-03,1.1046726584e+06,5.7935714722
             with self.assertRaisesRegex(AssertionError, 'workload: expected'):
                 native.run_job(None, 'mdtest', 'test', 'create', ranks,
                                [[], []], ('File creation',), Path('/logs'), 32, 60, 10)
-
-
-class SmallFileIOTests(unittest.TestCase):
-    SIZE = 4096
-
-    def test_write_and_read_count_only_exact_full_files(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            payload = b'a' * self.SIZE + b'b' * self.SIZE + b'c' * self.SIZE
-            count, total = io.write_files(root, 3, self.SIZE, payload)
-            self.assertEqual((count, total), (3, 3 * self.SIZE))
-            self.assertEqual(
-                [path.name for path in sorted(root.iterdir())],
-                ['file-00000.bin', 'file-00001.bin', 'file-00002.bin'])
-            self.assertEqual((root / 'file-00001.bin').read_bytes(), b'b' * self.SIZE)
-            self.assertEqual(io.read_files(root, 3, self.SIZE), (3, 3 * self.SIZE))
-            (root / 'file-00001.bin').write_bytes(bytes(self.SIZE - 1))
-            self.assertEqual(io.read_files(root, 3, self.SIZE), (2, 2 * self.SIZE))
-
-    def test_create_write_requires_fresh_files(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            self.assertEqual(io.write_files(root, 1, 16, b'a' * 16), (1, 16))
-            self.assertEqual(io.write_files(root, 1, 16, b'b' * 16), (0, 0))
-            self.assertEqual((root / 'file-00000.bin').read_bytes(), b'a' * 16)
-
-    def result(self, mode, counts, sync_ok=None):
-        return io.RESULT_PREFIX + json.dumps({
-            'mode': mode, 'tasks': len(counts), 'rank_files': counts,
-            'rank_bytes': [count * self.SIZE for count in counts],
-            'rank_elapsed_s': [0.2 + index for index in range(len(counts))],
-            'sync_ok': sync_ok})
-
-    def test_complete_batch_uses_slowest_client_and_exact_successes(self):
-        phase = io.parse_batch('create-write', self.result('create-write', [4, 4], True),
-                               2, 'create-write', 4, self.SIZE)
-        self.assertEqual((phase.name, phase.operations, phase.elapsed_s),
-                         ('create-write', 8, 1.2))
-        self.assertEqual(phase.rank_elapsed_s, [0.2, 1.2])
-
-    def test_missing_file_or_sync_cannot_become_a_throughput_row(self):
-        with self.assertRaisesRegex(AssertionError, 'full-file successes'):
-            io.parse_batch('create-write', self.result('create-write', [4, 3], True),
-                           2, 'create-write', 4, self.SIZE)
-        with self.assertRaisesRegex(AssertionError, 'target syncfs'):
-            io.parse_batch('create-write', self.result('create-write', [4, 4], False),
-                           2, 'create-write', 4, self.SIZE)
-        with self.assertRaisesRegex(AssertionError, 'read sync'):
-            io.parse_batch('read', self.result('read', [4, 4], True),
-                           2, 'read', 4, self.SIZE)
 
 
 class TableEmissionTests(unittest.TestCase):

@@ -152,9 +152,9 @@ value:
   - Clocks of different machines are never compared; per-task durations are measured
     by each task on its own machine.
 - **Native workload jobs:** mdtest-peak launches upstream mdtest directly.
-  `mount-scale --workload mdtest-io` and `mdtest-create` use native mdtest on one
-  verified mount per active MPI rank. `--workload mount` instead starts one
-  wrapper command per rank behind a start barrier and measures no file I/O.
+  `mount-scale` (`--workload mdtest-io`, the default) and `mdtest-create` use native
+  mdtest on one verified mount per active MPI rank. `--workload mount` instead starts
+  one wrapper command per rank behind a start barrier and measures no file I/O.
   The per-machine lifecycle worker verifies mounts and manages setup and
   cleanup outside phase timing. Optional single-host idle mounts never run ranks.
 

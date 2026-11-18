@@ -1,11 +1,10 @@
 """Persistent per-machine lifecycle workers for mount-scale.
 
-File-operation timing belongs to separate global MPI jobs: POSIX read/create-write
-or native mdtest. Each machine keeps one local/SSH worker holding Layout/Sampler
-state across those jobs. The worker prepares POSIX read fixtures outside I/O timing.
-Protocol: the controller writes the job, then one JSON request per line; the worker
-answers each with one JSON result line. A failing worker exits with its traceback in
-`worker.stderr.txt`; mounts and data stay for inspection.
+File-operation timing belongs to separate global MPI jobs: mount or native mdtest.
+Each machine keeps one local/SSH worker holding Layout/Sampler state across those
+jobs. Protocol: the controller writes the job, then one JSON request per line; the
+worker answers each with one JSON result line. A failing worker exits with its
+traceback in `worker.stderr.txt`; mounts and data stay for inspection.
 """
 
 from __future__ import annotations
@@ -26,8 +25,7 @@ import time
 from agent_fs_bench import cluster
 from agent_fs_bench.results import PROJECT_ROOT
 from agent_fs_bench.ssh import ssh_argv
-from .mount_scale_mounts import CGROUP_ROOT, Client, Layout, parse_profile
-from . import mount_scale_io as io
+from .mount_scale_mounts import Client, Layout, parse_profile
 from . import mount_scale_resources as resources
 
 
@@ -93,7 +91,7 @@ class Worker:
         if action in ('mount', 'unmount', 'mount-idle', 'unmount-idle',
                       'mount-plan', 'verify-mount'):
             timeout_s = self.job['lifecycle_timeout_s']
-        elif action in ('prepare-read', 'cleanup', 'remove-repeat', 'remove-data'):
+        elif action in ('cleanup', 'remove-repeat', 'remove-data'):
             timeout_s = self.job['fixture_timeout_s']
         else:
             timeout_s = self.timeout_s
@@ -117,24 +115,18 @@ def preflight(job: dict) -> None:
                                          f'{platform.system()}'
     staging = Path(job['staging'])
     assert staging.is_dir(), f'staging: expected an existing directory, measured {staging}'
-    if not job['directory_smoke']:
-        profile = parse_profile(job['profile'], job['target'])
-        admin = profile.admin_root
-        assert admin.is_dir(), f'admin_root: expected mounted here, measured {admin}'
-        assert not (staging.resolve().is_relative_to(admin.resolve())
-                    or admin.resolve().is_relative_to(staging.resolve())), \
-            f'staging: expected outside admin_root {admin}, measured {staging}'
-        if profile.cgroup:
-            controllers = (CGROUP_ROOT / 'cgroup.subtree_control').read_text().split()
-            if not {'cpu', 'memory'} <= set(controllers):
-                raise RuntimeError(f'{CGROUP_ROOT}: enable both cgroup v2 cpu and memory controllers')
+    profile = parse_profile(job['profile'], job['target'])
+    admin = profile.admin_root
+    assert admin.is_dir(), f'admin_root: expected mounted here, measured {admin}'
+    assert not (staging.resolve().is_relative_to(admin.resolve())
+                or admin.resolve().is_relative_to(staging.resolve())), \
+        f'staging: expected outside admin_root {admin}, measured {staging}'
 
 
 class Lifecycle:
     def __init__(self, job: dict):
         self.job = job
-        self.profile = (None if job['directory_smoke'] else
-                        parse_profile(job['profile'], job['target']))
+        self.profile = parse_profile(job['profile'], job['target'])
         self.data_root = Path(job['data_root'])
         self.logs = Path(job['work_dir']) / 'diagnostics' / job['name']
         self.logs.mkdir(parents=True, exist_ok=True)
@@ -150,7 +142,7 @@ class Lifecycle:
             'init-data': self.init_data, 'setup': self.setup, 'mount': self.mount,
             'mount-plan': self.mount_plan, 'verify-mount': self.verify_mount,
             'mount-idle': self.mount_idle, 'unmount-idle': self.unmount_idle,
-            'unmount': self.unmount, 'prepare-read': self.prepare_read,
+            'unmount': self.unmount,
             'idle': self.idle, 'sample-start': self.sample_start,
             'sample-stop': self.sample_stop, 'cleanup': self.cleanup,
             'remove-repeat': self.remove_repeat, 'remove-data': self.remove_data,
@@ -185,7 +177,6 @@ class Lifecycle:
 
     def mount_idle(self, request: dict) -> dict:
         """Mount a run-level idle cohort once; it stays mounted across active repeats."""
-        assert self.profile is not None, 'mount-idle: expected a real mount profile'
         assert self.idle_layout is None, 'mount-idle: idle cohort already mounted'
         clients = request['clients']
         assert type(clients) is int and clients > 0, \
@@ -214,24 +205,6 @@ class Lifecycle:
 
     def unmount(self, request: dict) -> dict:
         return {**self.layout.unmount(), 'agent_elapsed_s': self.layout.unmount_agent_elapsed_s}
-
-    def prepare_read(self, request: dict) -> dict:
-        """Create each client's durable read fixture through its first mount.
-
-        This runs before the measured remount and is never part of I/O timing.
-        """
-        files, size = request['files'], request['file_size_bytes']
-        assert self.clients, 'prepare-read: expected clients from setup'
-        def prepare(entry: tuple[int, Client]) -> dict:
-            index, client = entry
-            read = client.workspace / 'read'
-            write = client.workspace / 'write'
-            write.mkdir()
-            total = io.prepare_fixture(read, files, size, f'{self.job["name"]}-read-{index}')
-            return {'files': files, 'bytes': total}
-        with ThreadPoolExecutor(max_workers=len(self.clients)) as pool:
-            values = list(pool.map(prepare, enumerate(self.clients)))
-        return {'clients': values}
 
     def idle(self, request: dict) -> dict:
         return idle(self.job['idle_sample_s'])
@@ -289,27 +262,13 @@ class Lifecycle:
         local = Path(self.job['work_dir']) / name / self.job['name']
         local.mkdir(parents=True)
         self.private, self.local = private, local
-        if self.profile is None:
-            values = []
-            for index in range(clients):
-                workspace = private / f'agent-{index:04d}' / 'workspace'
-                workspace.mkdir(parents=True)
-                values.append(Client(workspace))
-            self.layout = None
-            aliases = tuple(values)
-        else:
-            log_dir = (self.logs / name / 'lifecycle'
-                       if self.job['workload'] == 'io'
-                       else local / 'lifecycle')
-            self.layout = Layout(self.profile, local, private, clients,
-                                 log_dir=log_dir,
-                                 timeout_s=self.job['command_timeout_s'])
-            aliases = self.layout.clients
+        self.layout = Layout(self.profile, local, private, clients,
+                             log_dir=local / 'lifecycle',
+                             timeout_s=self.job['command_timeout_s'])
+        aliases = self.layout.clients
         self.clients = tuple(aliases)
         baseline = idle(self.job['idle_sample_s'])
-        return {'clients': [{'workspace': str(client.workspace),
-                             'cgroup': str(client.cgroup) if client.cgroup is not None else None}
-                            for client in aliases],
+        return {'clients': [{'workspace': str(client.workspace)} for client in aliases],
                 'baseline': baseline}
 
 

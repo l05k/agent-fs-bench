@@ -17,6 +17,8 @@
 
 冻结 SWE-bench Pro V2 public 的 100 个均匀无放回样本（按公开 task ID 排序，用 Python `random.Random(20261110).sample`）和 Terminal-Bench 2.0 的全部 89 个，两套 harness 用同一 cohort。记录 release、采样实现和全部 378 个计划 task/harness。为每项准备 Harbor 单步任务定义、初始快照和镜像 digest；准备失败保留在计划台账，不造空 task 目录、不抽替代任务。可准备的每项都写入同一份 `cases`，没有 cassette 的项仍列出。使用 [回放入口](../docs/bench-agent-replay.md) 在 ext4 为 Codex `0.169.0`、OpenClaw `2026.11.3` 分别录制 Qwen 3.8 Max（Responses / Chat Completions）。每臂每任务 `tasks=1,repeats=3`，原计划 378 份 capture、4,536 次 replay。先用一公开任务验证实际挂载、预算与工具可比，再运行全计划；不以 smoke 代替。每次恢复相同内容、mode、link 和 `.git`，确认实际访问被测 bind 路径而非 image overlay。不可比仍计缺失/发散，不用 reward 筛选。
 
+Trace 采集使用多 host 并行，而不是在每台重复采集全队列：按冻结 `cases` 顺序 round-robin 分片，每 host 同时仅 1 项，在 ext4 上从独立初态录制；各 host 保持相同镜像、工具和 1c2g 任务预算。按[多 host 采集流程](../docs/bench-agent-replay.md#capture-on-several-hosts)执行 `python -m agent_fs_bench.replay_capture collect`，成功 cassette 自动汇集到实验 controller，再用 `distribute` 复制到各回放 host 的 manifest 路径。无需共享盘；本工作站不接收原始 trace。已分类的 task 失败记账并继续下一个独立 task；环境/SSH 失败停止该 host，剩余记 `not_run`，不重试或换任务。保留 controller 的全队列 `index.json` 用于覆盖对账。采集并行不改变每个后端 `tasks=1` 的单 Agent 回放合同。
+
 四系统跑完同一份 `cases` 后运行 `python -m agent_fs_bench.replay_report <四个完整 run 目录> --reference ext4`。按 benchmark × harness，同一任务四臂所有计划 repeats 均 `ok` 且 ext4 中位 tool time > 0，才取各系统的 `median(tool_s)/median(ext4 tool_s)`。汇总任务比值的中位数和 IQR；覆盖率分母用最初的 100 或 89，补入未进入 `cases` 的 `setup_failure`，对账 capture、发散、错误、超时和排除。不要回传逐任务比值。`harbor_s`、模型推理、verifier 和 setup 不进入主指标。
 
 ### 2. 工具：有明确完成边界的安装、SQLite、开发工作流
@@ -44,9 +46,9 @@ PY
 
 捕获主机对象和负载进程的实际 cgroup；不要把从外部启动的 FUSE daemon 误算进 CLI 的继承关系。一个正式实验点从固定配置生成，不在现场修改已跟踪文件。
 
-### 3. 优化消融：同一组 npm 工作区，两条机制对比
+### 3. 优化消融：同一组 npm 工作区，写侧目标与读侧缓存路径
 
-**写侧。** 只对比 `exclusive` 与 `exclusive-drop`；两臂均为一个 agent、一个真实独占客户端，固定 metadata TTL、local-lock、page cache、write buffer、group cache、部署和离线输入，**只改变 `drop-read-flush-barrier`**。复用实验 2 的 `npm-install` (`pm=npm,tasks=1,repeats=3,flush=true`)；主指标 `durable_s`，分解保留 `install_s` 和 `flush_s`。先核对该版 flag 的真实语义，不按名称假设其放松了所有同步。必须证明两臂仍在同一个最终确认边界完成：取得 `fsync`/目录发布契约，并在授权的独立 scratch 上确认已同步的内容与目录项经客户端异常退出后的新客户端可见；正常卸载会自行写回，不能单用正常卸载可见性代替。若该部署不能确认边界，不报持久完成对比。
+**写侧。** 两臂是站点提供的两个不同真实挂载目标别名，示例为 `exclusive` / `exclusive-drop`；不推断别名背后的共享/独占语义。每个别名一个 agent、一个真实客户端；固定部署、挂载选项、metadata TTL、local-lock、page cache、write buffer、group cache 和离线输入，只改变该站点声明的写侧因素。复用实验 2 的同一 `npm-install` 工作负载与输出（`pm=npm,tasks=1,repeats=3,flush=true`）；主指标 `durable_s`，分解保留 `install_s` 和 `flush_s`。先记录目标别名、实际生效选项和站点事实；除非有实测差异，不写关于 metadata 缓存或共享/独占的泛化结论。记录该部署实际的 `fsync`/目录发布契约，报告只到该契约为止；本组是性能基准，不要求异常退出/crash-injection 的额外持久性验收，也不从正常卸载可见性外推崩溃保证。若无法确认两臂在同一持久化边界完成，不报 `durable_s` 对比。
 
 **读侧。** producer 用上述同一 fixture 的真实 `npm ci`（`npm-install` 设置 `pm=npm,tasks=1,repeats=1,flush=true,keep_node_modules=true`），发布同一份已同步的 `node_modules`；消费者用 `tools/npm_workspace_pack.py` 执行一次固定包列表的 `npm pack --offline --ignore-scripts`。这测 npm 工具完成延迟（含遍历和压缩），不是裸读带宽。所有 arm 固定 Node/npm、列表、输入内容、client 独立进程、同一 ECS，使用不同真实 mount，不用 bind 冒充冷客户端。打包输出、npm cache 和日志在另一文件系统。计时前不对消费者工作区做全树读取/哈希，不要求清 provider cache；输出档案摘要核对逻辑输入一致。
 
@@ -66,7 +68,7 @@ PY
 
 ### 4. 文件操作延迟
 
-复用 `mdtest-peak`，单 rank、私有目录，`file_size_bytes=0/4096/1048576` 三次独立配置，每点 1 次 warmup + 5 个 measured repeat，沿用每尺寸默认 item 数。0 B 取 `file-create`（create+close，无数据/fsync）与 `file-stat`；4 KiB、1 MiB 分别取 `file-create`（create+write+`-y` 逐文件 fsync+close）与 `file-read`（open+全读+close，跟随创建、不吹冷缓存）。`ranks.csv:elapsed_s / items_per_task × 10^6` 是一个 repeat 的平均 µs/op；汇报中位数/IQR，**不从 phase/rank 均值推逐操作 p99**。空文件 open/close 不冒充读数据。
+复用 `mdtest-peak`，单 rank、私有目录，`file_size_bytes=0/4096/1048576` 三次独立配置，每点 1 次 warmup + 5 个 measured repeat，沿用每尺寸默认 item 数。0 B 取 `file-create`（create+close，无数据/fsync）与 `file-stat`；4 KiB、1 MiB 分别取 `file-create`（create+write+`-y` 逐文件 fsync+close）与 `file-read`（open+全读+close，跟随创建、不吹冷缓存）。`ranks.csv:elapsed_s / items_per_task × 10^6` 是一个 repeat 的平均 µs/op；汇报中位数/IQR，**不从 phase/rank 均值推逐操作 p99**。空文件 open/close 不冒充读数据。`mdtest-peak`/mdtest 自身不设 CPU 或内存额度；实验 4 的每个 agent（mdtest 及其子进程、该 agent 的真实客户端/FUSE daemon）仍由站点放入实验 1–4 的外部共同 1c2g 预算子树，不能按进程或 daemon 另加额度。
 
 ## Intro、5–8｜扩展性
 
@@ -82,12 +84,14 @@ PY
 
 空闲轴 M=0/64/192/384/768/1,024/1,536/1,920。看结果前记录站点授权的会话/内存额度、admin 余量、进程/文件句柄和 mount-table 限制，冻结可安全纳入的最高 M/N；旧 1,920 不是容量保证。超过上限的点 `not_run`，不以小规模成功替换；失败后不继续堆积 mount。M 个 idle mount 不发 MPI rank、不计入活跃样本；验证挂载与释放。记录客户端内存、CPU、可核实的 metadata 连接数，不从 buffer 配置推 RSS。
 
+实验 5–8 在固定宿主机资源上运行，不施加每 agent 的 1c2g 配额；mdtest 本身没有内置 CPU/内存限额，mount-scale 也不创建预算 cgroup。记录实际机器、挂载、会话/连接和站点额度，不把实验 1–4 的预算规则外推到这里。
+
 典型命令（按冻结矩阵替换目标和规模）：
 
 ```sh
 uv run python -m agent_fs_bench run mount-scale --mode remote --target apsara-fast -- \
   --workload mdtest-io --tasks 384 --repeats 3 --startup-timeout-s 180 \
-  --job-timeout-s 3600 --fixture-timeout-s 7200
+  --job-timeout-s 3600
 uv run python -m agent_fs_bench run mount-scale --mode remote --target apsara-1conn -- \
   --workload mount --tasks 320 --repeats 5
 uv run python -m agent_fs_bench run mount-scale --mode local --target apsara-1conn -- \
@@ -96,7 +100,7 @@ uv run python -m agent_fs_bench run mount-scale --mode local --target apsara-1co
   --workload mdtest-create --tasks 1 --idle-mounts 64 --repeats 100
 ```
 
-`mdtest-create` 只计 0 B create+close，独立删除/清理在计时外。验收每阶段精确 N×1,000 文件、正确的 native 模式和 rank 数、无 mdtest I/O warnings 或截断，无 mount/工作区残留。Exp 5 每个数据阶段的逻辑字节数为 `N×1,000×4,096`；字节数不等于物理存储 I/O。各组报实际 warm/cache 状态，不把结束同步或写可见性外推为崩溃证明。
+`mdtest-create` 只计 0 B create+close，独立删除/清理在计时外。验收每阶段精确 N×1,000 文件、正确的 native 模式和 rank 数、无 mdtest I/O warnings 或截断，无 mount/工作区残留。Exp 5 每个数据阶段的逻辑字节数为 `N×1,000×4,096`；字节数不等于物理存储 I/O。各组报实际 warm/cache 状态，不把逐文件 `fsync` 或写后可见性外推为崩溃证明。
 
 ## 9–10｜Clone 和作用域
 

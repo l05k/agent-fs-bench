@@ -7,7 +7,6 @@ checked through mountinfo and per-agent sentinels; no shell, sudo or cleanup.
 from __future__ import annotations
 
 import concurrent.futures
-import hashlib
 import re
 import secrets
 import subprocess
@@ -22,9 +21,6 @@ SHARED_DIRECTORY = "shared-directory"
 _TOPOLOGIES = {MULTI_MOUNT, SHARED_DIRECTORY}
 _MOUNTINFO = "/proc/self/mountinfo"
 _UNESCAPE = re.compile(r"\\([0-7]{3})")
-CGROUP_ROOT = Path('/sys/fs/cgroup/agent-fs-bench')
-CGROUP_CPU_MAX = '100000 100000'
-CGROUP_MEMORY_MAX = 2 * 1024**3
 
 
 @dataclass(frozen=True)
@@ -33,13 +29,11 @@ class Profile:
     admin_root: Path
     private_mount: tuple[str, ...] = ()
     unmount: tuple[str, ...] = ()
-    cgroup: bool = False
 
 
 @dataclass(frozen=True)
 class Client:
     workspace: Path
-    cgroup: Path | None = None
 
 
 def parse_profile(text: str, target_name: str, source: str = "mounts.toml") -> Profile:
@@ -49,13 +43,9 @@ def parse_profile(text: str, target_name: str, source: str = "mounts.toml") -> P
     it on its own machine.
     """
     table = tomllib.loads(text)["profiles"][target_name]
-    unknown = table.keys() - {'topology', 'admin_root', 'private_mount',
-                              'unmount', 'cgroup'}
+    unknown = table.keys() - {'topology', 'admin_root', 'private_mount', 'unmount'}
     if unknown:
         raise ValueError(f'{source}: unknown profile keys {sorted(unknown)}')
-    cgroup = table.get('cgroup', False)
-    if type(cgroup) is not bool:
-        raise ValueError(f'{source}: cgroup must be a TOML boolean')
     topology = table["topology"]
     if topology not in _TOPOLOGIES:
         raise ValueError(f"{source}: topology must be {MULTI_MOUNT} or {SHARED_DIRECTORY}")
@@ -68,7 +58,6 @@ def parse_profile(text: str, target_name: str, source: str = "mounts.toml") -> P
         admin_root=admin_root,
         private_mount=tuple(table['private_mount']),
         unmount=tuple(table['unmount']),
-        cgroup=cgroup,
     )
 
 
@@ -161,11 +150,7 @@ class Layout:
             if multi:
                 (local_root / "workspace").mkdir()
             mountpoint = local_root / 'workspace' if multi else local_root
-            cgroup = None
-            if profile.cgroup:
-                digest = hashlib.sha256(str(mountpoint.resolve()).encode()).hexdigest()
-                cgroup = CGROUP_ROOT / digest[:20]
-            client_values.append(Client(local_root / 'workspace', cgroup))
+            client_values.append(Client(local_root / 'workspace'))
             self.mountpoints.append(mountpoint)
         self.clients = tuple(client_values)
         self._write_sentinels()
@@ -173,8 +158,8 @@ class Layout:
     def mount(self) -> dict[str, int | float]:
         """Run every client's mount command, then verify outside the timer.
 
-        A successful unmount clears the prior mountinfo baseline, so the same Layout
-        can remount after the read fixture has been prepared through its first mount.
+        A successful unmount clears the prior mountinfo baseline, so a Layout can be
+        mounted again after verification.
         """
         self.begin_mount()
         commands = [self.mount_command(index) for index in range(len(self.clients))]
@@ -239,20 +224,7 @@ class Layout:
                 + (f"; missing {missing}" if missing else "")
             )
         self._check_aliases()
-        for client in self.clients:
-            if client.cgroup is not None:
-                self._check_cgroup(client.cgroup)
         return {"measured_mounts": len(scope)}
-
-    @staticmethod
-    def _check_cgroup(path: Path) -> None:
-        cpu = (path / 'cpu.max').read_text().strip()
-        memory = (path / 'memory.max').read_text().strip()
-        if (cpu, memory) != (CGROUP_CPU_MAX, str(CGROUP_MEMORY_MAX)):
-            raise RuntimeError(f'{path}: expected 1 CPU / 2 GiB, measured cpu.max={cpu!r}, '
-                               f'memory.max={memory!r}')
-        if not (path / 'cgroup.procs').read_text().strip():
-            raise RuntimeError(f'{path}: no mount client process in cgroup')
 
     def unmount(self) -> dict[str, int | float]:
         """Run every client's unmount command, then verify."""
@@ -269,9 +241,6 @@ class Layout:
                 f"unmount verification failed: {len(remaining)} mountpoint(s) "
                 f"remain; inspect {self.work_dir} and {self.data_root}"
             )
-        for client in self.clients:
-            if client.cgroup is not None and client.cgroup.exists():
-                raise RuntimeError(f'per-client cgroup remains after unmount: {client.cgroup}')
         self._mounted = False
         self._before = None
         return {"unmount_elapsed_s": wall, "remaining_mounts": 0}

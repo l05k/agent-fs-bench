@@ -69,10 +69,9 @@ checkout. Setup, placement and launcher settings: [run modes](docs/run-modes.md)
 
 The controller records the launcher, node facts and planned targets before
 running any workload. It appends validated raw observations and marks a target
-complete only after the workload returns. Mount-scale defaults to synchronized
-POSIX `io` batches; `mdtest-create`, `mdtest-io` and `mount` are selected
-explicitly, and `--directory-smoke` never mounts. The per-workload docs define
-each timing boundary.
+complete only after the workload returns. Mount-scale defaults to native
+`mdtest-io` on one real mount per agent; only `mdtest-io`, `mdtest-create` and
+`mount` remain. The per-workload docs define each timing boundary.
 
 ## Workloads
 
@@ -86,7 +85,7 @@ measurements; those workloads are not part of the active matrix.
 | `npm-install` | N concurrent offline npm or pnpm installs into cold `node_modules` | [npm install](docs/bench-npm-install.md) |
 | `clone` | Durable directory copies and native LakeBase Clone OpenAPI latency | [clone](docs/bench-clone.md) |
 | `kvtest` | SQLite small-BLOB reads and checked synchronous overwrites | [kvtest](docs/bench-kvtest-openclaw.md) |
-| `mount-scale` | One real mount per agent; synchronized POSIX `io` batches by default, or explicit native mdtest and mount-command latency workloads | [mount scale](docs/bench-mount-scale.md) |
+| `mount-scale` | One real mount per agent; native mdtest create+read (`mdtest-io`) by default, plus `mdtest-create` and mount-command latency | [mount scale](docs/bench-mount-scale.md) |
 | `mdtest-peak` | Native file create/stat/read/unlink phases; use one rank for per-repeat average operation latency | [mdtest peak](docs/bench-mdtest-peak.md) |
 | `agent-replay` | Paired Codex/OpenClaw model-response replay with native tool timing and per-trial verification | [agent replay](docs/bench-agent-replay.md) |
 
@@ -94,12 +93,15 @@ The cache ablation also uses `tools/npm_workspace_pack.py`: one offline
 `npm pack` over installed packages, with archives and npm state off-target.
 See the [execution matrix](experiments/round-03.md) for its inputs and timing.
 
+Agent replay captures are collected on the experiment controller and distributed
+to the replay hosts; see [agent replay capture](docs/bench-agent-replay.md#capture-on-several-hosts).
+
 ```sh
 uv run python -m agent_fs_bench run <command> --dirs /mnt/fs-a
 ```
 
 Workload flags go after `--`: `--smoke` for `clone`, `mdtest-peak` and `kvtest`,
-and `--workload`, `--idle-mounts` and `--directory-smoke` for `mount-scale`. Other
+and `--workload` and `--idle-mounts` for `mount-scale`. Other
 settings (tasks, scale, repeats, PRAGMAs, tool versions, paths) live in the `CONFIG`
 dict at the top of each module in `agent_fs_bench/benchmarks/`. Changing an
 experiment means editing `CONFIG`; each run's `config.json` records the resulting
@@ -151,8 +153,9 @@ summaries.
   compare tool versions (in each target's `info`), kernel, mount options or host
   environment; keep those consistent yourself. `config.json` records each machine's
   probed facts (`nodes`, incl. CPU model) and every target's task count per machine.
-- Cache semantics are workload-specific. `mount-scale` remounts the clients
-  before reads; this does not evict server or persistent/shared client caches.
+- Cache semantics are workload-specific. `mount-scale` native read follows create
+  in the same launch with no remount or cache drop; this does not evict server or
+  persistent/shared client caches.
 - Tasks are not bound to CPUs; resource limits (cgroups, cpusets) for FUSE clients,
   servers and the benchmark are set externally.
 - Smoke runs only prove the pipeline works; they are not performance or
