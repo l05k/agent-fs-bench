@@ -32,7 +32,6 @@ class Profile:
     topology: str
     admin_root: Path
     private_mount: tuple[str, ...] = ()
-    shared_mount: tuple[str, ...] = ()
     unmount: tuple[str, ...] = ()
     cgroup: bool = False
 
@@ -40,7 +39,6 @@ class Profile:
 @dataclass(frozen=True)
 class Client:
     workspace: Path
-    shared: tuple[Path, ...]
     cgroup: Path | None = None
 
 
@@ -51,8 +49,8 @@ def parse_profile(text: str, target_name: str, source: str = "mounts.toml") -> P
     it on its own machine.
     """
     table = tomllib.loads(text)["profiles"][target_name]
-    unknown = table.keys() - {'topology', 'admin_root', 'private_mount', 'shared_mount',
-                            'unmount', 'cgroup'}
+    unknown = table.keys() - {'topology', 'admin_root', 'private_mount',
+                              'unmount', 'cgroup'}
     if unknown:
         raise ValueError(f'{source}: unknown profile keys {sorted(unknown)}')
     cgroup = table.get('cgroup', False)
@@ -65,19 +63,11 @@ def parse_profile(text: str, target_name: str, source: str = "mounts.toml") -> P
     if not admin_root.is_absolute():
         raise ValueError(f"{source}: admin_root must be an absolute path")
 
-    def command(key: str, required: bool) -> tuple[str, ...]:
-        if key not in table:
-            if required:
-                raise ValueError(f"{source}: profile is missing {key}")
-            return ()
-        return tuple(table[key])
-
     return Profile(
         topology=topology,
         admin_root=admin_root,
-        private_mount=command("private_mount", True),
-        shared_mount=command("shared_mount", topology == MULTI_MOUNT),
-        unmount=command("unmount", True),
+        private_mount=tuple(table['private_mount']),
+        unmount=tuple(table['unmount']),
         cgroup=cgroup,
     )
 
@@ -131,7 +121,6 @@ class Layout:
         profile: Profile,
         work_dir: Path,
         data_root: Path,
-        shared_paths: Sequence[Path],
         clients: int,
         *,
         log_dir: Path,
@@ -139,27 +128,17 @@ class Layout:
     ) -> None:
         if profile.topology not in _TOPOLOGIES:
             raise ValueError(f"unsupported topology: {profile.topology!r}")
-        shared = tuple(shared_paths)
-        if (
-            not work_dir.is_dir() or not data_root.is_dir()
-            or not all(path.is_dir() for path in shared)
-        ):
-            raise ValueError("work_dir, data_root and shared_paths must exist")
-        if profile.cgroup and shared:
-            raise ValueError('per-client cgroups require directories=1')
+        if not work_dir.is_dir() or not data_root.is_dir():
+            raise ValueError("work_dir and data_root must exist")
         admin = profile.admin_root.resolve()
         work = work_dir.resolve()
         if _inside(work, admin) or _inside(admin, work):
             raise ValueError("work_dir must be outside admin_root")
-        for label, path in [("data_root", data_root)] + [
-            (f"shared_paths[{index}]", path) for index, path in enumerate(shared)
-        ]:
-            if path.resolve() == admin or not _inside(path.resolve(), admin):
-                raise ValueError(f"{label} must be a directory under admin_root")
+        if data_root.resolve() == admin or not _inside(data_root.resolve(), admin):
+            raise ValueError("data_root must be a directory under admin_root")
 
         multi = profile.topology == MULTI_MOUNT
         self.profile, self.work_dir, self.data_root = profile, work_dir, data_root
-        self.shared_paths = shared
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.timeout_s = timeout_s
@@ -179,31 +158,27 @@ class Layout:
             admin_agent.mkdir()
             (admin_agent / "workspace").mkdir()
             local_root.mkdir()
-            shared_dirs = [local_root / f"shared-{number}"
-                           for number in range(1, len(shared) + 1)]
             if multi:
                 (local_root / "workspace").mkdir()
-                for path in shared_dirs:
-                    path.mkdir()
             mountpoint = local_root / 'workspace' if multi else local_root
             cgroup = None
             if profile.cgroup:
                 digest = hashlib.sha256(str(mountpoint.resolve()).encode()).hexdigest()
                 cgroup = CGROUP_ROOT / digest[:20]
-            client_values.append(Client(local_root / 'workspace', tuple(shared_dirs), cgroup))
-            self.mountpoints.extend([mountpoint, *shared_dirs] if multi else [mountpoint])
+            client_values.append(Client(local_root / 'workspace', cgroup))
+            self.mountpoints.append(mountpoint)
         self.clients = tuple(client_values)
         self._write_sentinels()
 
     def mount(self) -> dict[str, int | float]:
-        """Run every client's mount commands, then verify outside the timer.
+        """Run every client's mount command, then verify outside the timer.
 
         A successful unmount clears the prior mountinfo baseline, so the same Layout
         can remount after the read fixture has been prepared through its first mount.
         """
         self.begin_mount()
-        plans = [self._plan(index) for index in range(len(self.clients))]
-        wall, self.mount_agent_elapsed_s = self._time(plans, "mount")
+        commands = [self.mount_command(index) for index in range(len(self.clients))]
+        wall, self.mount_agent_elapsed_s = self._time(commands, "mount")
         counts = self.accept_mount()
         return {"mount_elapsed_s": wall, **counts}
 
@@ -211,15 +186,6 @@ class Layout:
         """Snapshot mountinfo before commands run elsewhere (e.g. inside MPI ranks)."""
         if self._mounted or self._before is not None:
             raise RuntimeError("begin_mount() requires no active or unverified mount attempt")
-        if self.profile.topology == SHARED_DIRECTORY:
-            targets = (
-                self.data_root / f"agent-{index:04d}" / f"shared-{number}"
-                for index in range(len(self.clients))
-                for number in range(1, len(self.shared_paths) + 1)
-            )
-            absent = next((p for p in targets if p.exists() or p.is_symlink()), None)
-            if absent is not None:
-                raise RuntimeError(f"shared-directory target must stay absent: {absent}")
         self._before = _mount_points()
         planned = {point.resolve() for point in self.mountpoints}
         roots = self._roots()
@@ -244,13 +210,8 @@ class Layout:
         return counts
 
     def mount_command(self, index: int) -> list[str]:
-        """The single real mount command of one K=1 client."""
-        commands = self._plan(index)
-        if len(commands) != 1:
-            raise RuntimeError(
-                f"agent {index:04d} mount commands: expected 1, measured {len(commands)}"
-            )
-        return commands[0]
+        """The single expanded private mount command of one client."""
+        return self._command(index, self.profile.private_mount)
 
     def _roots(self) -> list[Path]:
         return [(self.work_dir / f"agent-{i:04d}").resolve()
@@ -294,11 +255,12 @@ class Layout:
             raise RuntimeError(f'{path}: no mount client process in cgroup')
 
     def unmount(self) -> dict[str, int | float]:
-        """Run every client's unmount commands in reverse, then verify."""
+        """Run every client's unmount command, then verify."""
         if not self._mounted:
             raise RuntimeError("unmount() requires a successful mount")
-        plans = [self._plan(i, unmount=True) for i in range(len(self.clients))]
-        wall, self.unmount_agent_elapsed_s = self._time(plans, "unmount")
+        commands = [self._command(index, self.profile.unmount)
+                    for index in range(len(self.clients))]
+        wall, self.unmount_agent_elapsed_s = self._time(commands, "unmount")
         roots = self._roots()
         remaining = [point for point in _mount_points().values()
                      if any(_inside(point, root) for root in roots)]
@@ -314,63 +276,37 @@ class Layout:
         self._before = None
         return {"unmount_elapsed_s": wall, "remaining_mounts": 0}
 
-    def _commands(self, index: int) -> list[tuple[tuple[str, ...], dict[str, object]]]:
-        """Per-client commands; private first, then one per shared resource."""
+    def _context(self, index: int) -> dict[str, object]:
         admin = self.profile.admin_root
         multi = self.profile.topology == MULTI_MOUNT
         private = self.data_root / f"agent-{index:04d}"
         local = self.work_dir / f"agent-{index:04d}"
         source = private / "workspace" if multi else private
-        context: dict[str, object] = {
+        return {
             "source": _volume_path(source, admin),
             "mountpoint": str(local / "workspace" if multi else local),
             "subdir": _volume_path(source, admin),
-            "binds": ",".join(
-                f"{_volume_path(shared, admin)}:"
-                f"{_volume_path(private / f'shared-{number}', admin)}"
-                for number, shared in enumerate(self.shared_paths, start=1)
-            ),
             "agent": index,
         }
-        if not multi:
-            return [(self.profile.private_mount, context)]
-        return [(self.profile.private_mount, context)] + [
-            (self.profile.shared_mount, {
-                **context,
-                "source": _volume_path(shared, admin),
-                "mountpoint": str(local / f"shared-{number}"),
-            })
-            for number, shared in enumerate(self.shared_paths, start=1)
-        ]
 
-    def _plan(self, index: int, *, unmount: bool = False) -> list[list[str]]:
-        commands = self._commands(index)
-        if unmount:
-            return [
-                self._expand(self.profile.unmount, context)
-                for _, context in reversed(commands)
-            ]
-        return [self._expand(template, context) for template, context in commands]
-
-    @staticmethod
-    def _expand(template: Sequence[str], context: dict[str, object]) -> list[str]:
+    def _command(self, index: int, template: Sequence[str]) -> list[str]:
+        context = self._context(index)
         return [token.format_map(context) for token in template]
 
     def _time(
-        self, plans: Sequence[Sequence[list[str]]], action: str
+        self, commands: Sequence[list[str]], action: str
     ) -> tuple[float, tuple[float, ...]]:
-        def run_client(index: int, commands: Sequence[list[str]]) -> float:
+        def run_client(index: int, argv: list[str]) -> float:
             started = time.perf_counter()
-            for step, argv in enumerate(commands):
-                log_path = self.log_dir / f'{action}-agent-{index:04d}-{step:02d}'
-                _run(argv, log_path, self.timeout_s)
+            log_path = self.log_dir / f'{action}-agent-{index:04d}'
+            _run(argv, log_path, self.timeout_s)
             return time.perf_counter() - started
 
         started = time.perf_counter()
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(plans)) as pool:
-                futures = [pool.submit(run_client, index, plan)
-                           for index, plan in enumerate(plans)]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(commands)) as pool:
+                futures = [pool.submit(run_client, index, argv)
+                           for index, argv in enumerate(commands)]
                 elapsed = tuple(future.result() for future in futures)
         except RuntimeError as exc:
             raise RuntimeError(
@@ -384,23 +320,15 @@ class Layout:
         for index in range(len(self.clients)):
             path = self.data_root / f"agent-{index:04d}" / "workspace" / name
             path.write_text(f"private-{index}", encoding="utf-8")
-        for index, path in enumerate(self.shared_paths):
-            (path / name).write_text(f"shared-{index}", encoding="utf-8")
 
     def _check_aliases(self) -> None:
         name = f".mount-scale-{self._sentinel}"
         for index, client in enumerate(self.clients):
-            expected = [("workspace", client.workspace, f"private-{index}")]
-            expected += [(f"shared-{n}", path, f"shared-{n - 1}")
-                         for n, path in enumerate(client.shared, start=1)]
-            for label, path, content in expected:
-                try:
-                    actual = (path / name).read_text(encoding="utf-8")
-                except OSError as exc:
-                    raise RuntimeError(
-                        f"agent {index:04d} {label} alias check failed: {exc}"
-                    ) from exc
-                if actual != content:
-                    raise RuntimeError(
-                        f"agent {index:04d} {label} aliases the wrong data"
-                    )
+            try:
+                actual = (client.workspace / name).read_text(encoding="utf-8")
+            except OSError as exc:
+                raise RuntimeError(
+                    f"agent {index:04d} workspace alias check failed: {exc}"
+                ) from exc
+            if actual != f"private-{index}":
+                raise RuntimeError(f"agent {index:04d} workspace aliases the wrong data")

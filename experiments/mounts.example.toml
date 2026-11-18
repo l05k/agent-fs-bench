@@ -5,21 +5,20 @@
 # admin_root is a pre-mounted full-volume view at the same path on every host,
 # pointing to the same volume. Admin mounts stay mounted and are excluded from
 # measured per-agent mount entries, but may still count toward provider quotas.
-# {source}/{subdir}/{binds} use volume-absolute paths, relative to admin_root.
+# {source}/{subdir} use volume-absolute paths, relative to admin_root.
 #
-# Round 03 uses directories = 1: one real backend mount and private workspace
-# per active agent or idle client. K>1 is for archived experiments only.
-# The site's wrapper establishes each client's actual session. For Experiments
-# 6/8, cap and verify one Apsara metadata connection per mount, with no sleeps
-# in the timed command. This example does not set a provider connection limit.
-# For the archived resource ablation, cgroup = true uses the site-owned wrapper
-# contract in docs/bench-mount-scale.md. Leave it unset for the scale matrix.
+# Round 03 uses one real backend mount and private workspace per active agent or
+# idle client. The site's wrapper establishes each client's actual session. For
+# Experiments 6/8, cap and verify one Apsara metadata connection per mount, with
+# no sleeps in the timed command. This example does not set a provider connection
+# limit. cgroup = true uses the site-owned wrapper contract in
+# docs/bench-mount-scale.md; --workload mount rejects it, and only mdtest-* runs
+# record mount_cgroup. Leave it unset for the scale matrix.
 
 [profiles.nfs]
 topology = "multi-mount"
 admin_root = "/mnt/nfs-admin"
 private_mount = ["mount", "-t", "nfs", "-o", "rw,vers=4", "server:/export{source}", "{mountpoint}"]
-shared_mount = ["mount", "-t", "nfs", "-o", "ro,vers=4", "server:/export{source}", "{mountpoint}"]
 unmount = ["umount", "{mountpoint}"]
 # A few Linux NFS mounts of one server/export may share one superblock, cache and
 # connection set. One mount entry is not one independent NFS TCP client. This profile
@@ -34,28 +33,11 @@ admin_root = "/mnt/cephfs-admin"
 # caches. Use the same options for the pre-mounted admin view.
 private_mount = ["mount", "-t", "ceph", "CLIENT@.FS_NAME={source}", "{mountpoint}", "-o",
                  "rw,relatime,ms_mode=secure,acl,noshare,mon_addr=MONITORS,secretfile=/etc/ceph/CLIENT.secret"]
-shared_mount = ["mount", "-t", "ceph", "CLIENT@.FS_NAME={source}", "{mountpoint}", "-o",
-                "ro,relatime,ms_mode=secure,acl,noshare,mon_addr=MONITORS,secretfile=/etc/ceph/CLIENT.secret"]
 unmount = ["umount", "{mountpoint}"]
 
-# Canonical K=1 LakeBase profile: one subdir mount per agent, no shared bind.
+# Canonical LakeBase profile: one private subdir mount per agent.
 [profiles.lakebase]
 topology = "shared-directory"
 admin_root = "/mnt/lakebase-admin"
 private_mount = ["lakebase-client", "mount", "META_URL", "{mountpoint}", "--subdir", "{subdir}"]
-unmount = ["lakebase-client", "umount", "{mountpoint}"]
-
-# K>1 shared-scope ablation only: selected by directories > 1 and a matching target.
-[profiles.lakebase-shared]
-topology = "shared-directory"
-admin_root = "/mnt/lakebase-admin"
-private_mount = ["lakebase-client", "mount", "META_URL", "{mountpoint}", "--subdir", "{subdir}", "--bind", "{binds}"]
-unmount = ["lakebase-client", "umount", "{mountpoint}"]
-
-# K>1 mechanism ablation: same LakeBase backend with K real mounts per agent.
-[profiles.lakebase-multi]
-topology = "multi-mount"
-admin_root = "/mnt/lakebase-admin"
-private_mount = ["lakebase-client", "mount", "META_URL", "{mountpoint}", "--subdir", "{subdir}"]
-shared_mount = ["lakebase-client", "mount", "META_URL", "{mountpoint}", "--subdir", "{source}"]
 unmount = ["lakebase-client", "umount", "{mountpoint}"]

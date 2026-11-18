@@ -86,7 +86,7 @@ PY
 
 ```sh
 uv run python -m agent_fs_bench run mount-scale --mode remote --target apsara-fast -- \
-  --workload mdtest-io --tasks 768 --repeats 3 --startup-timeout-s 180 \
+  --workload mdtest-io --tasks 384 --repeats 3 --startup-timeout-s 180 \
   --job-timeout-s 3600 --fixture-timeout-s 7200
 uv run python -m agent_fs_bench run mount-scale --mode remote --target apsara-1conn -- \
   --workload mount --tasks 320 --repeats 5

@@ -1,10 +1,8 @@
 """Persistent per-machine lifecycle workers for mount-scale.
 
-File-operation timing belongs to separate global MPI jobs: synchronized POSIX
-read/create-write for the canonical K=1 path, and mdtest only for the explicit K>1
-shared-scope ablation. Each machine keeps one worker in its own checkout (started over
-SSH for remote machines) that holds Layout/Sampler state across those jobs. The worker
-also prepares each read fixture through the first mount, outside measured I/O timing.
+File-operation timing belongs to separate global MPI jobs: POSIX read/create-write
+or native mdtest. Each machine keeps one local/SSH worker holding Layout/Sampler
+state across those jobs. The worker prepares POSIX read fixtures outside I/O timing.
 Protocol: the controller writes the job, then one JSON request per line; the worker
 answers each with one JSON result line. A failing worker exits with its traceback in
 `worker.stderr.txt`; mounts and data stay for inspection.
@@ -92,7 +90,8 @@ class Worker:
 
     def call(self, action: str, **data) -> dict:
         self._send({'action': action, **data})
-        if action in ('mount', 'unmount'):
+        if action in ('mount', 'unmount', 'mount-idle', 'unmount-idle',
+                      'mount-plan', 'verify-mount'):
             timeout_s = self.job['lifecycle_timeout_s']
         elif action in ('prepare-read', 'cleanup', 'remove-repeat', 'remove-data'):
             timeout_s = self.job['fixture_timeout_s']
@@ -198,7 +197,7 @@ class Lifecycle:
         private.mkdir()
         local.mkdir(parents=True)
         self.idle_layout = Layout(
-            self.profile, local, private, (), clients,
+            self.profile, local, private, clients,
             log_dir=local / 'lifecycle',
             timeout_s=self.job['command_timeout_s'],
         )
@@ -272,11 +271,9 @@ class Lifecycle:
         return {}
 
     def init_data(self, request: dict) -> dict:
-        """Create the run's data root, owner sentinel and shared resources (first machine)."""
+        """Create the run's data root and owner sentinel on the first machine."""
         self.data_root.mkdir(parents=True)
         (self.data_root / '.owner').write_text(self.job['token'])
-        for number in range(1, self.job['directories']):
-            (self.data_root / f'shared-{number}').mkdir()
         return {}
 
     def setup(self, request: dict) -> dict:
@@ -291,29 +288,26 @@ class Lifecycle:
         private.mkdir()
         local = Path(self.job['work_dir']) / name / self.job['name']
         local.mkdir(parents=True)
-        shared = tuple(self.data_root / f'shared-{i}'
-                       for i in range(1, self.job['directories']))
         self.private, self.local = private, local
         if self.profile is None:
             values = []
             for index in range(clients):
                 workspace = private / f'agent-{index:04d}' / 'workspace'
                 workspace.mkdir(parents=True)
-                values.append(Client(workspace, shared))
+                values.append(Client(workspace))
             self.layout = None
             aliases = tuple(values)
         else:
             log_dir = (self.logs / name / 'lifecycle'
                        if self.job['workload'] == 'io'
                        else local / 'lifecycle')
-            self.layout = Layout(self.profile, local, private, shared, clients,
+            self.layout = Layout(self.profile, local, private, clients,
                                  log_dir=log_dir,
                                  timeout_s=self.job['command_timeout_s'])
             aliases = self.layout.clients
         self.clients = tuple(aliases)
         baseline = idle(self.job['idle_sample_s'])
         return {'clients': [{'workspace': str(client.workspace),
-                             'shared': [str(p) for p in client.shared],
                              'cgroup': str(client.cgroup) if client.cgroup is not None else None}
                             for client in aliases],
                 'baseline': baseline}

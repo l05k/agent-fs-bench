@@ -18,7 +18,7 @@ real mounts on the same host without adding ranks; they remain mounted across th
 point's active repeats. The active file batches use **1,000 files per rank**;
 `mdtest-io` uses **4 KiB per file**, and `mdtest-create` uses empty files.
 
-The archived `--workload io` protocol prepares separate read and write data sets.
+The default `--workload io` protocol prepares separate read and write data sets.
 Its `read/` contains precreated files and its `write/` starts empty. The run
 snapshot records the file count and size; hold both fixed across a comparison.
 Files contain seeded pseudorandom data, distinct across clients and files in
@@ -32,17 +32,14 @@ rank placement. The main three-host curve uses all three hosts at its planned
 N > 1 points. N=1 uses only the first host and is a single-host reference.
 N above the CPU count oversubscribes the hosts; keep different host budgets separate.
 
-The archived K>1 `io` experiment uses mdtest for private and shared-scope phases.
-It is not in the active matrix, and its rows must not be pooled with private I/O.
-
 ## Dependencies and network
 
 Every participating machine needs:
 - Linux and Python 3.12+;
 - this repository's checkout with `uv sync --locked`, at the same path by default;
 - the same Open MPI 4.1.x version and architecture;
-- GNU coreutils `sync -f` (`syncfs`) for archived `--workload io` at K=1.
-- For `mdtest-create`, `mdtest-io`, or the archived K>1 path: the same upstream
+- GNU coreutils `sync -f` (`syncfs`) for `--workload io`.
+- For `mdtest-create` or `mdtest-io`: the same upstream
   IOR 4.0.0 `mdtest`, linked against that Open MPI. `mount` needs no mdtest binary.
 
 Open MPI requires:
@@ -77,10 +74,9 @@ Pass `--workload`, `--idle-mounts`, `--tasks`, `--repeats`, `--startup-timeout-s
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `tasks` | `64` | Active mounts, one rank per client |
-| `workload` | `io` | `mdtest-io`, `mdtest-create`, `mount`, or archived `io`; select explicitly for the paper |
+| `workload` | `io` | Default POSIX read/create-write; `mdtest-io`, `mdtest-create`, and `mount` are selected explicitly |
 | `idle_mounts` | `0` | Extra mounts, no ranks; one participating host, `mount` or `mdtest-create` only |
 | `profiles` | `local/mounts.toml` | Target mount profile, read on the controller |
-| `directories` | `1` | Keep at 1 for all active experiments; K>1 selects the archived shared-scope path |
 | `files` | `1000` | Files per active client in an I/O batch |
 | `file_size_bytes` | `4096` | Bytes per `mdtest-io` / POSIX I/O file; `mdtest-create` always uses 0 B |
 | `repeats` | `3` | Complete repetitions at the same N |
@@ -114,7 +110,7 @@ admin mounts are provisioned by the experiment environment.
 of the same volume**. Prepared data lives under
 `<admin_root>/agent-fs-bench/mount-scale/<run-id>/`:
 - The first participating machine's worker creates it, with this run's random owner
-  sentinel and any K>1 shared resources.
+  sentinel.
 - Every worker reads the sentinel before setup and rejects a disconnected admin namespace.
 - Per-repeat private data is separated by logical machine name; agent numbering starts at
   0 on each machine.
@@ -127,10 +123,9 @@ placeholders:
 | `{source}` | Volume-internal path starting with `/`, relative to the admin volume root |
 | `{mountpoint}` | Actual mountpoint on the current machine |
 | `{subdir}` | Private volume-internal path; workspace for multi-mount, agent root for shared-directory |
-| `{binds}` | Comma-separated volume-absolute `<shared source>:<agent shared-N>` mappings; K>1 ablation only |
 | `{agent}` | Client number on the current machine, starting at 0 |
 
-For K=1 each client must issue exactly one independent real backend mount. The CephFS
+Each client must issue exactly one independent real backend mount. The CephFS
 example uses the kernel client's `noshare` option, which creates a new client instance per
 mount instead of sharing one instance and its caches among mounts of the same cluster.
 Configure the actual Ceph monitors, filesystem name, client name and secret file; no
@@ -144,25 +139,29 @@ ensure each mount creates a real filesystem client; one mount plus a Linux bind 
 stand in for multiple clients.
 
 Mount commands must return after the mount is established and unmount commands after it is
-released. With K=1 the LakeBase profile must omit the empty `--bind` argument; the K>1
-variant in the example file adds it. The canonical read fixture travels through the first
-mount, so the read phase starts after an unmount/remount boundary.
+released. The LakeBase profile must omit the empty `--bind` argument. The canonical read
+fixture travels through the first mount, so the read phase starts after an
+unmount/remount boundary.
 
-For the archived K=1 FUSE resource ablation, set `cgroup = true` only in each
-filesystem's limited profile. Omit it in the unlimited control, whose wrapper
-must not impose the per-client limit. Use site-owned mount/unmount wrappers.
-Before starting the FUSE daemon in the limited arm, the mount wrapper must put
-it in `/sys/fs/cgroup/agent-fs-bench/<sha256(resolved mountpoint)[:20]>`
-with `cpu.max = 100000 100000` and `memory.max = 2147483648`. The site enables CPU
-and memory controllers at that root; the unmount wrapper removes the leaf after the
-daemon has exited. The harness checks both limits and a nonempty process list on each
-mount, moves the measured rank into the same leaf before MPI initialization, and
-rejects leftover leaves after unmount. Fixture preparation is outside that rank's
-budget. Do not apply this profile to a kernel filesystem client.
+For the FUSE resource ablation, set `cgroup = true` only in each filesystem's
+limited profile. Omit it in the unlimited control, whose wrapper must not impose
+the per-client limit. Use site-owned mount/unmount wrappers. Before starting the
+FUSE daemon in the limited arm, the mount wrapper must put it in
+`/sys/fs/cgroup/agent-fs-bench/<sha256(resolved mountpoint)[:20]>` with
+`cpu.max = 100000 100000` and `memory.max = 2147483648`. The site enables CPU and
+memory controllers at that root; the unmount wrapper removes the leaf after the
+daemon has exited. The harness checks both limits and a nonempty process list on
+each mount, moves the measured `io` or mdtest rank into the same leaf before MPI
+initialization, and rejects leftover leaves after unmount. Fixture preparation is
+outside that rank's budget. Only `mdtest-create` and `mdtest-io` record
+`mount_cgroup` in `targets[].info`; `io` joins the same leaf without that record.
+`--workload mount` rejects a cgroup profile: its ranks do not join the leaf, so it
+cannot claim a budgeted mount rank. Do not apply this profile to a kernel
+filesystem client.
 
 ```sh
 uv run python -m agent_fs_bench run mount-scale --mode remote --target cephfs -- \
-  --workload mdtest-io --tasks 768 --repeats 3
+  --workload mdtest-io --tasks 384 --repeats 3
 uv run python -m agent_fs_bench run mount-scale --mode local --target apsara-1conn -- \
   --workload mount --tasks 1 --idle-mounts 64 --repeats 100
 uv run python -m agent_fs_bench run mount-scale --mode local --target apsara-1conn -- \
@@ -200,7 +199,7 @@ active repeat and releases it at the end. Idle clients contribute no active
 mount samples or file operations. Use a complete `idle_unmounts` record and
 the actual verified idle count before accepting density results.
 
-### Archived POSIX I/O (`--workload io`)
+### POSIX I/O (`--workload io`)
 
 The following sequence applies to the Round 02 POSIX path, not native mdtest.
 
@@ -210,7 +209,7 @@ The following sequence applies to the Round 02 POSIX path, not native mdtest.
 2. The first machine's worker creates the run's data root and owner sentinel. In each
    repeat, every machine creates its own private workspace and mountpoints and samples
    baseline; this preparation is outside I/O timing.
-3. For K=1, mount the clients once, create the `read/` fixture through that first mount
+3. Mount the clients once, create the `read/` fixture through that first mount
    with exactly 1,000 full 4 KiB files, and call target-scoped `sync -f -- <read dir>` on
    every client. Create the separate empty `write/` target. Then unmount and mount again.
    The fixture preparation and both setup lifecycle steps are outside measured I/O time.
@@ -249,11 +248,6 @@ provider caches; report the mount type and options, and do not generalize beyond
 observed setup. Create-write latency is not a per-file durability latency: durability is
 the final batch syncfs.
 
-The K>1 ablation retains its earlier sequence: mount, mounted-idle, warm shared resources,
-the global private mdtest create/stat/read/remove job, then per-resource shared jobs. Its
-mount, fixture and mdtest timing boundaries are unchanged and its rows remain separate
-from the canonical phases.
-
 ## Results and interpretation
 
 Each run writes `results/mount-scale/<run-id>/config.json` (run configuration, mode,
@@ -275,8 +269,7 @@ Figures come only from `plot`.
 | `idle_mounts` / `idle_unmounts` | target, topology, tasks, idle_clients, host | Lifecycle elapsed time and measured/residual mount counts for the idle cohort |
 
 Native phase values are `file-create` or `create-write` and `read` according to
-the workload. Archived K>1 phase names start with `private/` or `shared-<n>/`.
-`mount` emits no I/O or resource workload rows. Keep results separated by
+the workload. `mount` emits no I/O or resource workload rows. Keep results separated by
 `config.workload`, `config.idle_mounts` and the mount profile.
 
 Column values:
@@ -325,7 +318,9 @@ all other measurement settings, the mode and the source fingerprint fixed.
 Resources come from **whole-machine counters on each machine**: CPU busy, MemTotal−
 MemAvailable, cache, dirty, slab and mount entries. They include Python, MPI, daemons, the
 kernel and other processes; there is no filesystem CPU/RSS attribution. Sampling windows
-include MPI startup/shutdown and phase gaps. Mount entries belong to the worker's current
+include MPI startup/shutdown and phase gaps. For native mdtest runs the sampling window
+also covers the job's untimed `-r` delete phase, so `resource_workload` peaks are not a
+create-only or read-only attribution. Mount entries belong to the worker's current
 namespace, so a daemon must create mounts in that namespace.
 
 ## Paper claim boundaries
@@ -338,7 +333,7 @@ namespace, so a daemon must create mounts in that namespace.
   the actual mount type/options and admin-view sharing. CephFS `noshare` is the example
   that creates a separate client instance per mount.
 - State the protocol: the native read phase follows creation, and its write uses
-  per-file `fsync`. The archived POSIX path remounts before a separate read and
+  per-file `fsync`. The POSIX `io` path remounts before a separate read and
   uses batch-end `syncfs` for writes. Neither establishes cold provider caches.
 - For mount p50/p99 use the active `agents.csv` command durations. For density
   create p50/p99 use the active `ranks.csv` create-batch durations. Give both the
@@ -347,18 +342,20 @@ namespace, so a daemon must create mounts in that namespace.
 - These workloads do not establish end-to-end agent latency, crash durability,
   or isolation correctness.
 
-## Validation performed
+## Previous smoke observations
 
-The K=1 directory smoke on Linux with Open MPI 4.1.8 started both ranks and verified
-64 complete files in each of the read and create-write batches. It checks local MPI
-startup, I/O and cleanup, not real backend mounts, cgroups, multi-host placement or
+These are previous smoke observations, not tests of this revision. The directory
+smoke on Linux with Open MPI 4.1.8 started both ranks and verified 64 complete
+files in each of the read and create-write batches. It checks local MPI startup,
+I/O and cleanup, not real backend mounts, cgroups, multi-host placement or
 storage performance.
 
 Round 03 also exercised `mount`, `mdtest-create`, and `mdtest-io` with real
 Linux bind mounts in a private namespace, Open MPI 4.1.6, and IOR 4.0.0.
-Two active ranks ran with three extra idle mounts for the density paths; both
-native data phases completed 64 files each. All mounts and data were released.
-This validates the lifecycle and result counts, not independent FUSE/NFS
+`mdtest-io` used two active ranks and completed 64 files per phase. `mount` and
+`mdtest-create` each used one active rank and three idle mounts. All mounts and
+data were released. These
+observations validate the lifecycle and result counts, not independent FUSE/NFS
 clients, remote placement, one-to-one backend connections, or performance.
 
 ## References

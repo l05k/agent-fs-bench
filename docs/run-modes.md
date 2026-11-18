@@ -10,9 +10,9 @@ run may use:
 | `remote` | `local/hosts.toml` in file order | launches `mpiexec`, runs no task |
 
 ```sh
-uv run python -m agent_fs_bench run mdtest --mode local --dirs /mnt/fs-a -- --smoke
-uv run python -m agent_fs_bench run mdtest --mode overflow --dirs /mnt/fs-a
-uv run python -m agent_fs_bench run mdtest --mode remote --dirs /mnt/fs-a
+uv run python -m agent_fs_bench run mdtest-peak --mode local --dirs /mnt/fs-a -- --smoke
+uv run python -m agent_fs_bench run mdtest-peak --mode overflow --dirs /mnt/fs-a
+uv run python -m agent_fs_bench run mdtest-peak --mode remote --dirs /mnt/fs-a
 ```
 
 Each workload's `CONFIG['tasks']` is the external concurrency of one run: the number of
@@ -142,8 +142,8 @@ value:
 
 `targets[].info.placement` records the task count per machine.
 
-- **Python workloads** (clone, npm-install, kvtest, sqlite-speedtest, dev-workflow,
-  mini-dev-workflow, agent-replay) run one MPI job per target, and every task runs
+- **Python workloads** (clone, npm-install, kvtest, dev-workflow, agent-replay)
+  run one MPI job per target, and every task runs
   `python -m agent_fs_bench.cluster task`, which calls the workload's `task(t)`.
   - Task 0 receives the `JobSpec` on stdin and streams result messages to the
     controller on stdout; the protocol table is in the `cluster.py` docstring.
@@ -151,13 +151,12 @@ value:
     which gives the batch wall time.
   - Clocks of different machines are never compared; per-task durations are measured
     by each task on its own machine.
-- **Native workload jobs:** mdtest and mdtest-peak launch upstream mdtest directly.
+- **Native workload jobs:** mdtest-peak launches upstream mdtest directly.
   `mount-scale --workload mdtest-io` and `mdtest-create` use native mdtest on one
   verified mount per active MPI rank. `--workload mount` instead starts one
   wrapper command per rank behind a start barrier and measures no file I/O.
   The per-machine lifecycle worker verifies mounts and manages setup and
   cleanup outside phase timing. Optional single-host idle mounts never run ranks.
-  Archived `io` runs use the older POSIX batches or K>1 shared mdtest path.
 
 ## Directories and data
 
@@ -173,7 +172,7 @@ value:
   - The experimenter guarantees what the target path is on each machine: one shared
     filesystem, or separate local disks.
   - Experiments that need one directory seen by every task need a shared target:
-    mdtest's `shared` layout and mount-scale's `admin_root`.
+    mount-scale's `admin_root`.
 
 Unexpected errors stop the run. A failing task aborts the whole MPI job; see
 the launcher stderr. Classified replay divergence, error and timeout are raw

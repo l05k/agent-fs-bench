@@ -1,13 +1,8 @@
 """Native mdtest phases for mount-scale, using the original IOR 4.0.0 binary.
 
-Besides the K>1 shared-scope ablation, this module builds the K=1 zero-byte create job
-and the native create-then-read job with per-file fsync (`-y`) used by the new
-workloads. Both keep mdtest's own phase times and rank CSV; removal runs outside the
-reported create/read phases.
-
-The canonical K=1 mount-scale path uses synchronized POSIX read/create-write jobs and
-does not execute mdtest. This module remains for the explicitly selected K>1
-shared read-only layout comparison; each job is launched with its configured timeout.
+This module builds one private zero-byte create job or a create-then-read job
+with per-file fsync (`-y`). Both keep mdtest's phase times and rank CSV;
+removal runs outside the reported create/read phases.
 
 | Symbol | Definition |
 | --- | --- |
@@ -18,8 +13,8 @@ shared read-only layout comparison; each job is launched with its configured tim
 
 Every phase is one global Open MPI 4.1 MPMD job (no CPU binding). Rank r's ``-d`` is
 client r's own alias, created by its machine's lifecycle worker, so every access goes
-through that client's mount. mdtest runs unchanged: one ``MPI_COMM_WORLD``, one ``-d``
-per task (mdtest rejects several paths with ``-S``), its own barriers and rank CSV.
+through that client's mount. mdtest runs unchanged: one ``MPI_COMM_WORLD``, one
+``-d`` per task, its own barriers and rank CSV.
 Private phases need ``test-dir.0-0`` in each workspace, which mdtest creates only for
 low ranks, so the controller creates it first. Timing comes only from mdtest's CSV;
 command wall time is never a metric and rates are never summed per machine.
@@ -44,8 +39,6 @@ _PHASES = (
     'Directory removal', 'File creation', 'File stat', 'File read',
     'File removal', 'Tree creation', 'Tree removal',
 )
-FILE_PHASES = ('File creation', 'File stat', 'File read', 'File removal')
-SHARED_PHASES = ('File stat', 'File read')
 _HEADER = ['rank', 'items'] + [f'{kind}-{name}' for name in _PHASES
                                for kind in ('rate', 'time')]
 # Phase time column; rank rows share the layout up to the tree phases.
@@ -63,7 +56,6 @@ class Rank:
 
     node: cluster.Node
     workspace: Path  # Private test directory parent; exists on that machine only.
-    shared: tuple[Path, ...]
     cgroup: Path | None = None
 
 
@@ -80,19 +72,6 @@ class Phase:
     operations: int
     elapsed_s: float
     rank_elapsed_s: list[float]
-
-
-def _options(files: int, size: int) -> tuple[str, ...]:
-    return ('-F', '-n', str(files), '-w', str(size), '-e', str(size), '-i', '1',
-            '--warningAsErrors')
-
-
-def shared_job(path: Path, files: int, size: int) -> tuple[str, ...]:
-    return ('-S', '-T', '-E', '-d', str(path), *_options(files, size))
-
-
-def private_job(path: Path, files: int, size: int) -> tuple[str, ...]:
-    return ('-F', '-u', '-C', '-T', '-E', '-r', '-d', str(path), *_options(files, size))
 
 
 def zero_create_job(path: Path, files: int) -> tuple[str, ...]:
@@ -139,26 +118,18 @@ def read_timings(label: str, text: str, phases: Sequence[str], tasks: int) -> Ti
                        for row in ranks] for name in phases})
 
 
-def phases_of(prefix: str, labels: Sequence[str], names: Sequence[str], timings: Timings,
-              operations: int) -> list[Phase]:
-    return [Phase(f'{prefix}/{label}', operations, timings.phase_s[name], timings.rank_s[name])
-            for label, name in zip(labels, names)]
-
-
 # Jobs ----------------------------------------------------------------------------------------
 
 def run_job(launcher: cluster.Launcher, binary: str, tag: str, label: str, ranks: Sequence[Rank],
             groups: Sequence[Sequence[str]], phases: Sequence[str], log_dir: Path,
-            files: int, timeout_s: float, startup_timeout_s: float,
-            private: bool = False, strict: bool = False) -> Timings:
+            files: int, timeout_s: float, startup_timeout_s: float) -> Timings:
     """Run one global MPMD job and return its validated timings."""
     capture = Path('/tmp') / f'agent-fs-bench-{tag}-{label}.csv'
     placement = tuple(rank.node for rank in ranks)
-    if private:
-        directories: dict[cluster.Node, list[Path]] = {}
-        for rank in ranks:
-            directories.setdefault(rank.node, []).append(rank.workspace / _TEST_DIR)
-        cluster.make_directories(launcher, directories)
+    directories: dict[cluster.Node, list[Path]] = {}
+    for rank in ranks:
+        directories.setdefault(rank.node, []).append(rank.workspace / _TEST_DIR)
+    cluster.make_directories(launcher, directories)
     programs = []
     for rank, group in zip(ranks, groups, strict=True):
         arguments = [binary, *group, '--saveRankPerformanceDetails', str(capture)]
@@ -173,13 +144,9 @@ def run_job(launcher: cluster.Launcher, binary: str, tag: str, label: str, ranks
                               timeout_s=timeout_s, startup_timeout_s=startup_timeout_s)
     cluster.validate_exit(run)
     check_banner(label, run.stdout, len(ranks))
-    if strict:
-        warnings = [line.strip() for line in run.stdout.splitlines()
-                    if line.startswith('WARNING:')]
-        assert not warnings, f'{label} mdtest warnings: expected none, measured {warnings}'
-        counts = re.findall(r'^(\d+) tasks, (\d+) files$', run.stdout, re.MULTILINE)
-        expected = [(str(len(ranks)), str(len(ranks) * files))]
-        assert counts == expected, f'{label} workload: expected {expected}, measured {counts}'
+    counts = re.findall(r'^(\d+) tasks, (\d+) files$', run.stdout, re.MULTILINE)
+    expected = [(str(len(ranks)), str(len(ranks) * files))]
+    assert counts == expected, f'{label} workload: expected {expected}, measured {counts}'
     timings = read_timings(label, cluster.fetch_file(placement[0], launcher, capture),
                            phases, len(ranks))
     assert timings.items == files, f'{label} items per task: expected {files}, ' \
@@ -198,54 +165,21 @@ class Mdtest:
     startup_timeout_s: float
 
     def job(self, label: str, ranks: Sequence[Rank], groups: Sequence[Sequence[str]],
-            phases: Sequence[str], log_dir: Path, files: int, private: bool = False,
-            strict: bool = False) -> Timings:
+            phases: Sequence[str], log_dir: Path, files: int) -> Timings:
         return run_job(self.launcher, self.binary, self.tag, label, ranks, groups, phases,
-                       log_dir, files, self.timeout_s, self.startup_timeout_s, private,
-                       strict)
-
-    def prepare(self, node: cluster.Node, shared_paths: Sequence[Path], files: int, size: int,
-                log_dir: Path) -> None:
-        """Create each shared fixture once with one task on `node`, before measurement."""
-        for index, path in enumerate(shared_paths, 1):
-            self.job(f'prepare-{index}', [Rank(node, path, ())],
-                     [('-S', '-C', '-d', str(path), *_options(files, size))],
-                     ('File creation',), log_dir, files)
+                       log_dir, files, self.timeout_s, self.startup_timeout_s)
 
     def create_timings(self, ranks: Sequence[Rank], files: int, log_dir: Path) -> Timings:
         """Native zero-byte file creation; removal follows in the same job, unmeasured."""
         return self.job('private-create', ranks,
                         [zero_create_job(rank.workspace, files) for rank in ranks],
-                        ('File creation',), log_dir, files, private=True,
-                        strict=True)
+                        ('File creation',), log_dir, files)
 
     def native_io_timings(self, ranks: Sequence[Rank], files: int, size: int,
                           log_dir: Path) -> Timings:
         """Native create then read, with per-file fsync in the create phase."""
         return self.job('private-io', ranks,
                         [native_io_job(rank.workspace, files, size) for rank in ranks],
-                        ('File creation', 'File read'), log_dir, files, private=True,
-                        strict=True)
+                        ('File creation', 'File read'), log_dir, files)
 
-    def warm(self, ranks: Sequence[Rank], files: int, size: int, log_dir: Path) -> None:
-        """Warm-up: stat and read every client alias once; the timings are discarded."""
-        for resource in range(len(ranks[0].shared)):
-            self.job(f'warm-shared-{resource + 1}', ranks,
-                     [shared_job(rank.shared[resource], files, size) for rank in ranks],
-                     SHARED_PHASES, log_dir, files)
 
-    def measure(self, ranks: Sequence[Rank], files: int, size: int, log_dir: Path) -> list[Phase]:
-        """Sampling: the private job, then one job per shared resource."""
-        operations = len(ranks) * files
-        timings = self.job('private', ranks,
-                           [private_job(rank.workspace, files, size) for rank in ranks],
-                           FILE_PHASES, log_dir, files, private=True)
-        phases = phases_of('private', ('create', 'stat', 'read', 'remove'), FILE_PHASES,
-                           timings, operations)
-        for resource in range(len(ranks[0].shared)):
-            label = f'shared-{resource + 1}'
-            timings = self.job(label, ranks,
-                               [shared_job(rank.shared[resource], files, size) for rank in ranks],
-                               SHARED_PHASES, log_dir, files)
-            phases += phases_of(label, ('stat', 'read'), SHARED_PHASES, timings, operations)
-        return phases

@@ -55,9 +55,9 @@ Targets run sequentially. Each machine works in
 ## Run modes
 
 ```sh
-uv run python -m agent_fs_bench run mdtest --mode local --dirs /mnt/fs-a     # this machine (default)
-uv run python -m agent_fs_bench run mdtest --mode overflow --dirs /mnt/fs-a  # this machine, then local/hosts.toml
-uv run python -m agent_fs_bench run mdtest --mode remote --dirs /mnt/fs-a    # local/hosts.toml only
+uv run python -m agent_fs_bench run mdtest-peak --mode local --dirs /mnt/fs-a     # this machine (default)
+uv run python -m agent_fs_bench run mdtest-peak --mode overflow --dirs /mnt/fs-a  # this machine, then local/hosts.toml
+uv run python -m agent_fs_bench run mdtest-peak --mode remote --dirs /mnt/fs-a    # local/hosts.toml only
 ```
 
 Each workload's `CONFIG['tasks']` is the external concurrency of one run (N
@@ -69,9 +69,10 @@ checkout. Setup, placement and launcher settings: [run modes](docs/run-modes.md)
 
 The controller records the launcher, node facts and planned targets before
 running any workload. It appends validated raw observations and marks a target
-complete only after the workload returns. Mount-scale runs native mdtest or
-measures mount commands under the same real mount lifecycle. The per-workload
-docs define each timing boundary.
+complete only after the workload returns. Mount-scale defaults to synchronized
+POSIX `io` batches; `mdtest-create`, `mdtest-io` and `mount` are selected
+explicitly, and `--directory-smoke` never mounts. The per-workload docs define
+each timing boundary.
 
 ## Workloads
 
@@ -85,7 +86,7 @@ measurements; those workloads are not part of the active matrix.
 | `npm-install` | N concurrent offline npm or pnpm installs into cold `node_modules` | [npm install](docs/bench-npm-install.md) |
 | `clone` | Durable directory copies and native LakeBase Clone OpenAPI latency | [clone](docs/bench-clone.md) |
 | `kvtest` | SQLite small-BLOB reads and checked synchronous overwrites | [kvtest](docs/bench-kvtest-openclaw.md) |
-| `mount-scale` | One real mount per agent: native mdtest scaling, mount-command latency, and single-node density | [mount scale](docs/bench-mount-scale.md) |
+| `mount-scale` | One real mount per agent; synchronized POSIX `io` batches by default, or explicit native mdtest and mount-command latency workloads | [mount scale](docs/bench-mount-scale.md) |
 | `mdtest-peak` | Native file create/stat/read/unlink phases; use one rank for per-repeat average operation latency | [mdtest peak](docs/bench-mdtest-peak.md) |
 | `agent-replay` | Paired Codex/OpenClaw model-response replay with native tool timing and per-trial verification | [agent replay](docs/bench-agent-replay.md) |
 
@@ -121,8 +122,8 @@ rank); every metric cell is a finite number. `run` never aggregates. Draw figure
 draw a custom figure:
 
 ```sh
-uv run python -m agent_fs_bench plot results/mdtest/<run-id> --targets ours,ext4,nfs
-uv run python -m agent_fs_bench plot results/mdtest/<run-n1> results/mdtest/<run-n16> \
+uv run python -m agent_fs_bench plot results/mdtest-peak/<run-id> --targets ours,ext4,nfs
+uv run python -m agent_fs_bench plot results/mdtest-peak/<run-n1> results/mdtest-peak/<run-n16> \
   --vary tasks --table phases --x tasks --y ops_per_s --split operation,layout \
   --yscale 1000 --logx
 ```

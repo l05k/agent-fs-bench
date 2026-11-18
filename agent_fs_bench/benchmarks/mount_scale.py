@@ -3,14 +3,13 @@
 | Symbol | Definition |
 | --- | --- |
 | N | `tasks`: clients, one MPI rank each, dealt round-robin over the machines |
-| K | `directories`: per-client directories; default 1 is one private workspace and one independent mount per client |
 | F, S | `files` per client and phase (default 1000), `file_size_bytes` (default 4096) |
 | T | One synchronized batch: start barrier through all tasks' completion and, for create-write, every target-scoped syncfs |
 | X | `ops_per_s = completed full files / T`; never summed per machine |
 | D_a | `controller_dispatch_elapsed_s`: controller time from notifying every worker of action a to receiving every reply |
 
-The canonical paper scenario is K=1. Each client has one private `read/` fixture and one
-fresh `write/` target behind its own real backend mount. Per repeat: setup -> first mount
+The default `io` workload has one private `read/` fixture and one fresh `write/`
+target behind each client's real backend mount. Per repeat: setup -> first mount
 -> create the durable read fixture through that mount and sync it -> unmount -> measured
 remount -> **read** the whole fixture -> **create-write** the separate fresh target ->
 unmount. Read starts after the remount; no cache drop, fadvise or direct I/O is used.
@@ -19,11 +18,7 @@ each client's target-scoped ``sync -f`` for file data and directory entries in T
 fixture preparation and cleanup are outside I/O timing. A failed or incomplete batch
 cannot emit a throughput row.
 
-K>1 retains the earlier shared read-only ablation with upstream mdtest, in the same run
-protocol but separate from the canonical phases. It is selected explicitly and is not a
-paper default; its private four-phase job and shared phases remain labeled as such.
-
-`--workload mount` keeps the same K=1 real mounts but times one site wrapper command per
+`--workload mount` keeps the same real mounts but times one site wrapper command per
 active rank, from invocation to ready return, and executes no I/O. `--workload
 mdtest-create` runs IOR 4.0.0 mdtest's private zero-byte create (removal follows in the
 job, unmeasured) on one mount per active client. `--workload mdtest-io` runs native
@@ -32,7 +27,7 @@ phases; read follows create without a remount or cache drop. `--idle-mounts N` m
 separate run-level Layout of N idle clients on one host for the mount and mdtest-create
 workloads; the cohort stays mounted across active repeats and is never placed as ranks.
 
-Per repeat tables: `phases` (read/create-write or ablation phases), `bandwidth` (logical
+Per repeat tables: `phases`, `bandwidth` (logical
 full-file bytes), `ranks`, `dispatch`, `host_mounts`, `host_unmounts`, `agents`,
 `resource_levels`, `resource_deltas`, `resource_workload`. An idle cohort additionally
 emits run-level `idle_mounts` and `idle_unmounts` lifecycle rows.
@@ -69,11 +64,10 @@ CONFIG = {
     'tasks': 64,
     'workload': 'io',  # io is the frozen canonical path; the others select new lifecycles.
     'idle_mounts': 0,
-    'directories': 1,  # K=1 canonical; >1 selects the shared-scope ablation.
     'files': 1000,
     'file_size_bytes': 4096,
     'repeats': 3,
-    'mdtest': 'mdtest',  # Used only by the explicitly selected K>1 ablation.
+    'mdtest': 'mdtest',  # Used only by mdtest-create and mdtest-io.
     'command_timeout_s': 360,  # Each mount/unmount command and short worker replies.
     'lifecycle_timeout_s': 900,  # One worker's complete mount or unmount action.
     'startup_timeout_s': 180,  # Before all ranks report they started, within job_timeout_s.
@@ -105,11 +99,6 @@ PEAKS = ('used_bytes', 'cached_bytes', 'dirty_bytes', 'slab_bytes',
 DATA_PHASES = (READ, CREATE_WRITE)
 
 
-def bandwidth_phase(name: str) -> bool:
-    """Canonical read/create-write and the old ablation's create/read phases."""
-    return name in DATA_PHASES or name.endswith(('/create', '/read'))
-
-
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--directory-smoke', action='store_true',
@@ -129,9 +118,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     options = parser.parse_args(argv)
     values = {**CONFIG, **vars(options)}
     if options.directory_smoke:
-        values.update(tasks=2, directories=1, files=32, repeats=1, idle_sample_s=0.1)
+        values.update(tasks=2, files=32, repeats=1, idle_sample_s=0.1)
     args = argparse.Namespace(**values)
-    for name in ('tasks', 'directories', 'files', 'file_size_bytes', 'repeats',
+    for name in ('tasks', 'files', 'file_size_bytes', 'repeats',
                  'command_timeout_s', 'lifecycle_timeout_s', 'startup_timeout_s',
                  'job_timeout_s', 'fixture_timeout_s', 'idle_sample_s', 'resource_sample_s'):
         value = getattr(args, name)
@@ -142,8 +131,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.workload != 'io':
         assert not args.directory_smoke, \
             f'--workload {args.workload}: expected a real mount profile, not --directory-smoke'
-        assert args.directories == 1, \
-            f'--workload {args.workload}: expected directories=1, measured {args.directories}'
     if args.idle_mounts:
         assert args.workload in ('mount', 'mdtest-create'), \
             f'--idle-mounts: expected workload mount or mdtest-create, measured {args.workload}'
@@ -217,8 +204,8 @@ def load_profile(ctx: RunContext, args: argparse.Namespace) -> tuple[Profile | N
         return None, None
     text = Path(args.profiles).read_text()
     profile = parse_profile(text, ctx.target.name, str(args.profiles))
-    if profile.cgroup and args.directories != 1:
-        raise ValueError('per-client cgroups require directories=1')
+    assert not (profile.cgroup and args.workload == 'mount'), \
+        'cgroup profiles do not support workload mount: its MPI ranks stay outside the leaf'
     admin = profile.admin_root.resolve()
     assert not (ctx.target.path.resolve().is_relative_to(admin)
                 or ctx.result_dir.resolve().is_relative_to(admin)), \
@@ -234,7 +221,7 @@ def worker_job(ctx: RunContext, args: argparse.Namespace, name: str, data_root: 
         'work_dir': str(ctx.work_dir / name), 'data_root': str(data_root), 'token': token,
         'profile': profile_text, 'directory_smoke': args.directory_smoke,
         'workload': args.workload,
-        'directories': args.directories, 'idle_sample_s': args.idle_sample_s,
+        'idle_sample_s': args.idle_sample_s,
         'resource_sample_s': args.resource_sample_s,
         'command_timeout_s': args.command_timeout_s,
         'lifecycle_timeout_s': args.lifecycle_timeout_s,
@@ -247,8 +234,6 @@ def start(ctx: RunContext, args: argparse.Namespace, profile: Profile | None,
     """Place the clients and start one lifecycle worker per participating machine."""
     if args.workload != 'io':
         assert profile is not None, f'{args.workload}: expected a real mount profile'
-        assert args.directories == 1, \
-            f'{args.workload}: expected directories=1, measured {args.directories}'
     # Every machine reaches the same data through its own admin view; the directory
     # smoke keeps it in the staging work directory, so it runs on one machine only.
     data_root = (ctx.work_dir / 'data' if profile is None else
@@ -264,8 +249,8 @@ def start(ctx: RunContext, args: argparse.Namespace, profile: Profile | None,
             f'--idle-mounts machines: expected 1 participating host, measured {len(nodes)}'
     launcher = ctx.pool.launcher
     tag = f'{ctx.run_id}-{ctx.target.name}'
-    engine = (None if args.directories == 1 and args.workload == 'io' else
-              Mdtest(args.mdtest, launcher, tag, args.job_timeout_s, args.startup_timeout_s))
+    engine = (Mdtest(args.mdtest, launcher, tag, args.job_timeout_s, args.startup_timeout_s)
+              if args.workload in MDTEST_WORKLOADS else None)
     # run_id is unique per run and identical on every machine: the admin-view sentinel.
     workers = [Worker(node, worker_job(ctx, args, node.name, data_root, ctx.run_id,
                                        profile_text),
@@ -277,57 +262,36 @@ def start(ctx: RunContext, args: argparse.Namespace, profile: Profile | None,
 
 
 def prepare(ctx: RunContext, args: argparse.Namespace, experiment: Experiment) -> dict[str, Any]:
-    """Create the run's data root and, for the explicit K>1 ablation, shared fixtures."""
-    info: dict[str, Any] = {'placement': cluster.placement_record(experiment.placement)}
-    if args.directories == 1:
-        sha256 = None
-        if args.workload in MDTEST_WORKLOADS:
-            digests = cluster.binary_digests(cluster.machines(experiment.placement),
-                                             ctx.pool.launcher, args.mdtest)
-            sha256 = cluster.validate_binary(args.mdtest, digests)
-        experiment.workers[0].call('init-data')
-        if args.workload != 'io':
-            info.update(workload=args.workload, idle_mounts=args.idle_mounts)
-            if experiment.profile is not None and experiment.profile.cgroup:
-                info['mount_cgroup'] = {'cpu_max': CGROUP_CPU_MAX,
-                                        'memory_max_bytes': CGROUP_MEMORY_MAX,
-                                        'scope': 'userspace-client-and-rank'}
-            if sha256 is not None:
-                info['mdtest'] = {'sha256': sha256, 'version': MDTEST_VERSION,
-                                  'workload': args.workload}
-            if args.workload == 'mount':
-                info.update(mount_timing='rank-wrapper-invocation-to-ready-return',
-                            cache_control='not-applicable-mount-lifecycle',
-                            completion='site-mount-wrapper-ready-return',
-                            durability='mount-ready')
-            elif args.workload == 'mdtest-create':
-                info.update(cache_control='not-applicable-zero-byte-create',
-                            completion='native-mdtest-create-phase-end-barrier',
-                            durability='not-applicable-zero-byte-files')
-            elif args.workload == 'mdtest-io':
-                info.update(cache_control='read-after-create-no-cache-drop',
-                            completion='native-mdtest-phase-end-barrier',
-                            durability='mdtest-y-per-file-fsync-no-directory-fsync')
-            return info
-        info.update(cache_control='unmount-remount-no-cache-drop',
-                    completion='exact-full-file',
-                    durability='target-scoped-syncfs-final-batch')
+    """Create the private data root and record the selected workload's boundary."""
+    info: dict[str, Any] = {'placement': cluster.placement_record(experiment.placement),
+                            'workload': args.workload, 'idle_mounts': args.idle_mounts}
+    if args.workload in MDTEST_WORKLOADS:
+        digests = cluster.binary_digests(cluster.machines(experiment.placement),
+                                         ctx.pool.launcher, args.mdtest)
+        info['mdtest'] = {'sha256': cluster.validate_binary(args.mdtest, digests),
+                          'version': MDTEST_VERSION, 'workload': args.workload}
         if experiment.profile is not None and experiment.profile.cgroup:
             info['mount_cgroup'] = {'cpu_max': CGROUP_CPU_MAX,
                                     'memory_max_bytes': CGROUP_MEMORY_MAX,
                                     'scope': 'userspace-client-and-rank'}
-        return info
-    assert experiment.engine is not None, 'K>1: expected an mdtest engine'
-    digests = cluster.binary_digests(cluster.machines(experiment.placement), ctx.pool.launcher,
-                                     args.mdtest)
-    sha256 = cluster.validate_binary(args.mdtest, digests)
     experiment.workers[0].call('init-data')
-    shared = tuple(experiment.data_root / f'shared-{number}'
-                   for number in range(1, args.directories))
-    experiment.engine.prepare(experiment.placement[0], shared, args.files, args.file_size_bytes,
-                              ctx.result_dir / 'prepare')
-    info.update(mdtest={'sha256': sha256, 'version': MDTEST_VERSION},
-                ablation='shared-scope-mdtest')
+    if args.workload == 'mount':
+        info.update(mount_timing='rank-wrapper-invocation-to-ready-return',
+                    cache_control='not-applicable-mount-lifecycle',
+                    completion='site-mount-wrapper-ready-return',
+                    durability='mount-ready')
+    elif args.workload == 'mdtest-create':
+        info.update(cache_control='not-applicable-zero-byte-create',
+                    completion='native-mdtest-create-phase-end-barrier',
+                    durability='not-applicable-zero-byte-files')
+    elif args.workload == 'mdtest-io':
+        info.update(cache_control='read-after-create-no-cache-drop',
+                    completion='native-mdtest-phase-end-barrier',
+                    durability='mdtest-y-per-file-fsync-no-directory-fsync')
+    else:
+        info.update(cache_control='unmount-remount-no-cache-drop',
+                    completion='exact-full-file',
+                    durability='target-scoped-syncfs-final-batch')
     return info
 
 
@@ -340,7 +304,6 @@ def setup_clients(experiment: Experiment, repeat: int) -> tuple[list[Rank], list
             'setup', repeat=repeat, clients=shares[worker.name], total_clients=count),
             experiment.workers))
     ranks = [Rank(worker.node, Path(client['workspace']),
-                  tuple(Path(path) for path in client['shared']),
                   Path(client['cgroup']) if client['cgroup'] is not None else None)
              for worker, setup in zip(experiment.workers, setups) for client in setup['clients']]
     return ranks, [setup['baseline'] for setup in setups]
@@ -355,9 +318,9 @@ def timed(workers: list[Worker], action: str) -> tuple[list[dict], float]:
 
 def measure_small_file_repeat(ctx: RunContext, args: argparse.Namespace,
                               experiment: Experiment, number: int) -> Repeat:
-    """Canonical K=1: durable read fixture, remount, read, then fresh create-write."""
+    """Durable read fixture, remount, read, then fresh create-write."""
     name = f'N{len(experiment.placement)}-R{number}'
-    print(f'  {experiment.topology} {name}, K=1, '
+    print(f'  {experiment.topology} {name}, workload io, '
           f'{args.files}x{args.file_size_bytes} B/client, hosts={len(experiment.workers)}',
           flush=True)
     diagnostics = ctx.result_dir / name
@@ -445,7 +408,7 @@ def measure_mount_repeat(ctx: RunContext, args: argparse.Namespace,
 
 def measure_mdtest_repeat(ctx: RunContext, args: argparse.Namespace,
                           experiment: Experiment, number: int) -> Repeat:
-    """K=1 native mdtest on one real mount per active client; no remount or fixture."""
+    """Native mdtest on one real mount per active client; no remount or fixture."""
     name = f'N{len(experiment.placement)}-R{number}'
     print(f'  {experiment.topology} {name}, workload {args.workload}, '
           f'N={len(experiment.placement)}, hosts={len(experiment.workers)}', flush=True)
@@ -478,42 +441,13 @@ def measure_mdtest_repeat(ctx: RunContext, args: argparse.Namespace,
                   dispatch_s, phases, [rank.node.name for rank in ranks])
 
 
-def measure_ablation_repeat(ctx: RunContext, args: argparse.Namespace,
-                            experiment: Experiment, number: int) -> Repeat:
-    """Explicit K>1 shared-scope ablation: the previous mdtest phases, unchanged."""
-    name = f'N{len(experiment.placement)}-R{number}'
-    print(f'  {experiment.topology} {name}, K={args.directories}, '
-          f'hosts={len(experiment.workers)}', flush=True)
-    diagnostics = ctx.result_dir / name
-    diagnostics.mkdir()
-    workers, engine = experiment.workers, experiment.engine
-    assert engine is not None, 'K>1: expected an mdtest engine'
-    ranks, baselines = setup_clients(experiment, number)
-    mounts, dispatch_s = [], {}
-    if experiment.profile is not None:
-        mounts, dispatch_s['mount'] = timed(workers, 'mount')
-    mounted = parallel(workers, 'idle')
-    engine.warm(ranks, args.files, args.file_size_bytes, diagnostics / 'warm')
-    parallel(workers, 'sample-start')
-    phases = engine.measure(ranks, args.files, args.file_size_bytes, diagnostics / 'measured')
-    workload = parallel(workers, 'sample-stop')
-    unmounts = []
-    if experiment.profile is not None:
-        unmounts, dispatch_s['unmount'] = timed(workers, 'unmount')
-    released = parallel(workers, 'idle')
-    return Repeat(number, name, baselines, mounted, workload, released, mounts, unmounts,
-                  dispatch_s, phases, [rank.node.name for rank in ranks])
-
-
 def measure_repeat(ctx: RunContext, args: argparse.Namespace, experiment: Experiment,
                    number: int) -> Repeat:
     if args.workload == 'mount':
         return measure_mount_repeat(ctx, args, experiment, number)
     if args.workload in MDTEST_WORKLOADS:
         return measure_mdtest_repeat(ctx, args, experiment, number)
-    measure = (measure_small_file_repeat if args.directories == 1
-               else measure_ablation_repeat)
-    return measure(ctx, args, experiment, number)
+    return measure_small_file_repeat(ctx, args, experiment, number)
 
 
 def validate_repeat(experiment: Experiment, result: Repeat) -> None:
@@ -529,7 +463,7 @@ def write_phases(ctx: RunContext, keys: dict[str, Any], phases: list[Phase], hos
     for phase in phases:
         phase_keys = {**keys, 'phase': phase.name}
         ctx.emit('phases', phase_keys, phase_metrics(phase, tasks))
-        if bandwidth_phase(phase.name):
+        if phase.name in DATA_PHASES:
             ctx.emit('bandwidth', phase_keys, bandwidth_metrics(phase, file_size_bytes))
         for sample, elapsed in enumerate(phase.rank_elapsed_s):
             ctx.emit('ranks', {**phase_keys, 'sample': sample, 'host': hosts[sample]},

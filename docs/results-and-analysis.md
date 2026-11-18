@@ -57,18 +57,18 @@ a custom figure:
 
 ```sh
 # Default figures, primary system first in the legend
-uv run python -m agent_fs_bench plot results/mdtest/<run-id> --targets ours,nfs,ext4
+uv run python -m agent_fs_bench plot results/mdtest-peak/<run-id> --targets ours,nfs,ext4
 
 # Pool repeated runs; their configs and source fingerprints must match
-uv run python -m agent_fs_bench plot results/mdtest/<run-a> results/mdtest/<run-b> \
-  --output figures/mdtest
+uv run python -m agent_fs_bench plot results/mdtest-peak/<run-a> results/mdtest-peak/<run-b> \
+  --output figures/mdtest-peak
 
 # One run per task count: let `tasks` differ to draw the curve
 uv run python -m agent_fs_bench plot results/mount-scale/<run-n64> results/mount-scale/<run-n256> \
   --vary tasks --output figures/mount-scale
 
 # Custom figure: one per operation, private layout only, in Kops/s
-uv run python -m agent_fs_bench plot results/mdtest/<run-n1> results/mdtest/<run-n16> \
+uv run python -m agent_fs_bench plot results/mdtest-peak/<run-n1> results/mdtest-peak/<run-n16> \
   --vary tasks --table phases --x tasks --y ops_per_s --split operation \
   --where layout=private --yscale 1000 --logx --xlabel 'Tasks' \
   --ylabel 'Throughput (Kops/s)' --name private

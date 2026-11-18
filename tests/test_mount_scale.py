@@ -7,8 +7,10 @@ import signal
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from agent_fs_bench.benchmarks import mount_scale, mount_scale_io as io
+from agent_fs_bench.benchmarks import mount_scale_mdtest as native
 from agent_fs_bench.benchmarks.mount_scale_mdtest import Phase, check_banner, read_timings
 from agent_fs_bench.benchmarks.mount_scale_mounts import Layout, Profile, _run
 from agent_fs_bench.results import RunContext, Tables, read_table
@@ -16,55 +18,62 @@ from agent_fs_bench.targets import Target
 
 
 class ConfigurationTests(unittest.TestCase):
-    def test_canonical_default_is_one_private_mount_and_1000_4k_files(self):
-        args = mount_scale.parse_args([])
-        self.assertEqual((args.directories, args.files, args.file_size_bytes), (1, 1000, 4096))
+    def test_rejects_cgroup_mount_before_starting_workers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / 'mounts.toml'
+            profile.write_text(f'''[profiles.fs]
+topology = "multi-mount"
+admin_root = "{root / 'admin'}"
+private_mount = ["mount"]
+unmount = ["umount"]
+cgroup = true
+''')
+            args = mount_scale.parse_args(['--workload', 'mount'])
+            args.profiles = profile
+            ctx = RunContext('mount-scale', 'run', Target('fs', root / 'stage'),
+                             root / 'work', root / 'results', None)
+            with mock.patch.object(mount_scale, 'start') as start:
+                with self.assertRaisesRegex(AssertionError, 'cgroup.*mount'):
+                    mount_scale.run(ctx, args)
+                start.assert_not_called()
 
     def test_directory_smoke_is_private_only(self):
         args = mount_scale.parse_args(['--directory-smoke'])
-        self.assertEqual((args.directories, args.files, args.repeats), (1, 32, 1))
-
-    def test_bandwidth_rows_cover_canonical_and_ablation_reads(self):
-        for phase in ('read', 'create-write', 'private/create', 'private/read',
-                      'shared-1/read'):
-            self.assertTrue(mount_scale.bandwidth_phase(phase))
-        for phase in ('private/stat', 'private/remove', 'shared-1/stat'):
-            self.assertFalse(mount_scale.bandwidth_phase(phase))
+        self.assertEqual((args.tasks, args.files, args.repeats), (2, 32, 1))
 
 
 class MountTopologyTests(unittest.TestCase):
-    def layout(self, directory: str, topology: str, agents: int, directories: int) -> Layout:
+    def layout(self, directory: str, topology: str, agents: int) -> Layout:
         root = Path(directory)
         admin, staging = root / 'admin', root / 'staging'
         admin.mkdir()
         staging.mkdir()
         private = admin / 'private'
         private.mkdir()
-        shared = [admin / f'shared-{i}' for i in range(1, directories)]
-        for path in shared:
-            path.mkdir()
         profile = Profile(topology, admin, ('mount', '{subdir}', '{mountpoint}'),
-                          ('mount', '{source}', '{mountpoint}'), ('umount', '{mountpoint}'))
-        return Layout(profile, staging, private, shared, agents,
+                          ('umount', '{mountpoint}'))
+        return Layout(profile, staging, private, agents,
                       log_dir=root / 'logs', timeout_s=5)
 
-    def test_directory_count_and_agent_count_are_independent(self):
-        for agents, directories in ((1, 3), (4, 2), (2, 1)):
+    def test_each_client_mounts_its_own_workspace(self):
+        for agents in (1, 4):
             for topology in ('multi-mount', 'shared-directory'):
-                with self.subTest(N=agents, X=directories, topology=topology):
+                with self.subTest(N=agents, topology=topology):
                     with tempfile.TemporaryDirectory() as directory:
-                        layout = self.layout(directory, topology, agents, directories)
-                        self.assertEqual(len(layout.clients), agents)
-                        self.assertEqual(len(layout.mountpoints),
-                                         agents * (directories if topology == 'multi-mount' else 1))
-                        self.assertEqual(len({client.workspace for client in layout.clients}), agents)
+                        layout = self.layout(directory, topology, agents)
+                        self.assertEqual(len(layout.mountpoints), agents)
                         for index, client in enumerate(layout.clients):
-                            self.assertEqual(len(client.shared), directories - 1)
+                            private = layout.data_root / f'agent-{index:04d}'
+                            point = layout.work_dir / f'agent-{index:04d}'
+                            if topology == 'multi-mount':
+                                private /= 'workspace'
+                                point /= 'workspace'
+                            command = layout.mount_command(index)
+                            self.assertEqual(command,
+                                             ['mount', '/' + str(private.relative_to(layout.profile.admin_root)),
+                                              str(point)])
                             self.assertTrue(client.workspace.parent.name == f'agent-{index:04d}')
-                            for number in range(1, directories):
-                                # LakeBase's bind target must be absent in its volume.
-                                source_target = layout.data_root / f'agent-{index:04d}' / f'shared-{number}'
-                                self.assertFalse(source_target.exists())
 
     def test_admin_symlink_cannot_redirect_private_data_outside_volume(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -73,9 +82,9 @@ class MountTopologyTests(unittest.TestCase):
             for path in (admin, outside, stage):
                 path.mkdir()
             (admin / 'escape').symlink_to(outside, target_is_directory=True)
-            profile = Profile('shared-directory', admin, ('mount',), (), ('umount',))
+            profile = Profile('shared-directory', admin, ('mount',), ('umount',))
             with self.assertRaisesRegex(ValueError, 'under admin_root'):
-                Layout(profile, stage, admin / 'escape', [], 1,
+                Layout(profile, stage, admin / 'escape', 1,
                        log_dir=root / 'logs', timeout_s=5)
             self.assertFalse((outside / 'agent-0000').exists())
 
@@ -177,6 +186,24 @@ all,32,,,,,,,,,,,4.9618383734e+04,1.2898445129e-03,1.1046726584e+06,5.7935714722
     def test_wrong_task_count_is_fatal(self):
         with self.assertRaisesRegex(AssertionError, 'tasks: expected 4'):
             check_banner('private', self.BANNER, 4)
+
+    def test_native_job_uses_exit_and_file_counts_not_unrelated_stdout(self):
+        node = native.cluster.Node('local', None, Path('/checkout'), sys.executable, {})
+        ranks = [native.Rank(node, Path('/workspace/a')),
+                 native.Rank(node, Path('/workspace/b'))]
+        stdout = self.BANNER + '2 tasks, 64 files\nWARNING: unrelated launcher diagnostic\n'
+        with (mock.patch.object(native.cluster, 'make_directories'),
+              mock.patch.object(native.cluster, 'run_program') as run,
+              mock.patch.object(native.cluster, 'fetch_file', return_value=self.CSV)):
+            run.return_value = native.cluster.ProgramRun('create', 0, stdout, Path('stderr'))
+            timings = native.run_job(None, 'mdtest', 'test', 'create', ranks,
+                                     [[], []], ('File creation',), Path('/logs'), 32, 60, 10)
+            self.assertEqual(timings.items, 32)
+            run.return_value = native.cluster.ProgramRun(
+                'create', 0, stdout.replace('64 files', '32 files'), Path('stderr'))
+            with self.assertRaisesRegex(AssertionError, 'workload: expected'):
+                native.run_job(None, 'mdtest', 'test', 'create', ranks,
+                               [[], []], ('File creation',), Path('/logs'), 32, 60, 10)
 
 
 class SmallFileIOTests(unittest.TestCase):
@@ -281,12 +308,12 @@ class TableEmissionTests(unittest.TestCase):
     def test_rank_samples_and_bandwidth_share_the_phase_identity(self):
         phases = [Phase('read', 4, 0.5, [0.2, 0.3]),
                   Phase('create-write', 4, 0.25, [0.1, 0.15]),
-                  Phase('private/stat', 4, 0.1, [0.05, 0.05])]
+                  Phase('file-create', 4, 0.1, [0.05, 0.05])]
         keys = {'topology': 'multi-mount', 'tasks': 2, 'repeat': 1}
         mount_scale.write_phases(self.ctx, keys, phases, ['local', 'node-a'], 4096)
         rows = read_table(self.root / 'phases.csv')
         self.assertEqual([row['phase'] for row in rows],
-                         ['read', 'create-write', 'private/stat'])
+                         ['read', 'create-write', 'file-create'])
         self.assertEqual([(row['phase'], row['bytes'])
                           for row in read_table(self.root / 'bandwidth.csv')],
                          [('read', str(4 * 4096)), ('create-write', str(4 * 4096))])
@@ -298,8 +325,8 @@ class TableEmissionTests(unittest.TestCase):
              ('read', '1', 'node-a', '0.3'),
              ('create-write', '0', 'local', '0.1'),
              ('create-write', '1', 'node-a', '0.15'),
-             ('private/stat', '0', 'local', '0.05'),
-             ('private/stat', '1', 'node-a', '0.05')])
+             ('file-create', '0', 'local', '0.05'),
+             ('file-create', '1', 'node-a', '0.05')])
 
 if __name__ == '__main__':
     unittest.main()
