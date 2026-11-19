@@ -1,8 +1,12 @@
-"""Internal MPI ranks for the mount-scale mount workload.
+"""Internal MPI ranks for the mount-scale native workloads.
 
 `mount` runs one site profiled mount command inside each rank: the command file holds
 the site wrapper argv, the rank times only the command from invocation to its ready
 return, and the wrapper's output stays in the private lifecycle work tree.
+
+`mdtest` joins the site-created budget group, prints one placement proof, then execs
+the original mdtest argv before MPI_Init and native phase timing. A join or proof
+failure ends that rank; there is no retry or alternate execution.
 """
 
 from __future__ import annotations
@@ -15,9 +19,10 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import Sequence
+from typing import NoReturn, Sequence
 
 from agent_fs_bench import cluster
+from .mount_scale_budget import PREFIX, join
 
 MOUNT_RESULT_PREFIX = 'MOUNT_SCALE_MOUNT_RESULT '
 
@@ -27,6 +32,21 @@ def parse_mount_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument('--command-file', required=True)
     parser.add_argument('--timeout', type=float)
     return parser.parse_args(argv)
+
+
+def parse_mdtest_args(argv: Sequence[str]) -> tuple[Path, list[str]]:
+    argv = list(argv)
+    try:
+        split = argv.index('--')
+    except ValueError:
+        raise SystemExit('internal mdtest rank runner requires -- <binary> [args...]') from None
+    parser = argparse.ArgumentParser(description='internal mount-scale mdtest rank')
+    parser.add_argument('--cgroup', required=True)
+    options = parser.parse_args(argv[:split])
+    command = argv[split + 1:]
+    if not command:
+        parser.error('expected the original mdtest command after --')
+    return Path(options.cgroup), command
 
 
 def parse_mount_result(stdout: str, tasks: int) -> list[float]:
@@ -91,9 +111,20 @@ def mount_main(argv: Sequence[str]) -> int:
     return 0
 
 
+def mdtest_main(argv: Sequence[str]) -> NoReturn:
+    cgroup, command = parse_mdtest_args(argv)
+    cluster.report_rank_start()
+    proof = join(cgroup)
+    proof['rank'] = int(os.environ['OMPI_COMM_WORLD_RANK'])
+    print(PREFIX + json.dumps(proof), flush=True)
+    os.execvp(command[0], command)
+
+
 def main(argv: Sequence[str]) -> int:
     if argv[:1] == ['mount']:
         return mount_main(argv[1:])
+    if argv[:1] == ['mdtest']:
+        return mdtest_main(argv[1:])
     raise SystemExit('internal mount-scale rank runner; use agent-fs-bench run mount-scale')
 
 

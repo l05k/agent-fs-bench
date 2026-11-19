@@ -51,7 +51,7 @@ Each launch is `mdtest -a POSIX -F -i 1 -n <n> -w S -e S -y [-u]`:
 
 `-y` makes mdtest fsync after each write. IOR 4.0.0 skips the write for S=0, so the 0 B create has no fsync; it measures pure create/close metadata cost. Measured repeats follow `warmup_repeats` identical, discarded launches, and reads follow writes in the same launch with **no cache drop** (`cache_state = after-warmup-write-then-read-same-launch-no-drop`), so read MiB/s can come from the client page cache. Do not report it as storage-server read bandwidth.
 
-`mdtest-peak` sets no CPU or memory quota. Experiments 1–4 use the external common 1 CPU / 2 GiB budget around each workload and its FUSE daemon where present; experiments 5–8 use fixed host resources without a per-agent quota. Upstream mdtest itself has no built-in limit.
+`mdtest-peak` sets no CPU or memory quota. The active [Round 04](../experiments/round-04.md) single-agent operation-latency runs use one external common 1 CPU / 2 GiB budget around the workload and its FUSE daemon where present. Mount-scale file workloads instead use site-created per-agent groups and the rank placement hook; timed mount/density groups use their explicitly frozen host resources. Upstream mdtest itself has no built-in limit.
 
 ## Results
 

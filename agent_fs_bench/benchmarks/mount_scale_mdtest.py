@@ -1,7 +1,7 @@
 """Native mdtest phases for mount-scale, using the original IOR 4.0.0 binary.
 
-This module builds one private zero-byte create job or a create-then-read job
-with per-file fsync (`-y`). Both keep mdtest's phase times and rank CSV;
+This module builds one private create job (without per-file fsync) or a
+create-then-read job with per-file fsync (`-y`). Both keep native phase times and rank CSV;
 removal runs outside the reported create/read phases.
 
 | Symbol | Definition |
@@ -32,6 +32,8 @@ from typing import Sequence
 
 from agent_fs_bench import cluster
 
+from .mount_scale_budget import read_placements
+
 VERSION = '4.0.0'
 READ = 'read'
 CREATE_WRITE = 'create-write'
@@ -58,11 +60,14 @@ class Rank:
 
     node: cluster.Node
     workspace: Path  # Private test directory parent; exists on that machine only.
+    cgroup: Path | None = None  # Site-created shared workload/FUSE budget, if configured.
 
 
 @dataclass(frozen=True)
 class Timings:
-    items: int  # Items per task reported by mdtest.
+    items: int  # Rank 0's final items value; not sufficient proof of completion.
+    operations: dict[str, int]  # Actual aggregate operations, reconstructed from native CSV.
+    rank_operations: dict[str, list[int]]
     phase_s: dict[str, float]  # T_p
     rank_s: dict[str, list[float]]  # t_{p,r}, rank order
 
@@ -75,10 +80,11 @@ class Phase:
     rank_elapsed_s: list[float]
 
 
-def zero_create_job(path: Path, files: int) -> tuple[str, ...]:
-    """File creation only, zero bytes per file; removal runs after the create phase."""
-    return ('-F', '-u', '-C', '-r', '-w', '0', '-d', str(path), '-n', str(files),
-            '-i', '1', '--warningAsErrors')
+def create_job(path: Path, files: int, size: int, stonewall_seconds: int | None) -> tuple[str, ...]:
+    """Create/write/close without fsync; native removal follows outside create timing."""
+    arguments = ('-F', '-u', '-C', '-r', '-w', str(size), '-e', str(size),
+                 '-d', str(path), '-n', str(files), '-i', '1', '--warningAsErrors')
+    return arguments if stonewall_seconds is None else (*arguments, '-W', str(stonewall_seconds))
 
 
 def native_io_job(path: Path, files: int, size: int) -> tuple[str, ...]:
@@ -104,6 +110,16 @@ def _seconds(label: str, text: str) -> float:
     return value
 
 
+def _operations(label: str, rate: str, seconds: str) -> int:
+    """IOR prints rate=completed/time and time with %.10e (11 significant digits)."""
+    product = _seconds(label + ' rate', rate) * _seconds(label + ' time', seconds)
+    count = round(product)
+    tolerance = max(1e-6, product * 2e-10)
+    assert tolerance < 0.5 and count > 0 and abs(product - count) <= tolerance, \
+        f'{label} completed operations: expected an unambiguous integer, measured {product}'
+    return count
+
+
 def read_timings(label: str, text: str, phases: Sequence[str], tasks: int) -> Timings:
     """T_p from the `all` row and t_{p,r} from the rank rows, for `phases` only."""
     rows = [row for row in csv.reader(io.StringIO(text)) if row]
@@ -112,8 +128,19 @@ def read_timings(label: str, text: str, phases: Sequence[str], tasks: int) -> Ti
     ranks = rows[2:]
     assert [row[0] for row in ranks] == [str(rank) for rank in range(tasks)], \
         f'{label} rank rows: expected {tasks}, measured {len(ranks)}'
+    operations = {name: _operations(f'{label} {name}', rows[1][_TIME[name] - 1],
+                                   rows[1][_TIME[name]]) for name in phases}
+    rank_operations = {
+        name: [_operations(f'{label} rank {row[0]} {name}', row[_TIME[name] - 1],
+                           row[_TIME[name]]) for row in ranks] for name in phases}
+    for name in phases:
+        assert operations[name] == sum(rank_operations[name]), \
+            f'{label} {name} completed operations: aggregate {operations[name]}, ' \
+            f'rank sum {sum(rank_operations[name])}'
     return Timings(
         items=int(rows[1][1]),
+        operations=operations,
+        rank_operations=rank_operations,
         phase_s={name: _seconds(f'{label} {name}', rows[1][_TIME[name]]) for name in phases},
         rank_s={name: [_seconds(f'{label} rank {row[0]} {name}', row[_TIME[name]])
                        for row in ranks] for name in phases})
@@ -134,17 +161,31 @@ def run_job(launcher: cluster.Launcher, binary: str, tag: str, label: str, ranks
     programs = []
     for rank, group in zip(ranks, groups, strict=True):
         arguments = [binary, *group, '--saveRankPerformanceDetails', str(capture)]
-        programs.append([rank.node.python, '-u', '-m', 'agent_fs_bench.cluster',
-                         'rank-exec', *arguments])
+        if rank.cgroup is None:
+            programs.append([rank.node.python, '-u', '-m', 'agent_fs_bench.cluster',
+                             'rank-exec', *arguments])
+        else:
+            programs.append([rank.node.python, '-u', '-m',
+                             'agent_fs_bench.benchmarks.mount_scale_runner', 'mdtest',
+                             '--cgroup', str(rank.cgroup), '--', *arguments])
     run = cluster.run_program(placement, launcher, programs, log_dir, label,
                               timeout_s=timeout_s, startup_timeout_s=startup_timeout_s)
     cluster.validate_exit(run)
     check_banner(label, run.stdout, len(ranks))
+    read_placements(run.stdout, [rank.cgroup for rank in ranks])
     counts = re.findall(r'^(\d+) tasks, (\d+) files$', run.stdout, re.MULTILINE)
     expected = [(str(len(ranks)), str(len(ranks) * files))]
     assert counts == expected, f'{label} workload: expected {expected}, measured {counts}'
-    timings = read_timings(label, cluster.fetch_file(placement[0], launcher, capture),
-                           phases, len(ranks))
+    text = cluster.fetch_file(placement[0], launcher, capture)
+    (log_dir / 'rank-performance.csv').write_text(text, encoding='utf-8')
+    timings = read_timings(label, text, phases, len(ranks))
+    for phase in phases:
+        expected_ops = len(ranks) * files
+        assert timings.operations[phase] == expected_ops and \
+            timings.rank_operations[phase] == [files] * len(ranks), \
+            f'{label} {phase} incomplete: expected {expected_ops} operations ' \
+            f'({files} per rank), measured {timings.operations[phase]} ' \
+            f'({timings.rank_operations[phase]})'
     assert timings.items == files, f'{label} items per task: expected {files}, ' \
                                    f'measured {timings.items}'
     return timings
@@ -165,11 +206,12 @@ class Mdtest:
         return run_job(self.launcher, self.binary, self.tag, label, ranks, groups, phases,
                        log_dir, files, self.timeout_s, self.startup_timeout_s)
 
-    def create_timings(self, ranks: Sequence[Rank], files: int, log_dir: Path) -> Timings:
-        """Native zero-byte file creation; removal follows in the same job, unmeasured."""
+    def create_timings(self, ranks: Sequence[Rank], files: int, size: int,
+                       stonewall_seconds: int | None, log_dir: Path) -> Timings:
+        """Native create without fsync; a truncated stonewall job fails count validation."""
         return self.job('private-create', ranks,
-                        [zero_create_job(rank.workspace, files) for rank in ranks],
-                        ('File creation',), log_dir, files)
+                        [create_job(rank.workspace, files, size, stonewall_seconds)
+                         for rank in ranks], ('File creation',), log_dir, files)
 
     def native_io_timings(self, ranks: Sequence[Rank], files: int, size: int,
                           log_dir: Path) -> Timings:

@@ -1,5 +1,7 @@
 """Consumer-visible mount topology invariants; no privileged mounts required."""
 
+import csv
+import io
 import os
 from pathlib import Path
 import signal
@@ -36,6 +38,19 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, 'idle-mounts'):
             mount_scale.parse_args(['--idle-mounts', '4'])
 
+    def test_create_options_cannot_silently_change_another_workload(self):
+        for argv in (['--create-file-size-bytes', '4096'], ['--stonewall-seconds', '600'],
+                     ['--workload', 'mount', '--stonewall-seconds', '600']):
+            with self.subTest(argv=argv), self.assertRaisesRegex(AssertionError, 'require'):
+                mount_scale.parse_args(argv)
+
+    def test_invalid_create_configuration_is_rejected_before_startup(self):
+        for values in ({'create_file_size_bytes': -1}, {'create_file_size_bytes': True},
+                       {'stonewall_seconds': 0}, {'stonewall_seconds': 0.5}):
+            with self.subTest(values=values), mock.patch.dict(mount_scale.CONFIG, **values):
+                with self.assertRaises(AssertionError):
+                    mount_scale.parse_args(['--workload', 'mdtest-create'])
+
     def test_cgroup_profile_key_is_not_retained(self):
         text = '''[profiles.fs]
 topology = "multi-mount"
@@ -46,6 +61,27 @@ cgroup = true
 '''
         with self.assertRaisesRegex(ValueError, 'unknown profile keys.*cgroup'):
             parse_profile(text, 'fs')
+
+    def test_timed_mount_rejects_a_budget_profile_before_creating_workers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / 'mounts.toml'
+            profile.write_text('''[profiles.fs]
+topology = "multi-mount"
+admin_root = "/admin"
+private_mount = ["mount"]
+unmount = ["umount"]
+rank_cgroup = "/sys/fs/cgroup/agent-fs-bench/{mount_hash}"
+''')
+            args = mount_scale.parse_args(['--workload', 'mount'])
+            args.profiles = profile
+            ctx = RunContext('mount-scale', 'run', Target('fs', root), root / 'work',
+                             root / 'results', Tables(root))
+            with mock.patch.object(mount_scale, 'Worker') as worker:
+                with self.assertRaisesRegex(AssertionError, 'timed mounts'):
+                    mount_scale.run(ctx, args)
+                worker.assert_not_called()
+            self.assertFalse(ctx.work_dir.exists())
 
 
 class MountTopologyTests(unittest.TestCase):
@@ -150,6 +186,8 @@ all,32,,,,,,,,,,,4.9618383734e+04,1.2898445129e-03,1.1046726584e+06,5.7935714722
         timings = self.parse(self.CSV)
         self.assertEqual(timings.items, 32)
         self.assertEqual(timings.phase_s['File creation'], 1.2898445129e-03)
+        self.assertEqual(timings.operations['File creation'], 64)
+        self.assertEqual(timings.rank_operations['File creation'], [32, 32])
         self.assertEqual(timings.rank_s['File creation'], [1.2857913971e-03, 9.6893310547e-04])
         self.assertGreater(timings.phase_s['File creation'], max(timings.rank_s['File creation']))
 
@@ -165,6 +203,39 @@ all,32,,,,,,,,,,,4.9618383734e+04,1.2898445129e-03,1.1046726584e+06,5.7935714722
     def test_phase_that_did_not_run_is_fatal_instead_of_zero(self):
         with self.assertRaises(ValueError):
             read_timings('private', self.CSV, ('Directory creation',), 2)
+
+    def test_inconsistent_aggregate_and_rank_completed_counts_are_fatal(self):
+        text = self.CSV.replace('4.9618383734e+04', '2.4809191867e+04')
+        with self.assertRaisesRegex(AssertionError, 'aggregate 32, rank sum 64'):
+            self.parse(text)
+
+    def test_ambiguous_native_operation_count_is_not_rounded_into_a_valid_result(self):
+        text = self.CSV.replace('4.9618383734e+04', '4.9620000000e+04')
+        with self.assertRaisesRegex(AssertionError, 'unambiguous integer'):
+            self.parse(text)
+
+    def test_truncated_counts_fail_even_when_banner_and_items_still_match_the_plan(self):
+        rows = list(csv.reader(io.StringIO(self.CSV)))
+        rate = rows[0].index('rate-File creation')
+        for row in rows[1:]:
+            row[rate] = f'{float(row[rate]) / 2:.10e}'
+        output = io.StringIO()
+        csv.writer(output, lineterminator='\n').writerows(rows)
+        partial = output.getvalue()
+        node = native.cluster.Node('local', None, Path('/checkout'), sys.executable, {})
+        ranks = [native.Rank(node, Path('/workspace/a')),
+                 native.Rank(node, Path('/workspace/b'))]
+        with tempfile.TemporaryDirectory() as directory:
+            logs = Path(directory)
+            with (mock.patch.object(native.cluster, 'make_directories'),
+                  mock.patch.object(native.cluster, 'run_program') as run,
+                  mock.patch.object(native.cluster, 'fetch_file', return_value=partial)):
+                run.return_value = native.cluster.ProgramRun(
+                    'create', 0, self.BANNER + '2 tasks, 64 files\n', logs / 'stderr')
+                with self.assertRaisesRegex(AssertionError, 'incomplete.*measured 32'):
+                    native.run_job(None, 'mdtest', 'test', 'create', ranks,
+                                   [[], []], ('File creation',), logs, 32, 60, 10)
+            self.assertEqual((logs / 'rank-performance.csv').read_text(), partial)
 
     def test_mdtest_node_count_is_not_compared_with_the_plan(self):
         # mdtest counts MPI shared-memory domains, so unequal per-machine task counts
@@ -183,18 +254,20 @@ all,32,,,,,,,,,,,4.9618383734e+04,1.2898445129e-03,1.1046726584e+06,5.7935714722
         ranks = [native.Rank(node, Path('/workspace/a')),
                  native.Rank(node, Path('/workspace/b'))]
         stdout = self.BANNER + '2 tasks, 64 files\nWARNING: unrelated launcher diagnostic\n'
-        with (mock.patch.object(native.cluster, 'make_directories'),
+        with (tempfile.TemporaryDirectory() as directory,
+              mock.patch.object(native.cluster, 'make_directories'),
               mock.patch.object(native.cluster, 'run_program') as run,
               mock.patch.object(native.cluster, 'fetch_file', return_value=self.CSV)):
-            run.return_value = native.cluster.ProgramRun('create', 0, stdout, Path('stderr'))
+            logs = Path(directory)
+            run.return_value = native.cluster.ProgramRun('create', 0, stdout, logs / 'stderr')
             timings = native.run_job(None, 'mdtest', 'test', 'create', ranks,
-                                     [[], []], ('File creation',), Path('/logs'), 32, 60, 10)
+                                     [[], []], ('File creation',), logs, 32, 60, 10)
             self.assertEqual(timings.items, 32)
             run.return_value = native.cluster.ProgramRun(
                 'create', 0, stdout.replace('64 files', '32 files'), Path('stderr'))
             with self.assertRaisesRegex(AssertionError, 'workload: expected'):
                 native.run_job(None, 'mdtest', 'test', 'create', ranks,
-                               [[], []], ('File creation',), Path('/logs'), 32, 60, 10)
+                               [[], []], ('File creation',), logs, 32, 60, 10)
 
 
 class TableEmissionTests(unittest.TestCase):
@@ -268,6 +341,25 @@ class TableEmissionTests(unittest.TestCase):
              ('create-write', '1', 'node-a', '0.15'),
              ('file-create', '0', 'local', '0.05'),
              ('file-create', '1', 'node-a', '0.05')])
+
+
+    def test_budget_events_preserve_before_and_after_kernel_counters(self):
+        keys = {'topology': 'multi-mount', 'tasks': 1, 'repeat': 1}
+        counters = {'cpu_nr_periods': 4, 'cpu_nr_throttled': 2, 'cpu_throttled_usec': 7,
+                    'memory_max_events': 3, 'memory_oom': 1, 'memory_oom_kill': 0}
+        budget = {'cgroup': '/sys/fs/cgroup/agent-fs-bench/abc', **counters}
+        mount_scale.write_lifecycle(self.ctx, keys, 'local', 'mount',
+                                    {'mount_elapsed_s': 0.2, 'measured_mounts': 1,
+                                     'agent_elapsed_s': (0.2,), 'budgets': [budget]})
+        mount_scale.write_lifecycle(self.ctx, keys, 'local', 'unmount',
+                                    {'unmount_elapsed_s': 0.3, 'remaining_mounts': 0,
+                                     'agent_elapsed_s': (0.3,),
+                                     'budgets': [{**budget, 'cpu_nr_throttled': 5}]})
+        rows = read_table(self.root / 'budget_events.csv')
+        self.assertEqual([(row['action'], row['cpu_nr_throttled'], row['memory_oom'])
+                          for row in rows], [('mount', '2', '1'), ('unmount', '5', '1')])
+        self.assertTrue(all(row['cgroup'] == budget['cgroup'] for row in rows))
+
 
 if __name__ == '__main__':
     unittest.main()

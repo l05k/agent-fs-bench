@@ -1,42 +1,89 @@
 # Copy to local/mounts.toml. The controller distributes this private profile to
 # SSH workers; commands run on each machine as its configured user, without a shell.
 # Profile names match local/targets.toml. Targets are identically named local
-# staging paths on every host, NOT the admin filesystem. Replace hosts/meta URL.
-# admin_root is a pre-mounted full-volume view at the same path on every host,
-# pointing to the same volume. Admin mounts stay mounted and are excluded from
-# measured per-agent mount entries, but may still count toward provider quotas.
-# {source}/{subdir} use volume-absolute paths, relative to admin_root.
+# staging paths on every host, NOT the admin filesystem. Replace host/endpoint
+# placeholders. admin_root is a pre-mounted full-volume view at the same path on
+# every host, pointing to the same volume. Admin mounts stay mounted and are
+# excluded from measured per-agent mount entries, but may count toward provider
+# quotas. {source}/{subdir} are volume-absolute paths relative to admin_root.
 #
-# Round 03 uses one real backend mount and private workspace per active agent or
-# idle client. The site's wrapper establishes each client's actual session. For
-# Experiments 6/8, cap and verify one Apsara metadata connection per mount, with
-# no sleeps in the timed command. This example does not set a provider connection
-# limit. The harness sets no CPU/memory budget and creates no cgroup; Experiments
-# 1–4 budgets are applied externally around the workload and its FUSE daemon.
+# Round 04 uses one real backend mount and private workspace per active agent or
+# idle client. Each FUSE arm must start a real filesystem client per mount; the
+# site wrapper establishes the session before returning ready.
+#
+# Optional rank_cgroup is a thin site-owned budget hook, not the retired harness
+# quota implementation. The site mount wrapper creates the named group, sets
+# cpu.max="100000 100000" and memory.max=2147483648, and puts the FUSE daemon and
+# later workload rank in it. For NFS the group contains only the rank; kernel NFS
+# threads are not constrained. The harness never creates, resizes or removes a
+# group; a profile without rank_cgroup is unbudgeted. rank_cgroup is rejected for
+# timed --workload mount (mount latency / density-next-mount).
+#
+# {mount_hash} = sha256(str(actual_mountpoint).encode()).hexdigest()[:20].
+# The site needs cgroup v2 cpu and memory delegation; memory/pids-only delegation
+# cannot prove 1c2g and budgeted formal points must be not_run. A normal unmount
+# wrapper waits for the group to empty, removes it and returns nonzero on residue.
+# `cgroup = true`, `mount_cgroup`, `{binds}` and `shared_mount` are invalid here.
 
 [profiles.nfs]
 topology = "multi-mount"
 admin_root = "/mnt/nfs-admin"
-private_mount = ["mount", "-t", "nfs", "-o", "rw,vers=4", "server:/export{source}", "{mountpoint}"]
-unmount = ["umount", "{mountpoint}"]
-# A few Linux NFS mounts of one server/export may share one superblock, cache and
-# connection set. One mount entry is not one independent NFS TCP client. This profile
-# keeps normal cache defaults rather than silently adding nosharecache.
+# Optional per-rank budget. The group has no user-space daemon; do not claim it
+# bounds kernel NFS service threads or server quotas. A few Linux NFS mounts of
+# one server/export may share one superblock, cache and connection set: one mount
+# entry is not one independent NFS TCP client. This profile keeps normal cache
+# defaults rather than silently adding nosharecache. Remove rank_cgroup for a
+# timed mount profile.
+rank_cgroup = "/sys/fs/cgroup/agent-fs-bench/{mount_hash}"
+private_mount = ["/usr/local/bin/site-budgeted-mount", "{mountpoint}",
+                 "mount", "-t", "nfs4", "-o",
+                 "rw,vers=4.0,rsize=1048576,wsize=1048576,hard,noresvport,proto=tcp,timeo=600,retrans=2,sec=sys",
+                 "NFS_SERVER:/export{source}", "{mountpoint}"]
+unmount = ["/usr/local/bin/site-budgeted-unmount", "{mountpoint}",
+           "umount", "{mountpoint}"]
 
-[profiles.cephfs]
+# Formal CephFS FUSE arm: one real ceph-fuse daemon per rank. The site wrapper
+# starts it in the group, verifies the daemon PID and limits, then waits for the
+# mount to be ready. Replace CLIENT, FS_NAME, MONITORS and the keyring path with
+# the actual deployment; no value here is a claim about a real deployment.
+[profiles.cephfs-fuse]
+topology = "shared-directory"
+admin_root = "/mnt/cephfs-fuse-admin"
+rank_cgroup = "/sys/fs/cgroup/agent-fs-bench/{mount_hash}"
+private_mount = ["/usr/local/bin/site-budgeted-mount", "{mountpoint}",
+                 "ceph-fuse", "-f", "-m", "MONITORS", "-n", "client.CLIENT",
+                 "--client_mountpoint", "{subdir}",
+                 "--keyring", "/etc/ceph/CLIENT.keyring", "{mountpoint}"]
+unmount = ["/usr/local/bin/site-budgeted-unmount", "{mountpoint}",
+           "fusermount", "-u", "{mountpoint}"]
+
+# Historical/illustrative only: kernel CephFS with noshare is not the Round 04
+# formal CephFS arm. It creates one kernel client instance per mount instead of
+# sharing client caches. Do not use it to stand in for a FUSE daemon.
+[profiles.cephfs-kernel-example]
 topology = "multi-mount"
 admin_root = "/mnt/cephfs-admin"
-# Replace CLIENT, FS_NAME, MONITORS and the secret path with the actual deployment.
-# noshare creates a new kernel client instance per mount instead of sharing one
-# instance among mounts of the same cluster, so each agent has independent client
-# caches. Use the same options for the pre-mounted admin view.
 private_mount = ["mount", "-t", "ceph", "CLIENT@.FS_NAME={source}", "{mountpoint}", "-o",
                  "rw,relatime,ms_mode=secure,acl,noshare,mon_addr=MONITORS,secretfile=/etc/ceph/CLIENT.secret"]
 unmount = ["umount", "{mountpoint}"]
 
-# Canonical LakeBase profile: one private subdir mount per agent.
-[profiles.lakebase]
+# Round 04 LakeBase fast-drop arm: one private subdir mount per agent, every
+# optimization enabled, including drop-close. close is not a durability barrier;
+# only fsync/sync is. local-lock and keep-page-cache are safe only on an exclusive
+# subtree. The META_URL token stays in the private local file; do not commit it.
+# For N >= 3200, add a separate +conn4 deployment variant with
+#   "--meta-url-query-string", "max_open_conns=4&max_idle_conns=4"
+# and label it as a variant, not an independent cache factor. Never pass --bind.
+[profiles.lakebase-fast-drop]
 topology = "shared-directory"
-admin_root = "/mnt/lakebase-admin"
-private_mount = ["lakebase-client", "mount", "META_URL", "{mountpoint}", "--subdir", "{subdir}"]
-unmount = ["lakebase-client", "umount", "{mountpoint}"]
+admin_root = "/mnt/lakebase-fast-drop-admin"
+rank_cgroup = "/sys/fs/cgroup/agent-fs-bench/{mount_hash}"
+private_mount = ["/usr/local/bin/site-budgeted-mount", "{mountpoint}",
+                 "lakebase-client", "mount", "META_URL", "{mountpoint}",
+                 "--subdir", "{subdir}",
+                 "--attr-cache=300s", "--entry-cache=300s", "--dir-entry-cache=300s",
+                 "--local-lock", "--keep-page-cache", "-o", "writeback_cache",
+                 "--drop-read-flush-barrier", "--drop-close-flush-barrier",
+                 "--dirty-max-ratio=50", "--buffer-size=1024M"]
+unmount = ["/usr/local/bin/site-budgeted-unmount", "{mountpoint}",
+           "lakebase-client", "umount", "{mountpoint}"]
