@@ -1,6 +1,7 @@
 """Keep trace sharding and accepted-cassette installation lossless and fail-fast."""
 
 import io
+import os
 import json
 from pathlib import Path
 import sys
@@ -84,6 +85,19 @@ class CassetteInstallTests(unittest.TestCase):
         self.assertFalse(self.missing.cassette.exists())
         with self.assertRaisesRegex(ValueError, 'overwrite'):
             self.install()
+
+    def test_transfer_permissions_do_not_change_cassette_identity(self):
+        cassette = self.stage / 'cassettes' / 'one'
+        for path in cassette.iterdir():
+            path.chmod(0o666)
+        previous = os.umask(0o077)
+        try:
+            self.install()
+        finally:
+            os.umask(previous)
+        self.assertEqual(capture.cassette_digest(self.case.cassette),
+                         self.index['cases'][0]['cassette_sha256'])
+        self.assertEqual((self.case.cassette / 'flows.mitm').stat().st_mode & 0o777, 0o600)
 
     def test_changed_initial_data_blocks_all_installation(self):
         self.payload.write_text('different task input')

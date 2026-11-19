@@ -172,7 +172,7 @@ value:
   - The experimenter guarantees what the target path is on each machine: one shared
     filesystem, or separate local disks.
   - Experiments that need one directory seen by every task need a shared target:
-    mount-scale's `admin_root`.
+    mdtest-peak's `shared` layout and mount-scale's `admin_root`.
 
 Unexpected errors stop the run. A failing task aborts the whole MPI job; see
 the launcher stderr. Classified replay divergence, error and timeout are raw

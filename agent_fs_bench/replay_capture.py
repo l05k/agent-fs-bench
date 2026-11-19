@@ -3,6 +3,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -33,7 +34,13 @@ def input_facts(case: replay.ReplayCase) -> dict:
 
 
 def cassette_digest(path: Path) -> str:
-    return replay.fingerprint(path, [path / name for name in CASSETTE_FILES])
+    digest = hashlib.sha256()
+    for name in CASSETTE_FILES:
+        digest.update(name.encode() + b'\0')
+        with (path / name).open('rb') as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()
 
 
 def shards(cases: list[replay.ReplayCase], hosts: tuple[Host, ...]) -> list[tuple[Host, list]]:

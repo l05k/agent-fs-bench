@@ -2,6 +2,8 @@
 
 [Round 03](round-03.md) 是当前执行矩阵。下列材料只用于追溯；不执行、不进入新论文比较组。旧 checkout、版本、配置、`results/`、`packages/` 和旧失败记录原样保留；已从当前分支移除的 K>1/`directories` 实现与 `mini-dev-workflow`、`npm-install-nofsync`、`sqlite-speedtest`、`mdtest` CLI 入口只存在于历史 commit。冻结的 Round 02 commit `9a10d28` 仍可检出运行。归档不是删除，也不把实测改称合成数据。
 
+当前分支也已删除 `npm_install_nofsync.py`、`sqlite_speedtest.py`、`mini_dev_workflow.py` 及其专用测试；不为退役实验保留实现或 mini 对照 oracle。对应历史结果和 checkout 不变。
+
 | 归档项 | 原材料 | 不进入新版的原因 |
 | --- | --- | --- |
 | [Round 02](round-02.md) | 固定代码 `9a10d28`（仍可检出运行）；执行方案的发布快照 `dea462b` | 旧版执行方案。批末 `syncfs` + 重挂载读、对称 per-agent `smallfile-quota` 和 replay smoke-only 不再是正式矩阵；当前 replay 是全队列，扩展性使用原生 mdtest。 |

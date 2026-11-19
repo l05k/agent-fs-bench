@@ -17,6 +17,16 @@ from agent_fs_bench.targets import Target
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_canonical_native_io_configuration(self):
+        args = mount_scale.parse_args([])
+        self.assertEqual((args.workload, args.files, args.file_size_bytes, args.idle_mounts),
+                         ('mdtest-io', 1000, 4096, 0))
+
+    def test_invalid_config_workload_fails_during_parsing(self):
+        with mock.patch.dict(mount_scale.CONFIG, workload='io'):
+            with self.assertRaisesRegex(AssertionError, 'workload: expected'):
+                mount_scale.parse_args([])
+
     def test_removed_io_and_directory_smoke_are_rejected(self):
         for argv in (['--workload', 'io'], ['--directory-smoke']):
             with self.subTest(argv=argv), self.assertRaises(SystemExit):

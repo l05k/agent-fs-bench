@@ -108,6 +108,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     options = parser.parse_args(argv)
     values = {**CONFIG, **vars(options)}
     args = argparse.Namespace(**values)
+    assert args.workload in WORKLOADS, f'workload: expected one of {WORKLOADS}, measured {args.workload!r}'
     for name in ('tasks', 'files', 'file_size_bytes', 'repeats',
                  'command_timeout_s', 'lifecycle_timeout_s', 'startup_timeout_s',
                  'job_timeout_s', 'fixture_timeout_s', 'idle_sample_s', 'resource_sample_s'):

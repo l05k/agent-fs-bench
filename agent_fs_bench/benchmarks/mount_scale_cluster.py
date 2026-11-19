@@ -189,7 +189,7 @@ class Lifecycle:
         local.mkdir(parents=True)
         self.idle_layout = Layout(
             self.profile, local, private, clients,
-            log_dir=local / 'lifecycle',
+            log_dir=self.logs / 'idle' / 'lifecycle',
             timeout_s=self.job['command_timeout_s'],
         )
         return self.idle_layout.mount()
@@ -263,7 +263,7 @@ class Lifecycle:
         local.mkdir(parents=True)
         self.private, self.local = private, local
         self.layout = Layout(self.profile, local, private, clients,
-                             log_dir=local / 'lifecycle',
+                             log_dir=self.logs / name / 'lifecycle',
                              timeout_s=self.job['command_timeout_s'])
         aliases = self.layout.clients
         self.clients = tuple(aliases)

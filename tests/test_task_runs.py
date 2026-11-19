@@ -4,8 +4,7 @@ Network, pinned-version and Docker tools are replaced by small scripts; the
 workload's own preparation, timing, collective and row code run unchanged. Each
 workload runs in both placements a real run uses (two tasks on one machine, one task
 on each of two machines), because only a multi-task run can show a missing, extra or
-reordered collective. dev-workflow is not covered: it needs real Linux kernel commits,
-and its task code matches mini-dev-workflow's.
+reordered collective. dev-workflow is not covered here: it needs real Linux kernel commits.
 """
 
 import argparse
@@ -19,12 +18,10 @@ import threading
 import unittest
 from unittest import mock
 
-from agent_fs_bench.benchmarks import (agent_replay, clone, kvtest, mini_dev_workflow,
-                                       npm_install, sqlite_speedtest, sqlite_tools)
+from agent_fs_bench.benchmarks import agent_replay, clone, kvtest, npm_install, sqlite_tools
 import fake_task
 from fake_task import run_tasks
 from test_kvtest import KVTEST_READ_STDOUT, KVTEST_RUN_STDOUT
-from test_sqlite_speedtest import SPEEDTEST_STDOUT
 
 LINUX = sys.platform.startswith('linux')
 
@@ -103,30 +100,6 @@ class TaskRunTests(unittest.TestCase):
                                  [('2', str(index), slot[0])
                                   for index, slot in enumerate(slots)])
                 self.assertEqual([row['host'] for row in rows['reads']], [slot[0] for slot in slots])
-
-    def test_sqlite_speedtest(self):
-        args = sqlite_speedtest.parse_args([])
-        args.build_dir, args.repeats = str(self.tools), 1
-        sources, build = self.fake_sqlite_build('speedtest1', SPEEDTEST_STDOUT)
-        for label, slots in LAYOUTS.items():
-            with self.subTest(layout=label):
-                with sources, build:
-                    rows = run_tasks(sqlite_speedtest, args, slots)
-                self.assertEqual(len(rows['totals']), len(slots))
-                self.assertEqual(len(rows['stages']),
-                                 len(slots) * len(sqlite_speedtest.MAIN_STAGES))
-
-    @unittest.skipUnless(all(shutil.which(name) for name in
-                             ('git', 'make', 'cc', 'bash', 'grep', 'sed', 'python3')),
-                         'git, make, a C compiler and the shell tools are required')
-    def test_mini_dev_workflow(self):
-        args = mini_dev_workflow.parse_args([])
-        for label, slots in LAYOUTS.items():
-            with self.subTest(layout=label):
-                rows = run_tasks(mini_dev_workflow, args, slots)
-                self.assertEqual(len(rows['workflow']), len(slots))
-                self.assertEqual({row['tasks'] for row in rows['workflow']}, {'2'})
-                self.assertTrue(rows['steps'])
 
     @unittest.skipUnless(LINUX and Path('/dev/shm').is_dir(), 'Linux tmpfs /dev/shm is required')
     def test_npm_install(self):

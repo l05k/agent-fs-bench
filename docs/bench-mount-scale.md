@@ -192,7 +192,7 @@ the actual verified idle count before accepting density results.
      file set in the same job; there is no remount, fixture or cache drop between phases.
    The reported phase starts at mdtest's own barrier and ends at its end barrier; the
    untimed `-r` removal runs before job exit.
-4. Stop resource sampling, unmount concurrently in reverse order on each machine, verify
+4. Stop resource sampling, unmount concurrently on each machine, verify
    no residue, sample released-idle, and delete the unmounted private data. Only then emit
    the repeat's results. After all repeats succeed, collect lifecycle logs and delete the
    run's data.
