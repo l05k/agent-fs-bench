@@ -182,10 +182,10 @@ tools' native durability semantics:** both may leave data in the page cache, and
 the tree durable itself, so do not read `install_s` as what npm/pnpm guarantee or `durable_s` as
 their implementation detail.
 
-## No-fsync variant
+## Archived no-fsync variant
 
-`run npm-install-nofsync` runs the same module through
-`agent_fs_bench/benchmarks/npm_install_nofsync.py`, which only sets `CONFIG["flush"] = False`. It
+The retired `npm-install-nofsync` command used the same module through
+`agent_fs_bench/benchmarks/npm_install_nofsync.py`, setting `CONFIG["flush"] = False`. It
 removes every harness-initiated sync: the timed whole-project flush, the pre-timing input fsync, and
 the node leader's `os.sync()`. Step 2 keeps its project-placement check but drops the fsync, step 4
 does not exist, and nothing in the benchmark forces the tree to stable storage. The check that a

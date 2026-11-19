@@ -6,7 +6,6 @@ import unittest
 from unittest import mock
 
 from agent_fs_bench.benchmarks import npm_install as bench
-from agent_fs_bench.benchmarks import npm_install_nofsync
 
 
 class DurabilityTests(unittest.TestCase):
@@ -216,10 +215,6 @@ class ConfigTests(unittest.TestCase):
     def test_repeats_must_be_positive(self):
         with self.assertRaisesRegex(bench.BenchError, 'repeats must be a positive integer'):
             bench.parse_args([], {**bench.CONFIG, 'repeats': 0})
-
-    def test_nofsync_workload_exposes_flush_off(self):
-        self.assertFalse(npm_install_nofsync.parse_args([]).flush)
-        self.assertTrue(bench.parse_args([]).flush)
 
 
 if __name__ == '__main__':

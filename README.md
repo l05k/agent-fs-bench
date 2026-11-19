@@ -55,9 +55,9 @@ Targets run sequentially. Each machine works in
 ## Run modes
 
 ```sh
-uv run python -m agent_fs_bench run mdtest --mode local --dirs /mnt/fs-a     # this machine (default)
-uv run python -m agent_fs_bench run mdtest --mode overflow --dirs /mnt/fs-a  # this machine, then local/hosts.toml
-uv run python -m agent_fs_bench run mdtest --mode remote --dirs /mnt/fs-a    # local/hosts.toml only
+uv run python -m agent_fs_bench run mdtest-peak --mode local --dirs /mnt/fs-a     # this machine (default)
+uv run python -m agent_fs_bench run mdtest-peak --mode overflow --dirs /mnt/fs-a  # this machine, then local/hosts.toml
+uv run python -m agent_fs_bench run mdtest-peak --mode remote --dirs /mnt/fs-a    # local/hosts.toml only
 ```
 
 Each workload's `CONFIG['tasks']` is the external concurrency of one run (N
@@ -69,32 +69,39 @@ checkout. Setup, placement and launcher settings: [run modes](docs/run-modes.md)
 
 The controller records the launcher, node facts and planned targets before
 running any workload. It appends validated raw observations and marks a target
-complete only after the workload returns. Mount-scale runs its two synchronized
-I/O batches under the mount lifecycle; mdtest has its own phase counters. The
-per-workload docs define each timing boundary.
+complete only after the workload returns. Mount-scale defaults to native
+`mdtest-io` on one real mount per agent; only `mdtest-io`, `mdtest-create` and
+`mount` remain. The per-workload docs define each timing boundary.
 
 ## Workloads
+
+[Round 03](experiments/round-03.md) is the active paper matrix. The
+[experiment archive](experiments/archive.md) records superseded plans and
+measurements; those workloads are not part of the active matrix.
 
 | Command | Workload | Doc |
 | --- | --- | --- |
 | `dev-workflow` | N concurrent Linux kernel workflows: build, search, edit, Git, tree check and final filesystem sync | [dev workflow](docs/bench-dev-workflow.md) |
-| `mini-dev-workflow` | Same Git worktree workflow on a small C project | [dev workflow](docs/bench-dev-workflow.md) |
 | `npm-install` | N concurrent offline npm or pnpm installs into cold `node_modules` | [npm install](docs/bench-npm-install.md) |
-| `npm-install-nofsync` | Same, with no harness fsync; install timing, throughput and tree stats, no flush/durable metrics | [npm install](docs/bench-npm-install.md#no-fsync-variant) |
 | `clone` | Durable directory copies and native LakeBase Clone OpenAPI latency | [clone](docs/bench-clone.md) |
 | `kvtest` | SQLite small-BLOB reads and checked synchronous overwrites | [kvtest](docs/bench-kvtest-openclaw.md) |
-| `sqlite-speedtest` | N independent SQLite `speedtest1 main` SQL phases | [sqlite-speedtest](docs/bench-sqlite-speedtest.md) |
-| `mount-scale` | N independent mounts running remounted whole-file reads and batch-durable creates | [mount scale](docs/bench-mount-scale.md) |
-| `mdtest` | POSIX file or directory metadata throughput of N tasks at fixed total work | [mdtest](docs/bench-mdtest.md) |
-| `mdtest-peak` | Weak-scaling file create/stat/read/unlink ops/s and MiB/s of N tasks, up to 2× CPUs | [mdtest peak](docs/bench-mdtest-peak.md) |
+| `mount-scale` | One real mount per agent; native mdtest create+read (`mdtest-io`) by default, plus `mdtest-create` and mount-command latency | [mount scale](docs/bench-mount-scale.md) |
+| `mdtest-peak` | Native file create/stat/read/unlink phases; use one rank for per-repeat average operation latency | [mdtest peak](docs/bench-mdtest-peak.md) |
 | `agent-replay` | Paired Codex/OpenClaw model-response replay with native tool timing and per-trial verification | [agent replay](docs/bench-agent-replay.md) |
+
+The cache ablation also uses `tools/npm_workspace_pack.py`: one offline
+`npm pack` over installed packages, with archives and npm state off-target.
+See the [execution matrix](experiments/round-03.md) for its inputs and timing.
+
+Agent replay captures are collected on the experiment controller and distributed
+to the replay hosts; see [agent replay capture](docs/bench-agent-replay.md#capture-on-several-hosts).
 
 ```sh
 uv run python -m agent_fs_bench run <command> --dirs /mnt/fs-a
 ```
 
-Workload flags (after `--`): `--smoke` for `clone`, `mdtest`, `mdtest-peak`,
-`kvtest` and `sqlite-speedtest`, and `--directory-smoke` for `mount-scale`. All other
+Workload flags go after `--`: `--smoke` for `clone`, `mdtest-peak` and `kvtest`,
+and `--workload` and `--idle-mounts` for `mount-scale`. Other
 settings (tasks, scale, repeats, PRAGMAs, tool versions, paths) live in the `CONFIG`
 dict at the top of each module in `agent_fs_bench/benchmarks/`. Changing an
 experiment means editing `CONFIG`; each run's `config.json` records the resulting
@@ -117,8 +124,8 @@ rank); every metric cell is a finite number. `run` never aggregates. Draw figure
 draw a custom figure:
 
 ```sh
-uv run python -m agent_fs_bench plot results/mdtest/<run-id> --targets ours,ext4,nfs
-uv run python -m agent_fs_bench plot results/mdtest/<run-n1> results/mdtest/<run-n16> \
+uv run python -m agent_fs_bench plot results/mdtest-peak/<run-id> --targets ours,ext4,nfs
+uv run python -m agent_fs_bench plot results/mdtest-peak/<run-n1> results/mdtest-peak/<run-n16> \
   --vary tasks --table phases --x tasks --y ops_per_s --split operation,layout \
   --yscale 1000 --logx
 ```
@@ -146,8 +153,9 @@ summaries.
   compare tool versions (in each target's `info`), kernel, mount options or host
   environment; keep those consistent yourself. `config.json` records each machine's
   probed facts (`nodes`, incl. CPU model) and every target's task count per machine.
-- Cache semantics are workload-specific. `mount-scale` remounts the clients
-  before reads; this does not evict server or persistent/shared client caches.
+- Cache semantics are workload-specific. `mount-scale` native read follows create
+  in the same launch with no remount or cache drop; this does not evict server or
+  persistent/shared client caches.
 - Tasks are not bound to CPUs; resource limits (cgroups, cpusets) for FUSE clients,
   servers and the benchmark are set externally.
 - Smoke runs only prove the pipeline works; they are not performance or
@@ -165,6 +173,6 @@ agent_fs_bench/   CLI, task placement and Open MPI dispatch (cluster.py), analys
 experiments/      example TOML configs (copy to local/, which is git-ignored)
 data/             fixed inputs, lockfiles, Git bundles (see docs/fixtures.md)
 third_party/      agent-mitm-replay submodule
-tools/            fixture maintenance
+tools/            fixture maintenance and npm workspace packing
 docs/             run modes, per-workload configuration and timing boundaries
 ```

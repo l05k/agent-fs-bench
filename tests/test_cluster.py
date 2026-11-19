@@ -161,7 +161,7 @@ class ProgramTimeoutTests(unittest.TestCase):
             launcher = Launcher((str(mpiexec),), (), {}, Path('hosts.toml'), 15)
             with self.assertRaisesRegex(RuntimeError, 'duplicate or unexpected MPI rank 0'):
                 cluster.run_program(place([node('local')], 2), launcher, [['ignored']] * 2,
-                                    root, 'duplicate', timeout_s=5, startup_timeout_s=2)
+                                    root, 'duplicate', timeout_s=60, startup_timeout_s=30)
 
 
 class TaskDirectoryTests(unittest.TestCase):

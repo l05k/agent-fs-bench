@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from agent_fs_bench.benchmarks import dev_workflow, mini_dev_workflow
+from agent_fs_bench.benchmarks import dev_workflow
 from agent_fs_bench.benchmarks.build_settings import read_compiler_version
 from agent_fs_bench.results import PROJECT_ROOT
 
@@ -31,12 +31,6 @@ class KernelConfigFixtureTests(unittest.TestCase):
         self.assertIn('CONFIG_OVERLAY_FS=y', lines)
         self.assertNotIn('# CONFIG_64BIT is not set', lines)
         self.assertNotIn('CONFIG_X86_32=y', lines)
-
-class ConfigurationTests(unittest.TestCase):
-    def test_mini_rejects_jobs_above_the_fixed_parallelism_instead_of_clamping(self):
-        with mock.patch.dict(mini_dev_workflow.CONFIG, {'jobs': 9}), \
-                self.assertRaisesRegex(AssertionError, 'jobs'):
-            mini_dev_workflow.parse_args([])
 
 class FixtureResolutionTests(unittest.TestCase):
     def test_relative_fixture_dir_resolves_in_checkout(self):
@@ -81,18 +75,13 @@ class FixtureResolutionTests(unittest.TestCase):
             dev_workflow.DEFAULT_SERIES, dev_workflow.DEFAULT_CONFIG,
             'search.cmds', 'read.cmds', 'edit.cmds',
         })
-        self.assertEqual(mini_dev_workflow.fixture_names(series), {
-            mini_dev_workflow.DEFAULT_SERIES, mini_dev_workflow.DEFAULT_BUNDLE,
-            'search.cmds', 'read.cmds', 'edit.cmds',
-        })
 
     def test_shipped_fixtures_validate(self):
-        for module in (dev_workflow, mini_dev_workflow):
-            fixture_dir = module.resolve_fixture_dir(module.CONFIG['fixture_dir'])
-            series = module.validate_fixtures(fixture_dir)
-            self.assertTrue(series['commits'])
-            for name in module.fixture_names(series):
-                self.assertTrue((fixture_dir / name).is_file(), name)
+        fixture_dir = dev_workflow.resolve_fixture_dir(dev_workflow.CONFIG['fixture_dir'])
+        series = dev_workflow.validate_fixtures(fixture_dir)
+        self.assertTrue(series['commits'])
+        for name in dev_workflow.fixture_names(series):
+            self.assertTrue((fixture_dir / name).is_file(), name)
 
 class SyncTests(unittest.TestCase):
     def test_scoped_sync_uses_a_checked_command(self):

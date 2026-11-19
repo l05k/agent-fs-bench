@@ -31,6 +31,60 @@ See the [submodule usage](../third_party/agent-mitm-replay/docs/usage.md) for
 native versions, capture and Docker smoke commands. Archive the task manifests,
 image digests and redacted experiment configuration. Cassettes remain private.
 
+## Capture on several hosts
+
+Capture is separate from measured replay. Use an experiment controller and the
+same frozen cases file on each capture host; paths resolve in that host's checkout.
+Every host needs a local Docker daemon, the locked replay environment, the same
+pinned images and initial data, and ext4 for `local/replay-capture/`. Set up the
+same 1 CPU / 2 GiB workload budget in the task's Compose configuration before
+capture. For FUSE replay the daemon and workload share that total budget; capture
+uses ext4 and has no FUSE daemon. The controller stays outside the budget and
+does not run a capture.
+
+```sh
+# On the experiment controller. The key is sent over SSH stdin, never argv or index.json.
+export OPENAI_API_KEY=...
+uv run python -m agent_fs_bench.replay_capture collect \
+  --hosts-file local/capture-hosts.toml --cases-file local/agent-replay.toml \
+  --model openai/qwen3.8-max --upstream "$UPSTREAM_BASE_URL" \
+  --output local/capture-batch
+
+# Copy the accepted cassettes from the controller to each replay host.
+uv run python -m agent_fs_bench.replay_capture distribute \
+  --source local/capture-batch --hosts-file local/replay-hosts.toml \
+  --cases-file local/agent-replay.toml
+```
+
+Both host files use the existing `[[hosts]]` inventory format. Capture deals the
+ordered task/harness pairs round-robin, with one recording at a time per host;
+hosts run concurrently. Each pair is recorded once, not once per host. Different
+hosts may use different checkout paths via `root` / `python` in the inventory.
+Each capture restores a disposable copy, preserving modes, links and `.git`;
+the source template is not passed as a writable mount.
+
+Successful `manifest.json`, `flows.mitm` and `tools.json` are fetched to
+`local/capture-batch/cassettes/<case>/` with a verified digest. The private
+`index.json` keeps every planned pair, its assignment and its actual outcome.
+Classified task failures are recorded and the host continues its next pair;
+setup/SSH failures stop that host and leave remaining pairs `not_run`. Other
+hosts finish their independent shards. No retry or replacement task is run;
+any failure makes `collect` exit nonzero, retaining the accepted captures.
+Logs, failed workspaces and full native recording outputs stay on their capture
+host under `local/replay-capture/<batch>/`.
+
+`distribute` verifies the same source revision, cohort and pristine task inputs,
+then installs only accepted cassettes at the manifest's configured paths. It
+rejects an existing cassette instead of overwriting or merging it. Missing
+captures remain in the cases file for replay's `capture_missing` accounting.
+Use a fresh case/cassette directory for a new batch. No shared filesystem is
+required; raw cassettes remain on the experiment machines, never in the returned
+paper-summary packet.
+
+The index is capture provenance, not a performance summary. Keep task failures
+and host failures against the original cohort even when distributing a partial
+batch; successful recordings do not replace missing tasks.
+
 ## Measure and summarize
 
 ```sh

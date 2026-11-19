@@ -1,9 +1,9 @@
 # Development-workflow filesystem benchmarks
 
 `dev-workflow` replays a real kernel development cycle in disposable Linux
-checkouts. `mini-dev-workflow` replays the same search/read/edit/build/commit
-shape against a tiny C project using real Git worktrees. Both are Python
-standard-library workloads in `agent_fs_bench/benchmarks/`. One run launches
+checkouts. The retired `mini-dev-workflow` module retains the same shape on a
+tiny C project for historical fixtures and tests; it is not a CLI command.
+Both are Python standard-library workloads in `agent_fs_bench/benchmarks/`. One run launches
 `tasks` independent instances at once; curves over the task count come from
 separate runs pooled with `plot --vary tasks`.
 
@@ -22,7 +22,6 @@ unmounts them. Every machine of the pool keeps the same checkout and its own
 
 ```sh
 uv sync --locked
-uv run python -m agent_fs_bench run mini-dev-workflow --mode local --dirs /mnt/testfs
 uv run python -m agent_fs_bench run dev-workflow --mode local --dirs /mnt/testfs
 ```
 
@@ -36,7 +35,6 @@ workload help accepts only `--help` and opens no repositories:
 
 ```sh
 uv run python -m agent_fs_bench run dev-workflow -- --help
-uv run python -m agent_fs_bench run mini-dev-workflow -- --help
 ```
 
 Every task gets a fresh directory
@@ -90,15 +88,7 @@ each node leader, the machine that does the work.
 Mini needs a compiler selected by its Makefile, libc development files, and all
 of `data/mini-dev-workflow/`, including `source-repo.bundle`. The fixture uses
 Make's built-in `cc` by default and honours inherited `CC`/`CFLAGS` under normal
-make precedence. It needs no network, sudo, fixture regeneration, or shortened
-smoke mode. This runs its **entire** two-commit workload:
-
-```sh
-uv sync --locked
-mkdir -p /var/tmp/agent-fs-bench-smoke
-uv run python -m agent_fs_bench run mini-dev-workflow --mode local \
-  --dirs /var/tmp/agent-fs-bench-smoke
-```
+make precedence. Its historical fixture needs no network or sudo at runtime.
 
 Inside a Linux VM, use a guest-local target rather than a host-shared project
 path if testing the guest filesystem. Mini supports native ARM64 Linux.

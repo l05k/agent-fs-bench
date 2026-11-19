@@ -17,8 +17,8 @@ from .results import PROJECT_ROOT, RunContext, Tables, git_commit, source_digest
 from .targets import Target, load_targets
 
 BENCHMARKS = (
-    'clone', 'dev-workflow', 'mini-dev-workflow', 'npm-install', 'npm-install-nofsync',
-    'kvtest', 'sqlite-speedtest', 'mount-scale', 'mdtest', 'mdtest-peak', 'agent-replay',
+    'clone', 'dev-workflow', 'npm-install', 'kvtest', 'mount-scale', 'mdtest-peak',
+    'agent-replay',
 )
 RESULTS_DIR = PROJECT_ROOT / 'results'
 TARGETS_FILE = PROJECT_ROOT / 'local' / 'targets.toml'

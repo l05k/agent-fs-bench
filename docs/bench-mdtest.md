@@ -1,20 +1,15 @@
 # mdtest
 
+This fixed-total-workload CLI is retired. The implementation remains as shared
+helpers for [mdtest-peak](bench-mdtest-peak.md); the following describes historical
+measurement semantics, not a current run command.
+
 Measure POSIX metadata throughput with the unmodified **IOR mdtest 4.0.0** at one task count N per run. No fio, data-bandwidth test, cache eviction, extra fsync, automatic installation or retry.
 
 ## Prerequisites and commands
 
 Prepare `mdtest` 4.0.0 linked against the Open MPI 4.1 of every task machine, outside this repository. The [official release](https://github.com/hpc/ior/releases/tag/4.0.0) contains build instructions. Every machine must run the same binary: the controller computes the binary's SHA-256 on every participating machine before the run and fails unless they agree. Open MPI does not read shell profiles on remote machines, so prefer an absolute `mdtest_bin`. Mount targets externally; machine placement follows [run modes](run-modes.md).
 
-```sh
-uv sync --locked
-
-# One task count per run (CONFIG["tasks"]); --mode picks the machines.
-uv run python -m agent_fs_bench run mdtest --mode local --dirs /mnt/fs-a /mnt/fs-b
-
-# Small real end-to-end check, not a performance result.
-uv run python -m agent_fs_bench run mdtest --mode local --dirs /mnt/smoke -- --smoke
-```
 
 ## Experiment settings
 

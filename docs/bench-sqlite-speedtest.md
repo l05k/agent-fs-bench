@@ -1,25 +1,20 @@
 # Official SQLite SQL microbenchmark
 
-`run sqlite-speedtest` runs the unmodified official
+The retired `sqlite-speedtest` workload runs the unmodified official
 [`test/speedtest1.c`](https://sqlite.org/src/raw/test/speedtest1.c?ci=version-3.54.1)
 with `--testset main`. SQLite 3.54.1 and its amalgamation are pinned. Each task
 is a single-connection SQL workload on its own database file in the target
 directory, and a run may start several independent tasks; this is not an Agent
 replay. It complements `kvtest`'s controlled BLOB transaction experiment.
 
-## Run and configuration
+## Historical configuration
 
-```sh
-uv run python -m agent_fs_bench run sqlite-speedtest --mode local --dirs /mnt/fs-a /mnt/fs-b
-# Smoke test: two tasks, two repeats and scale 1.
-uv run python -m agent_fs_bench run sqlite-speedtest --mode local --dirs /mnt/fs-a -- --smoke
-```
+The CLI no longer exposes this workload; use [kvtest](bench-kvtest-openclaw.md)
+for the current SQLite experiment. Historical sources and results are retained.
 
-`--mode` selects the machines: `local` is the controller, `overflow` adds the
-`local/hosts.toml` machines in file order after the controller, and `remote`
-uses only those machines. Workload flags follow `--`; `--smoke` selects a small
-real workload. Mount targets externally. Change `CONFIG` in
-`agent_fs_bench/benchmarks/sqlite_speedtest.py` for an experiment. Defaults:
+The historical run snapshot records the placement mode and the module's
+`CONFIG` values. Its `--smoke` variant used a smaller scale and is not a
+current command. Historical defaults:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
