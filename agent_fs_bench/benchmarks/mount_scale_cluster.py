@@ -25,6 +25,7 @@ import time
 from agent_fs_bench import cluster
 from agent_fs_bench.results import PROJECT_ROOT
 from agent_fs_bench.ssh import ssh_argv
+from .mount_scale_budget import snapshot
 from .mount_scale_mounts import Client, Layout, parse_profile
 from . import mount_scale_resources as resources
 
@@ -150,8 +151,14 @@ class Lifecycle:
         }
         return actions[request['action']](request)
 
+    def _budgets(self) -> list[dict]:
+        return [snapshot(client.cgroup) for client in self.clients
+                if client.cgroup is not None]
+
     def mount(self, request: dict) -> dict:
-        return {**self.layout.mount(), 'agent_elapsed_s': self.layout.mount_agent_elapsed_s}
+        assert self.layout is not None, 'mount: expected a layout from setup'
+        return {**self.layout.mount(), 'agent_elapsed_s': self.layout.mount_agent_elapsed_s,
+                'budgets': self._budgets()}
 
     def mount_plan(self, request: dict) -> dict:
         """Write each active client's single mount argv to a private local file.
@@ -204,7 +211,10 @@ class Lifecycle:
         return result
 
     def unmount(self, request: dict) -> dict:
-        return {**self.layout.unmount(), 'agent_elapsed_s': self.layout.unmount_agent_elapsed_s}
+        assert self.layout is not None, 'unmount: expected a layout from setup'
+        budgets = self._budgets()
+        return {**self.layout.unmount(), 'agent_elapsed_s': self.layout.unmount_agent_elapsed_s,
+                'budgets': budgets}
 
     def idle(self, request: dict) -> dict:
         return idle(self.job['idle_sample_s'])
@@ -268,7 +278,9 @@ class Lifecycle:
         aliases = self.layout.clients
         self.clients = tuple(aliases)
         baseline = idle(self.job['idle_sample_s'])
-        return {'clients': [{'workspace': str(client.workspace)} for client in aliases],
+        return {'clients': [{'workspace': str(client.workspace),
+                             'cgroup': None if client.cgroup is None else str(client.cgroup)}
+                            for client in aliases],
                 'baseline': baseline}
 
 

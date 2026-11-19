@@ -7,6 +7,7 @@ checked through mountinfo and per-agent sentinels; no shell, sudo or cleanup.
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import re
 import secrets
 import subprocess
@@ -15,6 +16,9 @@ import tomllib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from string import Formatter
+
+from .mount_scale_budget import validate_path
 
 MULTI_MOUNT = "multi-mount"
 SHARED_DIRECTORY = "shared-directory"
@@ -29,11 +33,35 @@ class Profile:
     admin_root: Path
     private_mount: tuple[str, ...] = ()
     unmount: tuple[str, ...] = ()
+    rank_cgroup: str | None = None
 
 
 @dataclass(frozen=True)
 class Client:
     workspace: Path
+    cgroup: Path | None = None
+
+
+def _rank_cgroup(value: object, source: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f'{source}: rank_cgroup must be a nonempty string, measured {value!r}')
+    try:
+        fields = list(Formatter().parse(value))
+    except ValueError as exc:
+        raise ValueError(f'{source}: rank_cgroup template: {exc}') from None
+    placeholders = []
+    for _, field, spec, conversion in fields:
+        if field is None:
+            continue
+        if field != 'mount_hash' or spec or conversion is not None:
+            raise ValueError(f'{source}: rank_cgroup: expected one {{mount_hash}} '
+                             f'placeholder, measured {value!r}')
+        placeholders.append(field)
+    if placeholders != ['mount_hash']:
+        raise ValueError(f'{source}: rank_cgroup: expected one {{mount_hash}} '
+                         f'placeholder, measured {value!r}')
+    validate_path(Path(value), f'{source}: rank_cgroup')
+    return value
 
 
 def parse_profile(text: str, target_name: str, source: str = "mounts.toml") -> Profile:
@@ -43,7 +71,8 @@ def parse_profile(text: str, target_name: str, source: str = "mounts.toml") -> P
     it on its own machine.
     """
     table = tomllib.loads(text)["profiles"][target_name]
-    unknown = table.keys() - {'topology', 'admin_root', 'private_mount', 'unmount'}
+    unknown = table.keys() - {'topology', 'admin_root', 'private_mount', 'unmount',
+                              'rank_cgroup'}
     if unknown:
         raise ValueError(f'{source}: unknown profile keys {sorted(unknown)}')
     topology = table["topology"]
@@ -52,12 +81,16 @@ def parse_profile(text: str, target_name: str, source: str = "mounts.toml") -> P
     admin_root = Path(table["admin_root"])
     if not admin_root.is_absolute():
         raise ValueError(f"{source}: admin_root must be an absolute path")
+    rank_cgroup = table.get('rank_cgroup')
+    if rank_cgroup is not None:
+        rank_cgroup = _rank_cgroup(rank_cgroup, source)
 
     return Profile(
         topology=topology,
         admin_root=admin_root,
         private_mount=tuple(table['private_mount']),
         unmount=tuple(table['unmount']),
+        rank_cgroup=rank_cgroup,
     )
 
 
@@ -150,7 +183,11 @@ class Layout:
             if multi:
                 (local_root / "workspace").mkdir()
             mountpoint = local_root / 'workspace' if multi else local_root
-            client_values.append(Client(local_root / 'workspace'))
+            cgroup = None
+            if profile.rank_cgroup is not None:
+                digest = hashlib.sha256(str(mountpoint).encode()).hexdigest()[:20]
+                cgroup = Path(profile.rank_cgroup.format(mount_hash=digest))
+            client_values.append(Client(local_root / 'workspace', cgroup))
             self.mountpoints.append(mountpoint)
         self.clients = tuple(client_values)
         self._write_sentinels()
@@ -239,6 +276,13 @@ class Layout:
         if remaining:
             raise RuntimeError(
                 f"unmount verification failed: {len(remaining)} mountpoint(s) "
+                f"remain; inspect {self.work_dir} and {self.data_root}"
+            )
+        remaining_groups = [client.cgroup for client in self.clients
+                            if client.cgroup is not None and client.cgroup.exists()]
+        if remaining_groups:
+            raise RuntimeError(
+                f"unmount verification failed: {len(remaining_groups)} budget cgroup(s) "
                 f"remain; inspect {self.work_dir} and {self.data_root}"
             )
         self._mounted = False

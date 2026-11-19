@@ -11,8 +11,8 @@
 
 `--workload mount` times one site wrapper command per active rank, from invocation to
 ready return, on each client's real mount, and executes no I/O. `--workload
-mdtest-create` runs IOR 4.0.0 mdtest's private zero-byte create (removal follows in the
-job, unmeasured) on one mount per active client. The default `--workload mdtest-io` runs
+mdtest-create` runs IOR 4.0.0 mdtest's private create/write/close without fsync (zero
+bytes by default; removal follows in the job, unmeasured). The default `--workload mdtest-io` runs
 native create then read with `-y` (per-file fsync) and reports only the `create-write`
 and `read` phases; read follows create without a remount or cache drop. Mdtest uses one
 ``MPI_COMM_WORLD``, one ``-d`` per task and its own barriers and rank CSV; command wall
@@ -57,6 +57,8 @@ CONFIG = {
     'tasks': 64,
     'workload': 'mdtest-io',
     'idle_mounts': 0,
+    'create_file_size_bytes': 0,
+    'stonewall_seconds': None,  # Optional native create-only deadline, not a job timeout.
     'files': 1000,
     'file_size_bytes': 4096,
     'repeats': 3,
@@ -96,12 +98,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--workload', choices=WORKLOADS, default=CONFIG['workload'],
                         help='mount times one site mount wrapper per active rank; '
-                             'mdtest-create runs a native zero-byte private create; '
+                             'mdtest-create runs native private create without fsync; '
                              'mdtest-io runs native create then read with per-file fsync '
                              'in create.')
     parser.add_argument('--idle-mounts', type=int, default=CONFIG['idle_mounts'],
                         help='Run-level idle client mounts on one host, mount or mdtest-create '
                              'only; they stay mounted across active repeats and are never ranks.')
+    parser.add_argument('--create-file-size-bytes', type=int,
+                        default=CONFIG['create_file_size_bytes'],
+                        help='Bytes per mdtest-create file (default 0); no per-file fsync.')
+    parser.add_argument('--stonewall-seconds', type=int, default=CONFIG['stonewall_seconds'],
+                        help='Native create-only stonewall; truncated work fails validation.')
     for name, kind in (('tasks', int), ('repeats', int), ('startup_timeout_s', float),
                        ('job_timeout_s', float), ('fixture_timeout_s', float)):
         parser.add_argument('--' + name.replace('_', '-'), type=kind, default=CONFIG[name])
@@ -117,6 +124,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             f'{name}: expected positive finite number, measured {value!r}'
     assert type(args.idle_mounts) is int and args.idle_mounts >= 0, \
         f'idle_mounts: expected a nonnegative integer, measured {args.idle_mounts!r}'
+    assert type(args.create_file_size_bytes) is int and args.create_file_size_bytes >= 0, \
+        f'create_file_size_bytes: expected a nonnegative integer, measured ' \
+        f'{args.create_file_size_bytes!r}'
+    if args.stonewall_seconds is not None:
+        assert type(args.stonewall_seconds) is int and args.stonewall_seconds > 0, \
+            f'stonewall_seconds: expected a positive integer, measured {args.stonewall_seconds!r}'
+    if args.workload != 'mdtest-create':
+        assert args.create_file_size_bytes == 0 and args.stonewall_seconds is None, \
+            'create file size and stonewall require --workload mdtest-create'
     if args.idle_mounts:
         assert args.workload in ('mount', 'mdtest-create'), \
             f'--idle-mounts: expected workload mount or mdtest-create, measured {args.workload}'
@@ -188,6 +204,8 @@ class Repeat:
 def load_profile(ctx: RunContext, args: argparse.Namespace) -> tuple[Profile, str]:
     text = Path(args.profiles).read_text()
     profile = parse_profile(text, ctx.target.name, str(args.profiles))
+    assert not (profile.rank_cgroup is not None and args.workload == 'mount'), \
+        'rank_cgroup requires an mdtest workload; timed mounts use an unbudgeted profile'
     admin = profile.admin_root.resolve()
     assert not (ctx.target.path.resolve().is_relative_to(admin)
                 or ctx.result_dir.resolve().is_relative_to(admin)), \
@@ -251,9 +269,11 @@ def prepare(ctx: RunContext, args: argparse.Namespace, experiment: Experiment) -
                     completion='site-mount-wrapper-ready-return',
                     durability='mount-ready')
     elif args.workload == 'mdtest-create':
-        info.update(cache_control='not-applicable-zero-byte-create',
-                    completion='native-mdtest-create-phase-end-barrier',
-                    durability='not-applicable-zero-byte-files')
+        info.update(cache_control='create-without-cache-drop',
+                    file_size_bytes=args.create_file_size_bytes,
+                    stonewall_seconds=args.stonewall_seconds,
+                    completion='native-mdtest-create-phase-end-barrier-full-count',
+                    durability='no-fsync-no-durability-claim')
     else:
         assert args.workload == 'mdtest-io', f'unexpected workload: {args.workload}'
         info.update(cache_control='read-after-create-no-cache-drop',
@@ -270,7 +290,8 @@ def setup_clients(experiment: Experiment, repeat: int) -> tuple[list[Rank], list
         setups = list(pool.map(lambda worker: worker.call(
             'setup', repeat=repeat, clients=shares[worker.name], total_clients=count),
             experiment.workers))
-    ranks = [Rank(worker.node, Path(client['workspace']))
+    ranks = [Rank(worker.node, Path(client['workspace']),
+                  Path(client['cgroup']) if client['cgroup'] is not None else None)
              for worker, setup in zip(experiment.workers, setups) for client in setup['clients']]
     return ranks, [setup['baseline'] for setup in setups]
 
@@ -345,17 +366,20 @@ def measure_mdtest_repeat(ctx: RunContext, args: argparse.Namespace,
     mounts, dispatch_s['mount'] = timed(workers, 'mount')
     mounted = parallel(workers, 'idle')
     parallel(workers, 'sample-start')
-    operations = len(ranks) * args.files
     if args.workload == 'mdtest-create':
-        timings = engine.create_timings(ranks, args.files, diagnostics / 'measured')
-        phases = [Phase('file-create', operations, timings.phase_s['File creation'],
+        timings = engine.create_timings(ranks, args.files, args.create_file_size_bytes,
+                                        args.stonewall_seconds, diagnostics / 'measured')
+        phases = [Phase('file-create', timings.operations['File creation'],
+                        timings.phase_s['File creation'],
                         timings.rank_s['File creation'])]
     else:
         timings = engine.native_io_timings(ranks, args.files, args.file_size_bytes,
                                            diagnostics / 'measured')
-        phases = [Phase(CREATE_WRITE, operations, timings.phase_s['File creation'],
+        phases = [Phase(CREATE_WRITE, timings.operations['File creation'],
+                        timings.phase_s['File creation'],
                         timings.rank_s['File creation']),
-                  Phase(READ, operations, timings.phase_s['File read'],
+                  Phase(READ, timings.operations['File read'],
+                        timings.phase_s['File read'],
                         timings.rank_s['File read'])]
     workload = parallel(workers, 'sample-stop')
     unmounts, dispatch_s['unmount'] = timed(workers, 'unmount')
@@ -404,6 +428,10 @@ def write_lifecycle(ctx: RunContext, keys: dict[str, Any], host: str, action: st
     for sample, elapsed in enumerate(reply['agent_elapsed_s']):
         ctx.emit('agents', {**host_keys, 'action': action, 'sample': sample},
                  {'elapsed_s': elapsed})
+    for sample, budget in enumerate(reply.get('budgets', [])):
+        ctx.emit('budget_events', {**host_keys, 'action': action, 'sample': sample,
+                                   'cgroup': budget['cgroup']},
+                 {name: value for name, value in budget.items() if name != 'cgroup'})
 
 
 def write_resources(ctx: RunContext, keys: dict[str, Any], host: str, baseline: dict,
@@ -423,7 +451,12 @@ def write_repeat(ctx: RunContext, args: argparse.Namespace, experiment: Experime
                  result: Repeat) -> None:
     keys = {'topology': experiment.topology, 'tasks': len(experiment.placement),
             'repeat': result.number, 'workload': args.workload,
-            'idle_mounts': args.idle_mounts}
+            'idle_mounts': args.idle_mounts,
+            'file_size_bytes': (args.create_file_size_bytes if args.workload == 'mdtest-create'
+                                else args.file_size_bytes if args.workload == 'mdtest-io' else 0),
+            'stonewall_seconds': args.stonewall_seconds,
+            'per_file_fsync': args.workload == 'mdtest-io',
+            'budget': '1c2g' if experiment.profile.rank_cgroup is not None else 'none'}
     for action, elapsed in result.dispatch_s.items():
         ctx.emit('dispatch', {**keys, 'action': action}, {'controller_dispatch_elapsed_s': elapsed})
     for index, worker in enumerate(experiment.workers):
